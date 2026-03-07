@@ -6,9 +6,10 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date
+from datetime import date, timedelta
 
 import boto3
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +17,7 @@ logger = logging.getLogger(__name__)
 def read_signals(s3_bucket: str, run_date: str | None = None) -> dict:
     """
     Download signals/{date}/signals.json from S3.
-    Returns parsed signals dict. Raises if not found.
+    Returns parsed signals dict. Raises ClientError if not found.
     """
     d = run_date or str(date.today())
     key = f"signals/{d}/signals.json"
@@ -30,6 +31,43 @@ def read_signals(s3_bucket: str, run_date: str | None = None) -> dict:
         f"| candidates={len(data.get('buy_candidates', []))}"
     )
     return data
+
+
+def read_signals_with_fallback(s3_bucket: str, run_date: str | None = None, max_lookback: int = 5) -> dict:
+    """
+    Try to read signals for run_date, falling back to previous trading days if not found.
+
+    Skips weekends (research pipeline only runs on NYSE trading days).
+    Tries up to max_lookback calendar days back before giving up.
+
+    Returns the signals dict. Raises RuntimeError if nothing found within the lookback window.
+    """
+    start = date.fromisoformat(run_date) if run_date else date.today()
+    tried: list[str] = []
+
+    for days_back in range(max_lookback + 1):
+        candidate = start - timedelta(days=days_back)
+        if candidate.weekday() >= 5:  # skip Saturday (5) and Sunday (6)
+            continue
+        try:
+            signals = read_signals(s3_bucket, str(candidate))
+            if days_back > 0:
+                logger.warning(
+                    f"No signals for {start} — using {candidate} "
+                    f"({days_back} calendar day(s) old). Dates tried: {tried}"
+                )
+            return signals
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "NoSuchKey":
+                logger.info(f"No signals file for {candidate}, looking further back...")
+                tried.append(str(candidate))
+                continue
+            raise
+
+    raise RuntimeError(
+        f"No signals found within {max_lookback} calendar days of {start}. "
+        f"Dates tried: {tried}. Check that the research pipeline ran recently."
+    )
 
 
 def get_actionable_signals(signals: dict) -> dict:

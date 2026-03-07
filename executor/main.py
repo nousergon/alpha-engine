@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from executor.ibkr import IBKRClient
 from executor.position_sizer import compute_position_size
 from executor.risk_guard import check_order
-from executor.signal_reader import get_actionable_signals, read_signals
+from executor.signal_reader import get_actionable_signals, read_signals_with_fallback
 from executor.trade_logger import backup_to_s3, init_db, log_trade
 
 logging.basicConfig(
@@ -56,7 +56,12 @@ def run(dry_run: bool = False):
     conn = init_db(db_path)
 
     # ── 1. Read signals from S3 ──────────────────────────────────────────────
-    signals_raw = read_signals(signals_bucket, run_date)
+    try:
+        signals_raw = read_signals_with_fallback(signals_bucket, run_date)
+    except RuntimeError as e:
+        logger.error(f"Cannot proceed without signals: {e}")
+        conn.close()
+        return
     signals = get_actionable_signals(signals_raw)
     market_regime = signals["market_regime"]
     sector_ratings = signals["sector_ratings"]
