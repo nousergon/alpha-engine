@@ -12,7 +12,7 @@ import json
 import logging
 import os
 import sys
-from datetime import date
+from datetime import date, timedelta
 
 import yaml
 import yfinance as yf
@@ -35,7 +35,8 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config",
 def _spy_close(run_date: str) -> float | None:
     """Fetch SPY closing price for run_date via yfinance."""
     try:
-        hist = yf.download("SPY", start=run_date, end=run_date, progress=False, auto_adjust=True)
+        end_date = (date.fromisoformat(run_date) + timedelta(days=1)).isoformat()
+        hist = yf.download("SPY", start=run_date, end=end_date, progress=False, auto_adjust=True)
         if not hist.empty:
             return float(hist["Close"].iloc[0])
     except Exception as e:
