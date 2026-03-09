@@ -4,6 +4,7 @@ Thin ib_insync wrapper for the 4 operations the executor needs:
   - get_positions()
   - get_current_price(ticker)
   - place_market_order(ticker, action, shares)
+  - get_historical_bar(ticker, date)   ← used by backtester price_loader fallback
 
 IB Gateway must be running locally on port 4002 in paper mode.
 """
@@ -11,8 +12,8 @@ IB Gateway must be running locally on port 4002 in paper mode.
 from __future__ import annotations
 
 import logging
-
 import math
+from datetime import datetime
 
 from ib_insync import IB, Stock, MarketOrder
 
@@ -109,6 +110,58 @@ class IBKRClient:
             "status": trade.orderStatus.status,
         }
 
+    # ── Historical data ───────────────────────────────────────────────────────
+
+    def get_historical_bar(self, ticker: str, date: str) -> dict | None:
+        """
+        Fetch a single daily OHLCV bar for ticker on date (YYYY-MM-DD).
+
+        Used by the backtester's price_loader as a fallback when prices.json
+        is missing from S3 and yfinance returns no data for a ticker.
+
+        Returns:
+            {"open": float, "close": float, "high": float, "low": float}
+            or None if no data available.
+
+        Note: IBKR rate-limits historical data requests (~50 req/10s on paper).
+        The backtester only calls this for tickers yfinance missed, so volume
+        should be low in practice.
+        """
+        contract = Stock(ticker, "SMART", "USD")
+        try:
+            self.ib.qualifyContracts(contract)
+        except Exception as e:
+            logger.warning(f"Could not qualify contract for {ticker}: {e}")
+            return None
+
+        # reqHistoricalData endDateTime format: "YYYYMMDD HH:MM:SS"
+        end_dt = datetime.strptime(date, "%Y-%m-%d").strftime("%Y%m%d 23:59:59")
+        try:
+            bars = self.ib.reqHistoricalData(
+                contract,
+                endDateTime=end_dt,
+                durationStr="1 D",
+                barSizeSetting="1 day",
+                whatToShow="TRADES",
+                useRTH=True,
+                formatDate=1,
+            )
+        except Exception as e:
+            logger.warning(f"reqHistoricalData failed for {ticker} on {date}: {e}")
+            return None
+
+        if not bars:
+            logger.debug(f"No historical bar for {ticker} on {date} (weekend/holiday?)")
+            return None
+
+        bar = bars[-1]
+        return {
+            "open":  float(bar.open),
+            "close": float(bar.close),
+            "high":  float(bar.high),
+            "low":   float(bar.low),
+        }
+
     # ── Peak NAV ──────────────────────────────────────────────────────────────
 
     def get_peak_nav(self, db_conn) -> float:
@@ -160,6 +213,14 @@ class SimulatedIBKRClient:
             self._positions.pop(ticker, None)
             self._nav += shares * price
         return {"ib_order_id": None}
+
+    def get_historical_bar(self, ticker: str, date: str) -> dict | None:
+        # SimulatedIBKRClient only holds a single close price per ticker.
+        # Return it for all OHLCV fields — sufficient for backtester fallback use.
+        price = self._prices.get(ticker)
+        if price is None:
+            return None
+        return {"open": price, "close": price, "high": price, "low": price}
 
     def disconnect(self):
         pass
