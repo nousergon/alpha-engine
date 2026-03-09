@@ -14,6 +14,8 @@ import os
 import sys
 from datetime import date, timedelta
 
+import boto3
+import pandas as pd
 import yaml
 import yfinance as yf
 
@@ -107,6 +109,18 @@ def run(run_date: str | None = None):
         "daily_alpha_pct": alpha,
         "positions_snapshot": positions,
     })
+
+    # Export full history CSVs for dashboard consumption
+    trades_df = pd.read_sql("SELECT * FROM trades ORDER BY date, created_at", conn)
+    eod_df = pd.read_sql("SELECT * FROM eod_pnl ORDER BY date", conn)
+    s3 = boto3.client("s3")
+    for df, key in [
+        (trades_df, "trades/trades_full.csv"),
+        (eod_df, "trades/eod_pnl.csv"),
+    ]:
+        buf = df.to_csv(index=False).encode()
+        s3.put_object(Bucket=trades_bucket, Key=key, Body=buf)
+        logger.info(f"Exported {key} ({len(df)} rows) to s3://{trades_bucket}/{key}")
 
     backup_to_s3(db_path, run_date, trades_bucket)
 

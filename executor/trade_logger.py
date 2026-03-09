@@ -131,8 +131,10 @@ def log_eod(conn: sqlite3.Connection, eod: dict) -> None:
 
 
 def backup_to_s3(db_path: str, run_date: str, s3_bucket: str) -> None:
-    """Upload trades.db to S3 under trades/trades_{date}.db."""
+    """Upload trades.db to S3 under trades/trades_{date}.db and trades/trades_latest.db."""
     s3 = boto3.client("s3")
     key = f"trades/trades_{run_date}.db"
     s3.upload_file(db_path, s3_bucket, key)
     logger.info(f"trades.db backed up to s3://{s3_bucket}/{key}")
+    s3.upload_file(db_path, s3_bucket, "trades/trades_latest.db")
+    logger.info(f"trades.db backed up to s3://{s3_bucket}/trades/trades_latest.db")
