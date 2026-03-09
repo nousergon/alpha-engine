@@ -38,7 +38,7 @@ def _spy_close(run_date: str) -> float | None:
         end_date = (date.fromisoformat(run_date) + timedelta(days=1)).isoformat()
         hist = yf.download("SPY", start=run_date, end=end_date, progress=False, auto_adjust=True)
         if not hist.empty:
-            return float(hist["Close"].iloc[0])
+            return float(hist["Close"].values.flat[0])
     except Exception as e:
         logger.warning(f"Could not fetch SPY price: {e}")
     return None
@@ -86,7 +86,7 @@ def run(run_date: str | None = None):
         try:
             hist = yf.download("SPY", period="2d", progress=False, auto_adjust=True)
             if len(hist) >= 2:
-                spy_return = float((hist["Close"].iloc[-1] / hist["Close"].iloc[-2] - 1) * 100)
+                spy_return = float((hist["Close"].values.flat[-1] / hist["Close"].values.flat[-2] - 1) * 100)
         except Exception as e:
             logger.warning(f"SPY return calc failed: {e}")
 
