@@ -71,6 +71,7 @@ class IBKRClient:
             logger.warning(f"Could not qualify contract for {ticker}: {e}")
             return None
 
+        self.ib.reqMarketDataType(3)  # 3 = delayed (free); avoids Error 10089 on paper accounts
         ticker_data = self.ib.reqMktData(contract, "", False, False)
         self.ib.sleep(1)
 
