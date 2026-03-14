@@ -75,8 +75,11 @@ class IBKRClient:
         ticker_data = self.ib.reqMktData(contract, "", False, False)
         self.ib.sleep(1)
 
-        price = ticker_data.last or ticker_data.close
-        if not price or price <= 0 or not math.isfinite(price):
+        last = ticker_data.last
+        close = ticker_data.close
+        price = last if (last is not None and math.isfinite(last) and last > 0) else None
+        price = price or (close if (close is not None and math.isfinite(close) and close > 0) else None)
+        if not price:
             logger.warning(f"No valid price for {ticker} (last={ticker_data.last} close={ticker_data.close})")
             return None
 

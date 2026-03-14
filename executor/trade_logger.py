@@ -36,9 +36,16 @@ CREATE TABLE IF NOT EXISTS trades (
     fill_price               REAL,
     fill_time                TEXT,
     ib_order_id              INTEGER,
+    predicted_direction      TEXT,
+    prediction_confidence    REAL,
     created_at               TEXT NOT NULL
 );
 """
+
+_TRADES_MIGRATIONS = [
+    "ALTER TABLE trades ADD COLUMN predicted_direction TEXT",
+    "ALTER TABLE trades ADD COLUMN prediction_confidence REAL",
+]
 
 CREATE_EOD_TABLE = """
 CREATE TABLE IF NOT EXISTS eod_pnl (
@@ -54,9 +61,15 @@ CREATE TABLE IF NOT EXISTS eod_pnl (
 
 
 def init_db(db_path: str) -> sqlite3.Connection:
-    """Create tables if they don't exist. Returns open connection."""
+    """Create tables if they don't exist and run any pending migrations. Returns open connection."""
     conn = sqlite3.connect(db_path)
     conn.executescript(CREATE_TRADES_TABLE + CREATE_EOD_TABLE)
+    for migration in _TRADES_MIGRATIONS:
+        try:
+            conn.execute(migration)
+            conn.commit()
+        except Exception:
+            pass  # Column already exists
     conn.commit()
     logger.info(f"trades.db initialized at {db_path}")
     return conn
@@ -77,8 +90,9 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
             price_at_order, portfolio_nav_at_order, position_pct,
             research_score, research_conviction, research_rating,
             sector_rating, market_regime, price_target_upside,
-            thesis_summary, fill_price, fill_time, ib_order_id, created_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            thesis_summary, fill_price, fill_time, ib_order_id,
+            predicted_direction, prediction_confidence, created_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             trade_id,
@@ -99,6 +113,8 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
             trade.get("fill_price"),
             trade.get("fill_time"),
             trade.get("ib_order_id"),
+            trade.get("predicted_direction"),
+            trade.get("prediction_confidence"),
             datetime.now(timezone.utc).isoformat(),
         ),
     )
