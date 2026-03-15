@@ -7,26 +7,27 @@ Defaults are defined here. Override via the 'strategy' key in config/risk.yaml.
 from __future__ import annotations
 
 # ── Exit Manager defaults ────────────────────────────────────────────────────
+# These are conservative fallbacks — override via strategy key in risk.yaml.
 
 # ATR trailing stop
 ATR_TRAILING_ENABLED = True
 ATR_PERIOD = 14               # days for ATR calculation
-ATR_MULTIPLIER = 3.0          # stop = highest_high - ATR * multiplier
+ATR_MULTIPLIER = 2.5          # stop = highest_high - ATR * multiplier
 
 # Time-based exit decay
 TIME_DECAY_ENABLED = True
-TIME_DECAY_REDUCE_DAYS = 5    # trading days before 50% reduction
-TIME_DECAY_EXIT_DAYS = 10     # trading days before full exit
+TIME_DECAY_REDUCE_DAYS = 7    # trading days before 50% reduction
+TIME_DECAY_EXIT_DAYS = 14     # trading days before full exit
 
 # ── Graduated Drawdown defaults ──────────────────────────────────────────────
 
 GRADUATED_DRAWDOWN_ENABLED = True
 DRAWDOWN_TIERS = [
     # (threshold, sizing_multiplier, description)
-    (-0.03, 1.00, "0% to -3%: full sizing"),
-    (-0.05, 0.50, "-3% to -5%: half sizing"),
-    (-0.08, 0.25, "-5% to -8%: quarter sizing, highest conviction only"),
-    # Beyond -0.08: full halt (existing circuit breaker)
+    (-0.02, 1.00, "0% to -2%: full sizing"),
+    (-0.04, 0.50, "-2% to -4%: half sizing"),
+    (-0.06, 0.25, "-4% to -6%: quarter sizing"),
+    # Beyond circuit breaker threshold: full halt
 ]
 
 

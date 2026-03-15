@@ -17,10 +17,10 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-_SECTOR_ADJ = {
-    "overweight": 1.10,
+_DEFAULT_SECTOR_ADJ = {
+    "overweight": 1.05,
     "market_weight": 1.00,
-    "underweight": 0.75,
+    "underweight": 0.85,
 }
 
 
@@ -39,9 +39,9 @@ def compute_position_size(
 
     Algorithm (design doc B.3 + graduated drawdown):
       1. base_weight = 1 / n_enter_signals  (equal weight across all entries today)
-      2. sector_adj: overweight→1.10, market_weight→1.00, underweight→0.75
-      3. conviction_adj: rising/stable→1.00, declining→0.50
-      4. upside_adj: price_target_upside < min_price_target_upside → 0.50
+      2. sector_adj: from config sector_adj map (default: slight OW/UW tilt)
+      3. conviction_adj: rising/stable→1.00, declining→config multiplier
+      4. upside_adj: price_target_upside < min_price_target_upside → config multiplier
       5. drawdown_adj: multiplier from graduated drawdown tiers (1.0/0.50/0.25)
       6. position_weight = min(base * sector * conviction * upside * dd, max_position_pct)
       7. dollar_size = portfolio_nav * position_weight
@@ -53,14 +53,17 @@ def compute_position_size(
     n = max(len(enter_signals), 1)
     base_weight = 1.0 / n
 
-    sector_adj = _SECTOR_ADJ.get(sector_rating, 1.00)
+    sector_adj_map = config.get("sector_adj", _DEFAULT_SECTOR_ADJ)
+    sector_adj = sector_adj_map.get(sector_rating, 1.00)
 
     conviction = signal.get("conviction", "stable")
-    conviction_adj = 0.50 if conviction == "declining" else 1.00
+    conviction_decline_mult = config.get("conviction_decline_adj", 0.70)
+    conviction_adj = conviction_decline_mult if conviction == "declining" else 1.00
 
     upside = signal.get("price_target_upside")
     min_upside = config.get("min_price_target_upside", 0.05)
-    upside_adj = 0.50 if (upside is not None and upside < min_upside) else 1.00
+    upside_fail_mult = config.get("upside_fail_adj", 0.70)
+    upside_adj = upside_fail_mult if (upside is not None and upside < min_upside) else 1.00
 
     max_pct = config.get("max_position_pct", 0.05)
     raw_weight = base_weight * sector_adj * conviction_adj * upside_adj * drawdown_multiplier
