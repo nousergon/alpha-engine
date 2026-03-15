@@ -46,6 +46,56 @@ logger = logging.getLogger(__name__)
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "risk.yaml")
 
+# S3-delivered executor params (loaded once per cold-start)
+_executor_params_cache: dict | None = None
+_executor_params_loaded: bool = False
+
+# Flat param name → nested config path mapping
+_PARAM_MAP = {
+    "atr_multiplier": ("strategy", "exit_manager", "atr_multiplier"),
+    "time_decay_reduce_days": ("strategy", "exit_manager", "time_decay_reduce_days"),
+    "time_decay_exit_days": ("strategy", "exit_manager", "time_decay_exit_days"),
+    "min_score": ("min_score_to_enter",),
+    "max_position_pct": ("max_position_pct",),
+}
+
+
+def _load_executor_params_from_s3(bucket: str) -> dict | None:
+    """Read config/executor_params.json from S3. Cache per cold-start."""
+    global _executor_params_cache, _executor_params_loaded
+    if _executor_params_loaded:
+        return _executor_params_cache
+    _executor_params_loaded = True
+
+    try:
+        import json
+        import boto3
+        s3 = boto3.client("s3")
+        obj = s3.get_object(Bucket=bucket, Key="config/executor_params.json")
+        data = json.loads(obj["Body"].read())
+        # Only keep safe-to-override params
+        safe = {k: v for k, v in data.items() if k in _PARAM_MAP}
+        if safe:
+            logger.info("Loaded executor params from S3: %s", safe)
+            _executor_params_cache = safe
+        return _executor_params_cache
+    except Exception as e:
+        logger.debug("No S3 executor params (using defaults): %s", e)
+        return None
+
+
+def _merge_s3_params(config: dict, s3_params: dict) -> dict:
+    """Merge flat S3 param names into nested config structure."""
+    for param, value in s3_params.items():
+        path = _PARAM_MAP.get(param)
+        if not path:
+            continue
+        target = config
+        for key in path[:-1]:
+            target = target.setdefault(key, {})
+        target[path[-1]] = value
+    return config
+
 
 def load_config() -> dict:
     with open(CONFIG_PATH) as f:
@@ -79,6 +129,12 @@ def run(
                         config["strategy"][sub_key] = sub_val
             else:
                 config[key] = val
+    # Merge S3-delivered params (backtester recommendations) if not in simulate mode
+    if not simulate and not config_override:
+        s3_params = _load_executor_params_from_s3(config.get("signals_bucket", "alpha-engine-research"))
+        if s3_params:
+            config = _merge_s3_params(config, s3_params)
+
     db_path = config["db_path"]
     signals_bucket = config["signals_bucket"]
     trades_bucket = config["trades_bucket"]
