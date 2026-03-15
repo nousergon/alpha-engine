@@ -86,10 +86,40 @@ def run(
     conn = None if simulate else init_db(db_path)
 
     # ── 1. Read signals from S3 (or use injected override) ──────────────────
+    signal_source = config.get("signal_source", "research")
+
     if signals_override is not None:
         signals_raw = signals_override
         run_date = signals_raw.get("date", run_date)
+    elif signal_source == "population":
+        # NEW PATH: generate trading signals from population + technicals + GBM
+        try:
+            from executor.population_reader import read_population
+            from executor.signal_generator import generate_trading_signals, read_predictions
+
+            pop_data = read_population(signals_bucket)
+            predictions = read_predictions(signals_bucket)
+            pop_tickers = [p["ticker"] for p in pop_data.get("population", [])]
+            price_histories_for_scoring = load_price_histories(
+                tickers=pop_tickers,
+                signals_bucket=signals_bucket,
+            )
+            signals_raw = generate_trading_signals(
+                population=pop_data["population"],
+                predictions=predictions,
+                price_histories=price_histories_for_scoring,
+                market_regime=pop_data.get("market_regime", "neutral"),
+                sector_ratings=pop_data.get("sector_ratings", {}),
+                config=config,
+            )
+            logger.info("Signal source: population-based (technical + GBM)")
+        except Exception as e:
+            logger.error(f"Population-based signal generation failed: {e}")
+            if conn:
+                conn.close()
+            return
     else:
+        # LEGACY PATH: read Research signals.json directly
         try:
             signals_raw = read_signals_with_fallback(signals_bucket, run_date)
         except RuntimeError as e:
