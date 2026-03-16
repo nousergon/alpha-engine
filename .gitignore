@@ -1,6 +1,7 @@
 # Secrets / local config
 .env
 config/risk.yaml
+config/.executor_params_cache.json
 
 # Python
 __pycache__/

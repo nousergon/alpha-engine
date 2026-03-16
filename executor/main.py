@@ -24,6 +24,7 @@ import logging
 import os
 import sys
 from datetime import date
+from pathlib import Path
 
 import yaml
 
@@ -60,8 +61,16 @@ _PARAM_MAP = {
 }
 
 
+_EXECUTOR_PARAMS_CACHE_PATH = Path(__file__).resolve().parent.parent / "config" / ".executor_params_cache.json"
+
+
 def _load_executor_params_from_s3(bucket: str) -> dict | None:
-    """Read config/executor_params.json from S3. Cache per cold-start."""
+    """Read config/executor_params.json from S3. Cache per cold-start.
+
+    Fallback chain: S3 → local cache file → None (hardcoded defaults).
+    On successful S3 read, writes a local cache so the last known optimal
+    params survive transient S3 failures.
+    """
     global _executor_params_cache, _executor_params_loaded
     if _executor_params_loaded:
         return _executor_params_cache
@@ -78,10 +87,29 @@ def _load_executor_params_from_s3(bucket: str) -> dict | None:
         if safe:
             logger.info("Loaded executor params from S3: %s", safe)
             _executor_params_cache = safe
+            # Persist to local cache for fault tolerance
+            try:
+                _EXECUTOR_PARAMS_CACHE_PATH.write_text(json.dumps(safe, indent=2))
+            except Exception:
+                pass  # best-effort
         return _executor_params_cache
     except Exception as e:
-        logger.debug("No S3 executor params (using defaults): %s", e)
-        return None
+        logger.warning("Could not read executor params from S3: %s", e)
+
+    # Fallback: last known optimal from local cache
+    try:
+        if _EXECUTOR_PARAMS_CACHE_PATH.exists():
+            import json
+            data = json.loads(_EXECUTOR_PARAMS_CACHE_PATH.read_text())
+            safe = {k: v for k, v in data.items() if k in _PARAM_MAP}
+            if safe:
+                logger.info("Loaded executor params from local cache (last known optimal): %s", safe)
+                _executor_params_cache = safe
+                return _executor_params_cache
+    except Exception as e2:
+        logger.debug("Could not read local executor params cache: %s", e2)
+
+    return None
 
 
 def _merge_s3_params(config: dict, s3_params: dict) -> dict:
