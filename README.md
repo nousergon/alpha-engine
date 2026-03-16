@@ -1,5 +1,6 @@
 # Nous Ergon: Alpha Engine
-__See Nous Ergon blog series on [Hashnode](https://nous-ergon.hashnode.dev/)__
+
+**See the Nous Ergon blog series on [Hashnode](https://nous-ergon.hashnode.dev/)**
 
 **Nous Ergon** (νοῦς ἔργον — "intelligence at work") is a fully autonomous trading system that combines AI-driven research, quantitative prediction, and rule-based execution to generate market alpha.
 
@@ -12,21 +13,21 @@ The system targets sustained outperformance against the S&P 500 by splitting the
 | Layer | Tool | Role |
 |-------|------|------|
 | **Research** | LLM agents (Claude) | Judgment over unstructured data — news, analyst reports, macro context |
-| **Prediction** | Machine learning ensemble (LightGBM) | Pattern recognition over structured numerical features |
+| **Prediction** | Machine learning (LightGBM) | Pattern recognition over structured numerical features |
 | **Execution** | Deterministic rules | Hard risk constraints that never get creative |
 
 ---
 
-## Architecture
+## System Architecture
 
 Five modules run on AWS, connected through a shared S3 bucket. Each module reads its inputs from S3 and writes its outputs back — no shared state beyond the bucket.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    WEEKLY CADENCE (Sunday/Monday)                    │
+│                    WEEKLY CADENCE (Monday)                          │
 │                                                                     │
 │  Research ──── scan 900 tickers, rotate population, write signals  │
-│  Predictor Training ──── retrain on 10y history, promote if IC >   │
+│  Predictor Training ──── retrain on multi-year history, promote    │
 │  Backtester ──── signal quality + weight optimization + param sweep │
 └─────────────────────────────────────────────────────────────────────┘
 
@@ -57,43 +58,43 @@ S3 as the communication bus means any module can be replaced, rewritten, or test
 
 ### 1. Research — [`alpha-engine-research`](https://github.com/cipher813/alpha-engine-research)
 
-Autonomous investment research pipeline. Five LLM agents orchestrated by LangGraph maintain rolling investment theses on ~20 tracked stocks and scan ~900 S&P 500 and S&P 400 tickers weekly for the top buy candidates.
+Autonomous investment research pipeline. Five LLM agents orchestrated by LangGraph maintain rolling investment theses on a configurable universe of tracked stocks and scan ~900 S&P 500/400 tickers weekly for top buy candidates.
 
-- Quantitative filter reduces ~900 tickers to ~50 candidates (no LLM calls)
-- Ranking agent (Sonnet) selects the top ~35 from the filtered set
-- Per-ticker agents (news sentiment + analyst research) run independently on every candidate (Haiku)
+- Quantitative filter reduces ~900 tickers to a shortlist (no LLM calls)
+- Ranking agent (Sonnet) selects top candidates from the filtered set
+- Per-ticker agents (news + research) run independently on every candidate (Haiku)
 - Macro agent (Sonnet) assesses market environment and sector conditions
-- Consolidator agent (Sonnet) synthesizes all analyses into a research brief
+- Consolidator (Sonnet) synthesizes into a morning research brief via email
 - Outputs composite attractiveness scores (0–100) per ticker as `signals.json`
 
 ### 2. Predictor — [`alpha-engine-predictor`](https://github.com/cipher813/alpha-engine-predictor)
 
-LightGBM gradient-boosted model that predicts 5-day market-relative returns for each ticker. Produces directional predictions (UP/FLAT/DOWN) with confidence scores.
+LightGBM model that predicts 5-day market-relative returns for each ticker. Produces directional predictions (UP/FLAT/DOWN) with confidence scores.
 
-- Engineered features across technical indicators, macro context, volume analysis, and cross-sectional measures
+- Engineered features across technical indicators, macro context, volume, and cross-sectional measures
 - Trains on sector-neutral labels (stock returns minus sector ETF returns)
-- Weekly retraining with multi-year price history; new weights promote only if IC gate passes
+- Weekly retraining with walk-forward validation; weights promote only if IC gate passes
 - Veto gate: high-confidence DOWN predictions override BUY signals from Research
 
 ### 3. Executor — [`alpha-engine`](https://github.com/cipher813/alpha-engine) *(this repo)*
 
 Reads signals and predictions from S3, applies hard risk rules, sizes positions, and executes market orders on Interactive Brokers (paper trading).
 
-- Graduated drawdown response: tiered sizing reduction with configurable halt threshold
+- Graduated drawdown response with configurable halt threshold
 - ATR-based trailing stops (volatility-adaptive) with time-decay exit rules
-- Configurable position caps, sector concentration limits, and equity exposure limits
+- Configurable position caps, sector limits, and equity exposure limits
 - Deterministic execution — no reasoning, no prediction, just parameter application
 - Auto-tuned by backtester via S3-delivered `config/executor_params.json`
 
 ### 4. Backtester — [`alpha-engine-backtester`](https://github.com/cipher813/alpha-engine-backtester)
 
-The system's learning mechanism. Validates signal quality, runs attribution analysis, and recommends parameter updates that flow back to upstream modules.
+The system's learning mechanism. Validates signal quality, runs attribution analysis, and autonomously recommends parameter updates that flow back to upstream modules.
 
-- Signal quality: measures BUY signal accuracy at 10-day and 30-day horizons
-- Attribution: correlates sub-scores (news vs. research) with outperformance outcomes
+- Signal quality: measures BUY signal accuracy at configurable horizons
+- Attribution: correlates sub-scores with outperformance outcomes
 - Weight optimization: adjusts Research scoring weights with conservative guardrails
 - Parameter sweep: randomized search across executor parameters, ranked by Sharpe ratio
-- Veto threshold calibration: sweeps predictor confidence thresholds against historical outcomes
+- Veto threshold calibration: sweeps predictor confidence thresholds
 
 ### 5. Dashboard — [`alpha-engine-dashboard`](https://github.com/cipher813/alpha-engine-dashboard)
 
@@ -101,16 +102,81 @@ Read-only Streamlit application for monitoring the full system: portfolio perfor
 
 ---
 
+## Getting Started
+
+Each module has its own README with a Quick Start section. The table below shows what you need to configure for each:
+
+| Module | Config Files to Create | First Command |
+|--------|----------------------|---------------|
+| [Research](https://github.com/cipher813/alpha-engine-research) | `.env`, `config/universe.yaml`, `config/scoring.yaml`, `config/prompts/` + 13 proprietary source files | `python3 main.py --dry-run --skip-scanner` |
+| [Predictor](https://github.com/cipher813/alpha-engine-predictor) | `config/predictor.yaml` | `python train_gbm.py --data-dir data/cache` |
+| [Executor](https://github.com/cipher813/alpha-engine) | `config/risk.yaml` | `python executor/main.py --dry-run` |
+| [Backtester](https://github.com/cipher813/alpha-engine-backtester) | `config.yaml` | `python backtest.py --mode signal-quality` |
+| [Dashboard](https://github.com/cipher813/alpha-engine-dashboard) | None (works with defaults) | `streamlit run app.py` |
+
+---
+
+## Executor Quick Start (This Repo)
+
+### Prerequisites
+
+- Python 3.11+
+- IB Gateway running in paper mode on port 4002
+- AWS credentials with S3 read/write and SES send permission
+
+### Setup
+
+```bash
+git clone https://github.com/cipher813/alpha-engine.git
+cd alpha-engine
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+cp config/risk.yaml.example config/risk.yaml
+# Edit config/risk.yaml — set S3 bucket names, email addresses, risk parameters
+
+python executor/connection_test.py   # verify IB Gateway
+python executor/main.py --dry-run    # full loop, no orders placed
+```
+
+### Key Files
+
+```
+executor/main.py              # Daily trading loop (entry point)
+executor/signal_reader.py     # Reads signals.json from S3
+executor/risk_guard.py        # Hard rule enforcement + graduated drawdown
+executor/position_sizer.py    # Equal-weight base with adjustments
+executor/ibkr.py              # IB Gateway wrapper (ib_insync)
+executor/strategies/          # ATR trailing stops + time-decay exits
+executor/eod_reconcile.py     # EOD P&L vs SPY + email
+config/risk.yaml.example      # Safe template — copy to config/risk.yaml
+```
+
+---
+
+## Auto-Optimization
+
+The backtester writes three S3 config files that upstream modules read on cold-start, closing the feedback loop automatically:
+
+| S3 Key | Written By | Read By | Controls |
+|--------|-----------|---------|----------|
+| `config/scoring_weights.json` | Backtester | Research | Sub-score composite weights |
+| `config/executor_params.json` | Backtester | Executor | Risk parameters and sizing |
+| `config/predictor_params.json` | Backtester | Predictor | Veto confidence threshold |
+
+---
+
 ## Key Metrics
 
-| Metric | What it measures |
+| Metric | What It Measures |
 |--------|-----------------|
 | Total alpha | Portfolio cumulative return − SPY cumulative return |
-| Sharpe ratio | Risk-adjusted return (annualized) — primary optimization target |
+| Sharpe ratio | Risk-adjusted return (annualized) |
 | Daily alpha | Portfolio daily return − SPY daily return |
 | Signal accuracy | % of BUY signals beating SPY over configurable windows |
 | GBM IC | Rank correlation of predicted vs actual forward returns |
-| Max drawdown | Peak-to-trough portfolio decline (circuit breaker threshold configurable) |
+| Max drawdown | Peak-to-trough portfolio decline |
 
 ---
 
@@ -135,9 +201,9 @@ s3://alpha-engine-research/
 │   ├── trades_full.csv                  ← Complete trade audit log
 │   └── eod_pnl.csv                      ← Daily NAV, return, alpha
 ├── backtest/{date}/                     ← Weekly backtester outputs
-├── config/scoring_weights.json          ← Auto-updated by backtester → Research
-├── config/executor_params.json          ← Auto-updated by backtester → Executor
-├── config/predictor_params.json         ← Auto-updated by backtester → Predictor
+├── config/scoring_weights.json          ← Auto-updated by Backtester → Research
+├── config/executor_params.json          ← Auto-updated by Backtester → Executor
+├── config/predictor_params.json         ← Auto-updated by Backtester → Predictor
 └── research.db                          ← SQLite (signal history, theses)
 ```
 
@@ -157,31 +223,15 @@ s3://alpha-engine-research/
 
 ---
 
-## Executor Setup (this repo)
+## Related Modules
 
-### Prerequisites
-
-- IB Gateway running in paper mode on port 4002
-- AWS credentials with S3 read/write and SES send permission
-- Python 3.11+
-
-### Quick start
-
-```bash
-git clone https://github.com/cipher813/alpha-engine.git
-cd alpha-engine
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp config/risk.yaml.example config/risk.yaml
-# Edit config/risk.yaml with your S3 bucket names and email
-
-python executor/connection_test.py   # verify IB Gateway
-python executor/main.py --dry-run    # full loop, no orders
-```
+- [`alpha-engine-research`](https://github.com/cipher813/alpha-engine-research) — Autonomous LLM research pipeline
+- [`alpha-engine-predictor`](https://github.com/cipher813/alpha-engine-predictor) — GBM predictor (5-day alpha predictions)
+- [`alpha-engine-backtester`](https://github.com/cipher813/alpha-engine-backtester) — Signal quality analysis and parameter optimization
+- [`alpha-engine-dashboard`](https://github.com/cipher813/alpha-engine-dashboard) — Streamlit monitoring dashboard
 
 ---
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
