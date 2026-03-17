@@ -223,6 +223,38 @@ s3://alpha-engine-research/
 
 ---
 
+## Opportunities for Improvement
+
+### Execution Quality
+
+- **No connection heartbeat** — IB Gateway connection is created once at startup. If Gateway restarts mid-execution, the executor crashes with no recovery. Plan: add connection health check before each order block, with automatic reconnect on failure.
+
+### Risk Management
+
+- **No volatility-adjusted position sizing** — position sizes don't scale with VIX or realized volatility. Plan: add ATR-based sizing layer (`risk_per_trade / (ATR_14 * price)`) that naturally sizes smaller in volatile names.
+- **No cross-ticker correlation monitoring** — hidden concentration risk when multiple correlated positions are held (e.g., MSFT + AAPL + GOOGL all correlated >0.8). Plan: compute pairwise rolling correlations and alert or reduce when portfolio-level correlation exceeds a threshold.
+- **No profit-taking mechanism** — positions that gain 25%+ have no trim mechanism. Plan: add configurable profit-taking rules (e.g., trim 25% at +20%, trim 50% at +30%).
+- **Graduated drawdown only adjusts new entry sizing** — existing positions are untouched during drawdowns. Plan: add forced exit of lowest-conviction holdings when drawdown exceeds a configurable threshold, raising cash for recovery.
+- **Confidence-weighted sizing from predictor** — currently the predictor veto is binary (block or pass). Plan: map `p_up` to a continuous sizing multiplier (e.g., p_up 0.50-0.55 = 0.25x, 0.75+ = 1.0x) to extract more value from the ML signal.
+
+### Entry/Exit Strategy
+
+- **No entry momentum confirmation gate** — Plan: require 5d momentum > 0 and price above 20d MA before entering, reducing bad entries by an estimated 15-25%.
+- **No sector-relative exit** — ATR stop is absolute price-based. A stock dropping -15% while its sector drops -20% is actually outperforming. Plan: add sector-relative exit option that triggers only when the stock underperforms its sector.
+- **No momentum-based exit** — no trigger when 20-day momentum flips negative or RSI drops below 30.
+- **REDUCE always sells exactly 50%** — no configuration for partial reduction amounts. Plan: make reduction percentage configurable.
+
+### Signal Integration
+
+- **No signal staleness discount** — a 5-day-old signal is treated identically to today's signal. Plan: add a score decay factor proportional to signal age.
+- **No earnings date awareness** — positions hold through earnings with no volatility adjustment. Plan: reduce position size or tighten stops ahead of known earnings dates (available from FMP calendar).
+
+### EOD Reconciliation
+
+- **No alpha attribution by sector** — EOD email shows total alpha but not sector breakdown. Plan: compute per-sector contribution to daily alpha.
+
+---
+
 ## Related Modules
 
 - [`alpha-engine-research`](https://github.com/cipher813/alpha-engine-research) — Autonomous LLM research pipeline
