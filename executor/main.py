@@ -32,6 +32,7 @@ import yaml
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from executor.ibkr import IBKRClient, SimulatedIBKRClient
+from executor.market_hours import is_market_hours
 from executor.position_sizer import compute_position_size
 from executor.risk_guard import check_order, compute_drawdown_multiplier
 from executor.signal_reader import get_actionable_signals, read_signals_with_fallback
@@ -232,6 +233,12 @@ def run(
         f"REDUCE={len(signals['reduce'])} HOLD={len(signals['hold'])}"
     )
 
+    # ── 1b. Market hours gate ────────────────────────────────────────────────
+    if not simulate and not dry_run:
+        if not is_market_hours():
+            logger.warning("Market is not open — skipping live order placement")
+            return
+
     # ── 2. Connect to IBKR (or use injected simulated client) ───────────────
     if simulate:
         ibkr = ibkr_client
@@ -376,6 +383,11 @@ def run(
             })
         elif not dry_run:
             order_result = ibkr.place_market_order(ticker, "BUY", sizing["shares"])
+            if order_result["status"] in ("Rejected", "Timeout"):
+                logger.warning(
+                    f"ENTER {ticker} order {order_result['status']} — skipping trade log"
+                )
+                continue
             pred = predictions_by_ticker.get(ticker, {})
             log_trade(conn, {
                 "date": run_date,
@@ -414,6 +426,10 @@ def run(
                     },
                     "risk_guard_reason": reason,
                 }),
+                "fill_price": order_result.get("fill_price"),
+                "fill_time": order_result.get("fill_time"),
+                "filled_shares": order_result.get("filled_shares"),
+                "status": order_result.get("status"),
             })
 
     # ── 4. Process EXIT signals (Research + Strategy) ───────────────────────
@@ -460,6 +476,11 @@ def run(
         elif not dry_run:
             current_price = ibkr.get_current_price(ticker)
             order_result = ibkr.place_market_order(ticker, "SELL", shares_held)
+            if order_result["status"] in ("Rejected", "Timeout"):
+                logger.warning(
+                    f"EXIT {ticker} order {order_result['status']} — skipping trade log"
+                )
+                continue
             pred = predictions_by_ticker.get(ticker, {})
             log_trade(conn, {
                 "date": run_date,
@@ -485,6 +506,11 @@ def run(
                     "predicted_direction": pred.get("predicted_direction"),
                     "predicted_alpha": pred.get("predicted_alpha"),
                 }),
+                "fill_price": order_result.get("fill_price"),
+                "fill_time": order_result.get("fill_time"),
+                "filled_shares": order_result.get("filled_shares"),
+                "status": order_result.get("status"),
+                "exit_reason": sig.get("reason", "research_signal"),
             })
 
     # ── 5. Process REDUCE signals (Research + Strategy) ─────────────────────
@@ -540,6 +566,11 @@ def run(
         elif not dry_run:
             current_price = ibkr.get_current_price(ticker)
             order_result = ibkr.place_market_order(ticker, "SELL", shares_to_sell)
+            if order_result["status"] in ("Rejected", "Timeout"):
+                logger.warning(
+                    f"REDUCE {ticker} order {order_result['status']} — skipping trade log"
+                )
+                continue
             remaining_value = (shares_held - shares_to_sell) * (current_price or 0)
             pred = predictions_by_ticker.get(ticker, {})
             log_trade(conn, {
@@ -566,6 +597,11 @@ def run(
                     "predicted_direction": pred.get("predicted_direction"),
                     "predicted_alpha": pred.get("predicted_alpha"),
                 }),
+                "fill_price": order_result.get("fill_price"),
+                "fill_time": order_result.get("fill_time"),
+                "filled_shares": order_result.get("filled_shares"),
+                "status": order_result.get("status"),
+                "exit_reason": sig.get("reason", "research_signal"),
             })
 
     # ── 6. Backup and disconnect ─────────────────────────────────────────────

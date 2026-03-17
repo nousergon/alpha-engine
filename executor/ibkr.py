@@ -87,31 +87,83 @@ class IBKRClient:
 
     # ── Orders ────────────────────────────────────────────────────────────────
 
-    def place_market_order(self, ticker: str, action: str, shares: int) -> dict:
+    def place_market_order(self, ticker: str, action: str, shares: int, timeout_seconds: float = 30.0) -> dict:
         """
-        Place a market order.
+        Place a market order and wait for fill confirmation.
 
         Args:
             ticker: stock symbol
             action: "BUY" | "SELL"
             shares: number of shares
+            timeout_seconds: max seconds to wait for fill (default 30)
 
         Returns:
-            {"ib_order_id": int, "status": str}
+            {"ib_order_id": int, "status": str, "fill_price": float|None,
+             "filled_shares": int|None, "fill_time": str|None}
+            status values: "Filled", "PartialFill", "Rejected", "Timeout", or IB status
         """
         contract = Stock(ticker, "SMART", "USD")
-        self.ib.qualifyContracts(contract)
+        try:
+            self.ib.qualifyContracts(contract)
+        except Exception as e:
+            logger.error(f"Could not qualify contract for {ticker}: {e}")
+            return {
+                "ib_order_id": None,
+                "status": "Rejected",
+                "fill_price": None,
+                "filled_shares": None,
+                "fill_time": None,
+            }
+
         order = MarketOrder(action, shares)
         trade = self.ib.placeOrder(contract, order)
-        self.ib.sleep(1)
+
+        # Poll for fill confirmation
+        terminal_states = {"Filled", "Cancelled", "Inactive", "ApiCancelled"}
+        elapsed = 0.0
+        poll_interval = 0.5
+        while elapsed < timeout_seconds:
+            self.ib.sleep(poll_interval)
+            elapsed += poll_interval
+            status = trade.orderStatus.status
+            if status in terminal_states:
+                break
+
+        status = trade.orderStatus.status
+        fill_price = None
+        filled_shares = None
+        fill_time = None
+
+        if trade.fills:
+            total_qty = sum(f.execution.shares for f in trade.fills)
+            total_cost = sum(f.execution.shares * f.execution.price for f in trade.fills)
+            fill_price = round(total_cost / total_qty, 4) if total_qty > 0 else None
+            filled_shares = int(total_qty)
+            fill_time = trade.fills[-1].execution.time.isoformat() if trade.fills[-1].execution.time else None
+
+        # Normalize status
+        if status == "Filled":
+            result_status = "Filled"
+        elif status in ("Cancelled", "Inactive", "ApiCancelled"):
+            result_status = "Rejected"
+        elif filled_shares and filled_shares < shares:
+            result_status = "PartialFill"
+        elif status not in terminal_states:
+            result_status = "Timeout"
+        else:
+            result_status = status
 
         logger.info(
-            f"Order placed: {action} {shares} {ticker} "
-            f"| orderId={trade.order.orderId} status={trade.orderStatus.status}"
+            f"Order {result_status}: {action} {shares} {ticker} "
+            f"| orderId={trade.order.orderId} fill_price={fill_price} "
+            f"filled_shares={filled_shares}"
         )
         return {
             "ib_order_id": trade.order.orderId,
-            "status": trade.orderStatus.status,
+            "status": result_status,
+            "fill_price": fill_price,
+            "filled_shares": filled_shares,
+            "fill_time": fill_time,
         }
 
     # ── Historical data ───────────────────────────────────────────────────────
@@ -244,7 +296,13 @@ class SimulatedIBKRClient:
                 else:
                     held["shares"] = held_shares - shares
             self._cash += shares * price
-        return {"ib_order_id": None}
+        return {
+            "ib_order_id": None,
+            "status": "Filled",
+            "fill_price": price,
+            "filled_shares": shares,
+            "fill_time": None,
+        }
 
     def get_historical_bar(self, ticker: str, date: str) -> dict | None:
         price = self._prices.get(ticker)
