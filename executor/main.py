@@ -148,6 +148,16 @@ def run(
     run_date = str(date.today())
     logger.info(f"Executor starting | date={run_date} | dry_run={dry_run} | simulate={simulate}")
 
+    # Flow Doctor: structured error capture (skip in backtester simulate mode)
+    fd = None
+    if not simulate:
+        try:
+            import flow_doctor
+            fd = flow_doctor.init(config_path=os.path.join(
+                os.path.dirname(os.path.dirname(__file__)), "flow-doctor.yaml"))
+        except Exception:
+            pass
+
     config = load_config()
     if config_override:
         for key, val in config_override.items():
@@ -201,6 +211,12 @@ def run(
             logger.info("Signal source: population-based (technical + GBM)")
         except Exception as e:
             logger.error(f"Population-based signal generation failed: {e}")
+            if fd:
+                fd.report(e, severity="critical", context={
+                    "site": "population_signal_generation",
+                    "signal_source": signal_source,
+                    "run_date": run_date,
+                })
             if conn:
                 conn.close()
             return
@@ -210,6 +226,13 @@ def run(
             signals_raw = read_signals_with_fallback(signals_bucket, run_date)
         except RuntimeError as e:
             logger.error(f"Cannot proceed without signals: {e}")
+            if fd:
+                fd.report(e, severity="critical", context={
+                    "site": "research_signal_read",
+                    "signal_source": signal_source,
+                    "run_date": run_date,
+                    "signals_bucket": signals_bucket,
+                })
             if conn:
                 conn.close()
             return
@@ -222,7 +245,12 @@ def run(
         try:
             from executor.signal_generator import read_predictions
             predictions_by_ticker = read_predictions(signals_bucket)
-        except Exception:
+        except Exception as e:
+            if fd:
+                fd.report(e, severity="warning", context={
+                    "site": "gbm_predictions_read",
+                    "signals_bucket": signals_bucket,
+                })
             predictions_by_ticker = {}
     else:
         predictions_by_ticker = {}
@@ -306,6 +334,7 @@ def run(
         )
 
     enter_signals = signals["enter"]
+    n_entered = 0
 
     # ── 3. Process ENTER signals ─────────────────────────────────────────────
     for sig in enter_signals:
@@ -317,6 +346,17 @@ def run(
         if ticker in current_positions:
             logger.info(f"SKIP ENTER {ticker} — already in portfolio")
             continue
+
+        # O10: Earnings proximity warning — entering right before earnings is high-risk
+        # Check predictor predictions for next_earnings_days (populated by earnings_fetcher)
+        earnings_warning_days = config.get("earnings_proximity_warning_days", 2)
+        pred_data = predictions_by_ticker.get(ticker, {})
+        next_earnings_days = pred_data.get("next_earnings_days") or sig.get("next_earnings_days")
+        if next_earnings_days is not None and next_earnings_days <= earnings_warning_days:
+            logger.warning(
+                f"EARNINGS WARNING: {ticker} reports in {next_earnings_days} day(s) — "
+                f"entering before earnings carries elevated event risk"
+            )
 
         current_price = ibkr.get_current_price(ticker)
         if not current_price:
@@ -364,6 +404,7 @@ def run(
             f"(${sizing['dollar_size']:.0f}, {sizing['position_pct']*100:.1f}% NAV)"
         )
 
+        n_entered += 1
         if simulate:
             orders.append({
                 "date": run_date,
@@ -431,6 +472,19 @@ def run(
                 "filled_shares": order_result.get("filled_shares"),
                 "status": order_result.get("status"),
             })
+
+    # Flow Doctor: report if all entry signals were blocked
+    if fd and len(enter_signals) > 0 and n_entered == 0:
+        fd.report(
+            severity="warning",
+            message=f"All {len(enter_signals)} ENTER signals blocked by risk guard",
+            context={
+                "site": "all_entries_blocked",
+                "run_date": run_date,
+                "market_regime": market_regime,
+                "n_candidates": len(enter_signals),
+            },
+        )
 
     # ── 4. Process EXIT signals (Research + Strategy) ───────────────────────
     # Merge Research exits with strategy-generated exits (deduplicate by ticker)

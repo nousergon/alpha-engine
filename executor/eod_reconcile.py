@@ -48,26 +48,27 @@ def _spy_close(run_date: str) -> float | None:
     return None
 
 
-def _load_signals_from_s3(bucket: str, run_date: str) -> dict:
+def _load_signals_from_s3(bucket: str, run_date: str, fd=None) -> dict:
     """Load today's signals.json from S3. Returns {} on failure."""
     s3 = boto3.client("s3")
     for dt in [run_date]:
         try:
             obj = s3.get_object(Bucket=bucket, Key=f"signals/{dt}/signals.json")
             return json.loads(obj["Body"].read())
-        except Exception:
-            pass
+        except Exception as e:
+            if fd: fd.report(e, severity="warning", context={"site": "load_signals_s3", "date": dt})
     return {}
 
 
-def _load_predictions_from_s3(bucket: str) -> dict:
+def _load_predictions_from_s3(bucket: str, fd=None) -> dict:
     """Load latest predictions from S3. Returns {ticker: pred_dict}."""
     s3 = boto3.client("s3")
     try:
         obj = s3.get_object(Bucket=bucket, Key="predictor/predictions/latest.json")
         data = json.loads(obj["Body"].read())
         return {p["ticker"]: p for p in data.get("predictions", []) if "ticker" in p}
-    except Exception:
+    except Exception as e:
+        if fd: fd.report(e, severity="warning", context={"site": "load_predictions_s3"})
         return {}
 
 
@@ -76,10 +77,11 @@ def _build_position_contexts(
     conn,
     signals_bucket: str,
     run_date: str,
+    fd=None,
 ) -> list[dict]:
     """Assemble per-position context for rationale synthesis."""
-    signals_data = _load_signals_from_s3(signals_bucket, run_date)
-    predictions = _load_predictions_from_s3(signals_bucket)
+    signals_data = _load_signals_from_s3(signals_bucket, run_date, fd=fd)
+    predictions = _load_predictions_from_s3(signals_bucket, fd=fd)
 
     # Build signals lookup
     signals_by_ticker = {}
@@ -134,7 +136,7 @@ def _build_position_contexts(
     return contexts
 
 
-def _synthesize_rationales(contexts: list[dict]) -> dict[str, str]:
+def _synthesize_rationales(contexts: list[dict], fd=None) -> dict[str, str]:
     """Call Haiku to synthesize per-position narratives. Falls back to templates."""
     if not contexts:
         return {}
@@ -162,6 +164,7 @@ def _synthesize_rationales(contexts: list[dict]) -> dict[str, str]:
         return {n["ticker"]: n["narrative"] for n in result.get("narratives", [])}
     except Exception as e:
         logger.warning(f"LLM rationale synthesis failed: {e} — using template fallback")
+        if fd: fd.report(e, severity="warning", context={"site": "llm_rationale_synthesis"})
 
     # Template fallback
     narratives = {}
@@ -201,6 +204,14 @@ def _synthesize_rationales(contexts: list[dict]) -> dict[str, str]:
 def run(run_date: str | None = None):
     run_date = run_date or str(date.today())
     logger.info(f"EOD reconciliation | date={run_date}")
+
+    fd = None
+    try:
+        import flow_doctor
+        fd = flow_doctor.init(config_path=os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), "flow-doctor-eod.yaml"))
+    except Exception:
+        pass
 
     with open(CONFIG_PATH) as f:
         config = yaml.safe_load(f)
@@ -243,6 +254,7 @@ def run(run_date: str | None = None):
                 spy_return = float((hist["Close"].values.flat[-1] / hist["Close"].values.flat[-2] - 1) * 100)
         except Exception as e:
             logger.warning(f"SPY return calc failed: {e}")
+            if fd: fd.report(e, severity="warning", context={"site": "spy_return_calc"})
 
     alpha = (daily_return - spy_return) if (daily_return is not None and spy_return is not None) else None
 
@@ -270,9 +282,13 @@ def run(run_date: str | None = None):
         (trades_df, "trades/trades_full.csv"),
         (eod_df, "trades/eod_pnl.csv"),
     ]:
-        buf = df.to_csv(index=False).encode()
-        s3.put_object(Bucket=trades_bucket, Key=key, Body=buf)
-        logger.info(f"Exported {key} ({len(df)} rows) to s3://{trades_bucket}/{key}")
+        try:
+            buf = df.to_csv(index=False).encode()
+            s3.put_object(Bucket=trades_bucket, Key=key, Body=buf)
+            logger.info(f"Exported {key} ({len(df)} rows) to s3://{trades_bucket}/{key}")
+        except Exception as e:
+            logger.warning(f"S3 CSV export failed for {key}: {e}")
+            if fd: fd.report(e, severity="warning", context={"site": "s3_csv_export", "key": key})
 
     backup_to_s3(db_path, run_date, trades_bucket)
 
@@ -281,24 +297,29 @@ def run(run_date: str | None = None):
     position_narratives = {}
     try:
         if positions:
-            contexts = _build_position_contexts(positions, conn, signals_bucket, run_date)
-            position_narratives = _synthesize_rationales(contexts)
+            contexts = _build_position_contexts(positions, conn, signals_bucket, run_date, fd=fd)
+            position_narratives = _synthesize_rationales(contexts, fd=fd)
             logger.info(f"Position narratives generated for {len(position_narratives)} tickers")
     except Exception as e:
         logger.warning(f"Position rationale generation failed: {e}")
+        if fd: fd.report(e, severity="warning", context={"site": "rationale_generation"})
 
-    send_eod_email(
-        run_date=run_date,
-        nav=nav,
-        daily_return=daily_return,
-        spy_return=spy_return,
-        alpha=alpha,
-        positions=positions,
-        conn=conn,
-        sender=config["email_sender"],
-        recipients=config["email_recipients"],
-        position_narratives=position_narratives,
-    )
+    try:
+        send_eod_email(
+            run_date=run_date,
+            nav=nav,
+            daily_return=daily_return,
+            spy_return=spy_return,
+            alpha=alpha,
+            positions=positions,
+            conn=conn,
+            sender=config["email_sender"],
+            recipients=config["email_recipients"],
+            position_narratives=position_narratives,
+        )
+    except Exception as e:
+        logger.error(f"EOD email failed: {e}")
+        if fd: fd.report(e, severity="error", context={"site": "send_eod_email"})
 
     conn.close()
     logger.info("EOD reconciliation complete")

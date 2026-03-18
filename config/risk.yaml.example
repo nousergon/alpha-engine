@@ -76,5 +76,10 @@ strategy:
       - [-0.04, 0.50, "-2% to -4%: half sizing"]
       - [-0.06, 0.25, "-4% to -6%: quarter sizing"]
 
+# ── Earnings proximity (O10) ──────────────────────────────────────────────
+# Warn (log + email mention) when entering a position within N days of earnings.
+# Informational only — not a gate. The predictor features handle the signal.
+earnings_proximity_warning_days: 2
+
 # ── Paths (adjust to your deployment) ───────────────────────────────────────
 db_path: "/path/to/trades.db"
