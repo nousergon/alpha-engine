@@ -1,9 +1,12 @@
 """
 Exit manager — generates EXIT and REDUCE signals from quantitative rules.
 
-Two independent exit strategies run in parallel:
+Five independent exit strategies run in parallel:
   1. ATR trailing stop: exit if price falls below highest_high - ATR * multiplier
-  2. Time-based decay: reduce after N days, exit after M days without thesis refresh
+  2. Profit-taking: reduce when unrealized gain exceeds threshold
+  3. Momentum exit: exit on severe negative momentum + oversold RSI
+  4. Time-based decay: reduce after N days, exit after M days without thesis refresh
+  5. Sector-relative veto: cancel ATR exit if stock is outperforming its sector
 
 These are additive to Research signals — if Research says HOLD but exit_manager
 says EXIT, the exit fires. Research EXIT signals always take precedence.
@@ -18,6 +21,20 @@ import logging
 from datetime import date, timedelta
 
 logger = logging.getLogger(__name__)
+
+SECTOR_ETF_MAP = {
+    "Technology": "XLK",
+    "Healthcare": "XLV",
+    "Financial": "XLF",
+    "Consumer Discretionary": "XLY",
+    "Consumer Staples": "XLP",
+    "Energy": "XLE",
+    "Utilities": "XLU",
+    "Real Estate": "XLRE",
+    "Materials": "XLB",
+    "Industrials": "XLI",
+    "Communication Services": "XLC",
+}
 
 
 def check_atr_trailing_stop(
@@ -163,6 +180,162 @@ def check_time_decay(
     return None
 
 
+def check_profit_take(
+    ticker: str,
+    current_price: float,
+    avg_cost: float | None,
+    strategy_config: dict,
+) -> dict | None:
+    """
+    Check if a position should be partially sold to lock in gains.
+
+    If unrealized gain exceeds the configured threshold, return a REDUCE signal.
+
+    Args:
+        ticker: stock symbol
+        current_price: current market price
+        avg_cost: average cost basis per share
+        strategy_config: from load_strategy_config()
+
+    Returns:
+        REDUCE signal dict if profit threshold exceeded, else None.
+    """
+    if not strategy_config.get("profit_take_enabled", True):
+        return None
+
+    if avg_cost is None or avg_cost <= 0:
+        return None
+
+    unrealized_gain = (current_price - avg_cost) / avg_cost
+    threshold = strategy_config.get("profit_take_pct", 0.25)
+
+    if unrealized_gain >= threshold:
+        logger.info(
+            f"PROFIT TAKE triggered for {ticker}: "
+            f"gain={unrealized_gain:.2%} >= threshold={threshold:.2%}"
+        )
+        return {
+            "ticker": ticker,
+            "action": "REDUCE",
+            "reason": "profit_take",
+            "detail": (
+                f"unrealized gain {unrealized_gain:.2%} >= "
+                f"threshold {threshold:.2%}"
+            ),
+            "unrealized_gain": round(unrealized_gain, 4),
+        }
+
+    return None
+
+
+def check_sector_relative_veto(
+    ticker: str,
+    sector: str,
+    price_history: list[dict],
+    sector_etf_history: list[dict],
+    strategy_config: dict,
+) -> bool:
+    """
+    Veto an exit if the stock is outperforming its sector ETF.
+
+    If the stock's recent return exceeds the sector ETF return by more than
+    the configured threshold, the exit should be vetoed (stock still has
+    relative momentum).
+
+    Args:
+        ticker: stock symbol
+        sector: sector name (used for logging only)
+        price_history: stock OHLCV bars sorted ascending
+        sector_etf_history: sector ETF OHLCV bars sorted ascending
+        strategy_config: from load_strategy_config()
+
+    Returns:
+        True if exit should be vetoed, False otherwise.
+    """
+    if not strategy_config.get("sector_relative_veto_enabled", True):
+        return False
+
+    if not price_history or len(price_history) < 5:
+        return False
+
+    if not sector_etf_history or len(sector_etf_history) < 5:
+        return False
+
+    lookback = min(20, len(price_history), len(sector_etf_history))
+
+    stock_return = (
+        price_history[-1]["close"] / price_history[-lookback]["close"]
+    ) - 1
+    sector_return = (
+        sector_etf_history[-1]["close"] / sector_etf_history[-lookback]["close"]
+    ) - 1
+
+    outperformance = stock_return - sector_return
+    threshold = strategy_config.get("sector_relative_outperform_threshold", 0.05)
+
+    if outperformance > threshold:
+        logger.warning(
+            f"SECTOR VETO for {ticker}: outperforming {sector} by "
+            f"{outperformance:.2%} (threshold={threshold:.2%}) — exit vetoed"
+        )
+        return True
+
+    return False
+
+
+def check_momentum_exit(
+    ticker: str,
+    price_history: list[dict],
+    strategy_config: dict,
+) -> dict | None:
+    """
+    Check if a position should be exited based on severe negative momentum.
+
+    Triggers when both 20-day momentum is deeply negative AND RSI is oversold,
+    indicating a sustained downtrend with no reversal signal.
+
+    Args:
+        ticker: stock symbol
+        price_history: OHLCV bars sorted ascending (needs >= 21 bars)
+        strategy_config: from load_strategy_config()
+
+    Returns:
+        EXIT signal dict if momentum criteria met, else None.
+    """
+    if not strategy_config.get("momentum_exit_enabled", True):
+        return None
+
+    if price_history is None or len(price_history) < 21:
+        return None
+
+    # 20-day momentum (percentage)
+    momentum = (price_history[-1]["close"] / price_history[-21]["close"] - 1) * 100
+
+    # RSI(14)
+    rsi = _compute_rsi(price_history, period=14)
+
+    mom_threshold = strategy_config.get("momentum_exit_threshold", -15.0)
+    rsi_threshold = strategy_config.get("momentum_exit_rsi", 30)
+
+    if momentum < mom_threshold and rsi is not None and rsi < rsi_threshold:
+        logger.info(
+            f"MOMENTUM EXIT triggered for {ticker}: "
+            f"20d momentum={momentum:.1f}% (< {mom_threshold}%), "
+            f"RSI={rsi:.1f} (< {rsi_threshold})"
+        )
+        return {
+            "ticker": ticker,
+            "action": "EXIT",
+            "reason": "momentum_exit",
+            "detail": (
+                f"20d momentum={momentum:.1f}% (threshold={mom_threshold}%), "
+                f"RSI(14)={rsi:.1f} (threshold={rsi_threshold})"
+            ),
+        }
+
+    return None
+
+
 def evaluate_exits(
     current_positions: dict[str, dict],
     signals_by_ticker: dict[str, dict],
@@ -170,6 +343,7 @@ def evaluate_exits(
     price_histories: dict[str, list[dict]],
     ibkr_client,
     strategy_config: dict,
+    sector_etf_histories: dict[str, list[dict]] | None = None,
 ) -> list[dict]:
     """
     Evaluate all held positions against exit rules.
@@ -178,6 +352,12 @@ def evaluate_exits(
     merged with Research signals in main.py — strategy exits supplement
     Research exits (they don't conflict).
 
+    Check order:
+      1. ATR trailing stop (with sector-relative veto)
+      2. Profit-taking
+      3. Momentum exit
+      4. Time-based decay
+
     Args:
         current_positions: {ticker: {shares, market_value, avg_cost, sector, entry_date}}
         signals_by_ticker: {ticker: signal_dict} from Research
@@ -185,6 +365,8 @@ def evaluate_exits(
         price_histories: {ticker: [{date, open, high, low, close}, ...]}
         ibkr_client: for fetching current prices
         strategy_config: from load_strategy_config()
+        sector_etf_histories: {etf_ticker: [{date, open, high, low, close}, ...]}
+                              for sector-relative veto. None disables veto.
 
     Returns:
         List of signal dicts with action="EXIT" or "REDUCE" and reason field.
@@ -207,8 +389,9 @@ def evaluate_exits(
         if current_price is None:
             continue
 
-        # 1. ATR trailing stop
         history = price_histories.get(ticker, [])
+
+        # 1. ATR trailing stop (with sector-relative veto)
         atr_signal = check_atr_trailing_stop(
             ticker=ticker,
             current_price=current_price,
@@ -217,10 +400,47 @@ def evaluate_exits(
             strategy_config=strategy_config,
         )
         if atr_signal:
-            strategy_signals.append(atr_signal)
-            continue  # ATR exit takes priority over time decay
+            # Check sector-relative veto before accepting ATR exit
+            sector = pos.get("sector", "")
+            etf_ticker = SECTOR_ETF_MAP.get(sector, "SPY")
+            etf_history = (
+                sector_etf_histories.get(etf_ticker, [])
+                if sector_etf_histories
+                else []
+            )
+            if check_sector_relative_veto(
+                ticker, sector, history, etf_history, strategy_config
+            ):
+                logger.info(
+                    f"ATR exit for {ticker} vetoed — outperforming sector ({sector})"
+                )
+            else:
+                strategy_signals.append(atr_signal)
+                continue  # ATR exit takes priority over other checks
 
-        # 2. Time-based decay
+        # 2. Profit-taking
+        avg_cost = pos.get("avg_cost")
+        profit_signal = check_profit_take(
+            ticker=ticker,
+            current_price=current_price,
+            avg_cost=avg_cost,
+            strategy_config=strategy_config,
+        )
+        if profit_signal:
+            strategy_signals.append(profit_signal)
+            continue  # Profit-take fires, skip remaining checks
+
+        # 3. Momentum exit
+        momentum_signal = check_momentum_exit(
+            ticker=ticker,
+            price_history=history,
+            strategy_config=strategy_config,
+        )
+        if momentum_signal:
+            strategy_signals.append(momentum_signal)
+            continue  # Momentum exit fires, skip time decay
+
+        # 4. Time-based decay
         time_signal = check_time_decay(
             ticker=ticker,
             entry_date=entry_date,
@@ -271,6 +491,46 @@ def _compute_atr(price_history: list[dict], period: int = 14) -> float | None:
         atr = atr * (1 - alpha) + tr * alpha
 
     return atr
+
+
+def _compute_rsi(price_history: list[dict], period: int = 14) -> float | None:
+    """
+    Compute Relative Strength Index over the last `period` bars.
+
+    Uses Wilder's smoothing (same as ATR) for average gain/loss.
+    Returns None if insufficient data.
+    """
+    if len(price_history) < period + 1:
+        return None
+
+    # Close-to-close changes
+    changes = [
+        price_history[i]["close"] - price_history[i - 1]["close"]
+        for i in range(1, len(price_history))
+    ]
+
+    gains = [max(c, 0) for c in changes]
+    losses = [max(-c, 0) for c in changes]
+
+    if len(gains) < period:
+        return None
+
+    # Initial SMA for first `period` bars
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    # Wilder's smoothing for remaining bars
+    alpha = 1.0 / period
+    for i in range(period, len(gains)):
+        avg_gain = avg_gain * (1 - alpha) + gains[i] * alpha
+        avg_loss = avg_loss * (1 - alpha) + losses[i] * alpha
+
+    if avg_loss == 0:
+        return 100.0
+
+    rs = avg_gain / avg_loss
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return rsi
 
 
 def _approx_trading_days(start: date, end: date) -> int:

@@ -241,20 +241,23 @@ def run(run_date: str | None = None):
 
     # SPY return for the day
     spy_price = _spy_close(run_date)
-    spy_prior_row = conn.execute(
-        "SELECT spy_return_pct, portfolio_nav FROM eod_pnl ORDER BY date DESC LIMIT 1"
-    ).fetchone()
     spy_return = None
-    if spy_price and spy_prior_row:
-        # We don't store spy price directly — use accumulated return approach
-        # (simplified: just log SPY daily return from yfinance)
-        try:
-            hist = yf.download("SPY", period="2d", progress=False, auto_adjust=True)
-            if len(hist) >= 2:
-                spy_return = float((hist["Close"].values.flat[-1] / hist["Close"].values.flat[-2] - 1) * 100)
-        except Exception as e:
-            logger.warning(f"SPY return calc failed: {e}")
-            if fd: fd.report(e, severity="warning", context={"site": "spy_return_calc"})
+    if spy_price:
+        # Try cached prior SPY close from eod_pnl first
+        spy_prior_row = conn.execute(
+            "SELECT spy_close FROM eod_pnl WHERE spy_close IS NOT NULL ORDER BY date DESC LIMIT 1"
+        ).fetchone()
+        if spy_prior_row and spy_prior_row[0]:
+            spy_return = (spy_price / spy_prior_row[0] - 1) * 100
+        else:
+            # Fallback: yfinance 2d download
+            try:
+                hist = yf.download("SPY", period="2d", progress=False, auto_adjust=True)
+                if len(hist) >= 2:
+                    spy_return = float((hist["Close"].values.flat[-1] / hist["Close"].values.flat[-2] - 1) * 100)
+            except Exception as e:
+                logger.warning(f"SPY return calc failed: {e}")
+                if fd: fd.report(e, severity="warning", context={"site": "spy_return_calc"})
 
     alpha = (daily_return - spy_return) if (daily_return is not None and spy_return is not None) else None
 
@@ -272,7 +275,25 @@ def run(run_date: str | None = None):
         "spy_return_pct": spy_return,
         "daily_alpha_pct": alpha,
         "positions_snapshot": positions,
+        "spy_close": spy_price,
     })
+
+    # ── Sector attribution ──────────────────────────────────────────────────
+    sector_attribution = {}
+    if positions and nav > 0:
+        for ticker, pos in positions.items():
+            sector = pos.get("sector", "Unknown")
+            mv = pos.get("market_value", 0)
+            weight = mv / nav
+            # Use unrealized PnL as proxy for daily contribution
+            unrealized = pos.get("unrealized_pnl", 0)
+            daily_contrib = (unrealized / nav * 100) if nav else 0
+            if sector not in sector_attribution:
+                sector_attribution[sector] = {"weight": 0.0, "contribution": 0.0, "positions": 0}
+            sector_attribution[sector]["weight"] += weight
+            sector_attribution[sector]["contribution"] += daily_contrib
+            sector_attribution[sector]["positions"] += 1
+        logger.info(f"Sector attribution: {sector_attribution}")
 
     # Export full history CSVs for dashboard consumption
     trades_df = pd.read_sql("SELECT * FROM trades ORDER BY date, created_at", conn)
@@ -316,6 +337,7 @@ def run(run_date: str | None = None):
             sender=config["email_sender"],
             recipients=config["email_recipients"],
             position_narratives=position_narratives,
+            sector_attribution=sector_attribution,
         )
     except Exception as e:
         logger.error(f"EOD email failed: {e}")

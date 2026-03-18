@@ -19,6 +19,19 @@ TIME_DECAY_ENABLED = True
 TIME_DECAY_REDUCE_DAYS = 7    # trading days before 50% reduction
 TIME_DECAY_EXIT_DAYS = 14     # trading days before full exit
 
+# Profit-taking
+PROFIT_TAKE_ENABLED = True
+PROFIT_TAKE_PCT = 0.25        # 25% unrealized gain triggers REDUCE
+
+# Sector-relative exit veto
+SECTOR_RELATIVE_VETO_ENABLED = True
+SECTOR_RELATIVE_OUTPERFORM_THRESHOLD = 0.05  # 5% outperformance suppresses ATR exit
+
+# Momentum-based exit
+MOMENTUM_EXIT_ENABLED = True
+MOMENTUM_EXIT_THRESHOLD = -15.0  # 20d momentum % threshold
+MOMENTUM_EXIT_RSI = 30           # RSI(14) threshold
+
 # ── Graduated Drawdown defaults ──────────────────────────────────────────────
 
 GRADUATED_DRAWDOWN_ENABLED = True
@@ -29,6 +42,11 @@ DRAWDOWN_TIERS = [
     (-0.06, 0.25, "-4% to -6%: quarter sizing"),
     # Beyond circuit breaker threshold: full halt
 ]
+
+# Drawdown forced exits
+DRAWDOWN_FORCED_EXIT_ENABLED = True
+DRAWDOWN_FORCED_EXIT_TIER2_COUNT = 1
+DRAWDOWN_FORCED_EXIT_TIER3_COUNT = 2
 
 
 def load_strategy_config(config: dict) -> dict:
@@ -54,7 +72,25 @@ def load_strategy_config(config: dict) -> dict:
         "time_decay_reduce_days": exit_cfg.get("time_decay_reduce_days", TIME_DECAY_REDUCE_DAYS),
         "time_decay_exit_days": exit_cfg.get("time_decay_exit_days", TIME_DECAY_EXIT_DAYS),
 
+        # Profit-taking
+        "profit_take_enabled": exit_cfg.get("profit_take_enabled", PROFIT_TAKE_ENABLED),
+        "profit_take_pct": exit_cfg.get("profit_take_pct", PROFIT_TAKE_PCT),
+
+        # Sector-relative exit veto
+        "sector_relative_veto_enabled": exit_cfg.get("sector_relative_veto_enabled", SECTOR_RELATIVE_VETO_ENABLED),
+        "sector_relative_outperform_threshold": exit_cfg.get("sector_relative_outperform_threshold", SECTOR_RELATIVE_OUTPERFORM_THRESHOLD),
+
+        # Momentum-based exit
+        "momentum_exit_enabled": exit_cfg.get("momentum_exit_enabled", MOMENTUM_EXIT_ENABLED),
+        "momentum_exit_threshold": exit_cfg.get("momentum_exit_threshold", MOMENTUM_EXIT_THRESHOLD),
+        "momentum_exit_rsi": exit_cfg.get("momentum_exit_rsi", MOMENTUM_EXIT_RSI),
+
         # Graduated drawdown
         "graduated_drawdown_enabled": drawdown_cfg.get("enabled", GRADUATED_DRAWDOWN_ENABLED),
         "drawdown_tiers": drawdown_cfg.get("tiers", DRAWDOWN_TIERS),
+
+        # Drawdown forced exits
+        "drawdown_forced_exit_enabled": drawdown_cfg.get("drawdown_forced_exit_enabled", DRAWDOWN_FORCED_EXIT_ENABLED),
+        "drawdown_forced_exit_tier2_count": drawdown_cfg.get("drawdown_forced_exit_tier2_count", DRAWDOWN_FORCED_EXIT_TIER2_COUNT),
+        "drawdown_forced_exit_tier3_count": drawdown_cfg.get("drawdown_forced_exit_tier3_count", DRAWDOWN_FORCED_EXIT_TIER3_COUNT),
     }

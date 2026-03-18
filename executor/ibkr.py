@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from datetime import datetime
 
 from ib_insync import IB, Stock, MarketOrder
@@ -21,13 +22,42 @@ logger = logging.getLogger(__name__)
 
 
 class IBKRClient:
-    def __init__(self, host: str = "127.0.0.1", port: int = 4002, client_id: int = 1):
+    def __init__(self, host: str = "127.0.0.1", port: int = 4002, client_id: int = 1,
+                 reconnect_attempts: int = 3):
         self.ib = IB()
+        self._host = host
+        self._port = port
+        self._client_id = client_id
+        self._reconnect_attempts = reconnect_attempts
         logger.info(f"Connecting to IB Gateway at {host}:{port} (clientId={client_id})")
         self.ib.connect(host, port, clientId=client_id, timeout=20)
         if not self.ib.isConnected():
             raise RuntimeError("Failed to connect to IB Gateway")
         logger.info("Connected to IB Gateway")
+
+    def ensure_connected(self) -> None:
+        """Check IB Gateway connection; reconnect with exponential backoff if down."""
+        if self.ib.isConnected():
+            return
+
+        logger.warning("IB Gateway connection lost — attempting reconnect")
+        for attempt in range(1, self._reconnect_attempts + 1):
+            delay = 2 ** attempt  # 2, 4, 8, ...
+            logger.info(f"Reconnect attempt {attempt}/{self._reconnect_attempts} "
+                        f"(waiting {delay}s)")
+            time.sleep(delay)
+            try:
+                self.ib.connect(self._host, self._port,
+                                clientId=self._client_id, timeout=20)
+                if self.ib.isConnected():
+                    logger.info("Reconnected to IB Gateway")
+                    return
+            except Exception as e:
+                logger.warning(f"Reconnect attempt {attempt} failed: {e}")
+
+        raise RuntimeError(
+            f"Failed to reconnect to IB Gateway after {self._reconnect_attempts} attempts"
+        )
 
     # ── Account ───────────────────────────────────────────────────────────────
 
@@ -64,6 +94,7 @@ class IBKRClient:
         Fetch last trade price for ticker.
         Returns None if no price available (pre-market, bad contract, etc.).
         """
+        self.ensure_connected()
         contract = Stock(ticker, "SMART", "USD")
         try:
             self.ib.qualifyContracts(contract)
@@ -102,6 +133,7 @@ class IBKRClient:
              "filled_shares": int|None, "fill_time": str|None}
             status values: "Filled", "PartialFill", "Rejected", "Timeout", or IB status
         """
+        self.ensure_connected()
         contract = Stock(ticker, "SMART", "USD")
         try:
             self.ib.qualifyContracts(contract)
@@ -309,6 +341,10 @@ class SimulatedIBKRClient:
         if price is None:
             return None
         return {"open": price, "close": price, "high": price, "low": price}
+
+    def ensure_connected(self) -> None:
+        """No-op — simulated client is always connected."""
+        pass
 
     def disconnect(self):
         pass

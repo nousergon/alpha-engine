@@ -21,6 +21,15 @@ min_conviction_to_enter:         # only these conviction levels allow new entrie
   - rising
   - stable
 
+# Momentum confirmation gate — skip entries with weak momentum
+momentum_gate_enabled: true
+momentum_gate_threshold: -5.0   # min 20d momentum % (backtester-tunable: [-10.0, -5.0, -2.0])
+
+# Cross-ticker correlation blocking — prevent correlated entries
+correlation_block_enabled: true
+correlation_block_threshold: 0.80  # max mean pairwise correlation (backtester-tunable: [0.70, 0.75, 0.80, 0.85])
+correlation_lookback_days: 60
+
 # ── Sizing adjustments ──────────────────────────────────────────────────────
 min_price_target_upside: 0.08    # below this: apply upside_fail_adj
 sector_adj:
@@ -29,11 +38,33 @@ sector_adj:
   underweight: 0.85
 conviction_decline_adj: 0.70     # multiplier when conviction == "declining"
 upside_fail_adj: 0.70            # multiplier when upside < min_price_target_upside
+min_position_dollar: 500         # skip entries below this dollar size (safety param)
+reduce_fraction: 0.50            # fraction of position to sell on REDUCE (backtester-tunable)
+
+# ── ATR-based sizing ──────────────────────────────────────────────────────
+atr_sizing_enabled: true
+atr_sizing_target_risk: 0.02    # target risk per position (backtester-tunable: [0.01, 0.02, 0.03])
+
+# ── Confidence-weighted sizing ─────────────────────────────────────────────
+confidence_sizing_enabled: true
+confidence_sizing_min: 0.70      # min confidence multiplier (backtester-tunable: [0.6, 0.7, 0.8])
+confidence_sizing_range: 0.60    # range of confidence adjustment (backtester-tunable: [0.4, 0.6, 0.8])
+
+# ── Signal staleness discount ──────────────────────────────────────────────
+staleness_discount_enabled: true
+staleness_decay_per_day: 0.03    # 3% decay per day (backtester-tunable: [0.02, 0.03, 0.05])
+staleness_floor: 0.70            # minimum staleness multiplier
+
+# ── Earnings sizing adjustment ──────────────────────────────────────────────
+earnings_sizing_enabled: true
+earnings_proximity_days: 5       # days before earnings to apply reduction (backtester-tunable: [3, 5, 7])
+earnings_sizing_reduction: 0.50  # size reduction near earnings (backtester-tunable: [0.30, 0.50, 0.70])
 
 # ── IBKR connection ─────────────────────────────────────────────────────────
 ibkr_host: "127.0.0.1"
 ibkr_port: 4002                  # 4002 = paper trading, 4001 = live
 ibkr_client_id: 1
+ibkr_reconnect_attempts: 3       # max reconnect attempts before failing
 
 # ── S3 ───────────────────────────────────────────────────────────────────────
 signals_bucket: "your-research-bucket-name"
@@ -69,12 +100,30 @@ strategy:
     time_decay_reduce_days: 7
     time_decay_exit_days: 14
 
+    # Profit-taking: emit REDUCE when unrealized gain exceeds threshold
+    profit_take_enabled: true
+    profit_take_pct: 0.25          # 25% gain triggers profit-take (backtester-tunable: [0.15, 0.20, 0.25, 0.30])
+
+    # Sector-relative exit veto: suppress ATR exit if stock outperforms sector
+    sector_relative_veto_enabled: true
+    sector_relative_outperform_threshold: 0.05  # 5% outperformance suppresses exit (safety param)
+
+    # Momentum-based exit: exit when momentum and RSI both signal weakness
+    momentum_exit_enabled: true
+    momentum_exit_threshold: -15.0  # 20d momentum % (backtester-tunable: [-20.0, -15.0, -10.0])
+    momentum_exit_rsi: 30           # RSI(14) threshold
+
   graduated_drawdown:
     enabled: true
     tiers:
       - [-0.02, 1.00, "0% to -2%: full sizing"]
       - [-0.04, 0.50, "-2% to -4%: half sizing"]
       - [-0.06, 0.25, "-4% to -6%: quarter sizing"]
+
+  # Drawdown forced exits — reduce portfolio risk during drawdowns (safety params)
+  drawdown_forced_exit_enabled: true
+  drawdown_forced_exit_tier2_count: 1   # force-exit N lowest-conviction positions at tier 2
+  drawdown_forced_exit_tier3_count: 2   # force-exit N lowest-conviction positions at tier 3
 
 # ── Earnings proximity (O10) ──────────────────────────────────────────────
 # Warn (log + email mention) when entering a position within N days of earnings.

@@ -81,6 +81,7 @@ def build_eod_email(
     positions: dict,
     conn: sqlite3.Connection,
     position_narratives: dict[str, str] | None = None,
+    sector_attribution: dict | None = None,
 ) -> tuple[str, str, str]:
     """
     Build the EOD email subject + (html_body, plain_body).
@@ -145,6 +146,25 @@ def build_eod_email(
                 f"<tr><td><b>{ticker}</b></td><td>{narrative}</td></tr>"
             )
             plain_parts.append(f"  {ticker}: {narrative}")
+        html_parts.append("</table>")
+        plain_parts.append("")
+
+    # ── Sector Attribution ─────────────────────────────────────────────────
+    if sector_attribution:
+        html_parts.append("<h2>Sector Attribution</h2>")
+        html_parts.append("<table>")
+        html_parts.append("<tr><th>Sector</th><th>Weight</th><th>Contribution</th><th>Positions</th></tr>")
+        plain_parts.append("SECTOR ATTRIBUTION")
+        plain_parts.append("-" * 40)
+        for sector, data in sorted(sector_attribution.items(), key=lambda x: abs(x[1]["contribution"]), reverse=True):
+            weight_pct = data["weight"] * 100
+            contrib = data["contribution"]
+            n_pos = data["positions"]
+            html_parts.append(
+                f"<tr><td>{sector}</td><td>{weight_pct:.1f}%</td>"
+                f"<td>{_pct(contrib)}</td><td>{n_pos}</td></tr>"
+            )
+            plain_parts.append(f"  {sector:<25} {weight_pct:>5.1f}%  {_plain_pct(contrib):>8}  {n_pos} pos")
         html_parts.append("</table>")
         plain_parts.append("")
 
@@ -219,10 +239,12 @@ def send_eod_email(
     recipients: list[str],
     region: str = "us-east-1",
     position_narratives: dict[str, str] | None = None,
+    sector_attribution: dict | None = None,
 ) -> None:
     subject, html_body, plain_body = build_eod_email(
         run_date, nav, daily_return, spy_return, alpha, positions, conn,
         position_narratives=position_narratives,
+        sector_attribution=sector_attribution,
     )
 
     app_password = os.environ.get("GMAIL_APP_PASSWORD", "").replace(" ", "")

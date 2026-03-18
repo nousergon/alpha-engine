@@ -19,6 +19,111 @@ from executor.strategies.config import load_strategy_config
 logger = logging.getLogger(__name__)
 
 
+def _pearson_correlation(x: list[float], y: list[float]) -> float | None:
+    """Compute Pearson correlation coefficient between two lists."""
+    n = len(x)
+    if n < 2:
+        return None
+    mean_x = sum(x) / n
+    mean_y = sum(y) / n
+
+    cov = sum((x[i] - mean_x) * (y[i] - mean_y) for i in range(n))
+    var_x = sum((xi - mean_x) ** 2 for xi in x)
+    var_y = sum((yi - mean_y) ** 2 for yi in y)
+
+    denom = (var_x * var_y) ** 0.5
+    if denom == 0:
+        return None
+    return cov / denom
+
+
+def check_correlation(
+    ticker: str,
+    current_positions: dict[str, dict],
+    price_histories: dict[str, list[dict]],
+    config: dict,
+) -> tuple[bool, str]:
+    """
+    Check if a new entry is too correlated with existing same-sector positions.
+
+    Computes 60-day rolling Pearson correlation between candidate's daily returns
+    and each held position's daily returns. Blocks if mean pairwise correlation
+    with same-sector positions exceeds threshold.
+
+    Returns:
+        (approved, reason)
+    """
+    if not config.get("correlation_block_enabled", True):
+        return True, "correlation check disabled"
+
+    threshold = config.get("correlation_block_threshold", 0.80)
+    lookback = config.get("correlation_lookback_days", 60)
+
+    candidate_history = price_histories.get(ticker, [])
+    if len(candidate_history) < lookback:
+        return True, f"insufficient price history for {ticker} ({len(candidate_history)} < {lookback})"
+
+    # Get candidate's sector
+    candidate_sector = None
+    for t, pos in current_positions.items():
+        if t == ticker:
+            candidate_sector = pos.get("sector", "")
+            break
+
+    # Compute daily returns for candidate
+    candidate_closes = [b["close"] for b in candidate_history[-lookback:]]
+    candidate_returns = []
+    for i in range(1, len(candidate_closes)):
+        candidate_returns.append(candidate_closes[i] / candidate_closes[i-1] - 1)
+
+    if not candidate_returns:
+        return True, "no returns computed for candidate"
+
+    # Compare with same-sector held positions
+    correlations = []
+    for held_ticker, pos in current_positions.items():
+        if held_ticker == ticker:
+            continue
+        held_sector = pos.get("sector", "")
+        if candidate_sector and held_sector != candidate_sector:
+            continue  # only compare within same sector
+
+        held_history = price_histories.get(held_ticker, [])
+        if len(held_history) < lookback:
+            continue
+
+        held_closes = [b["close"] for b in held_history[-lookback:]]
+        held_returns = []
+        for i in range(1, len(held_closes)):
+            held_returns.append(held_closes[i] / held_closes[i-1] - 1)
+
+        # Align lengths
+        min_len = min(len(candidate_returns), len(held_returns))
+        if min_len < 10:
+            continue
+
+        cr = candidate_returns[-min_len:]
+        hr = held_returns[-min_len:]
+
+        # Pearson correlation
+        corr = _pearson_correlation(cr, hr)
+        if corr is not None:
+            correlations.append((held_ticker, corr))
+
+    if not correlations:
+        return True, "no same-sector positions to compare"
+
+    mean_corr = sum(c for _, c in correlations) / len(correlations)
+
+    if mean_corr > threshold:
+        tickers_str = ", ".join(f"{t}({c:.2f})" for t, c in correlations)
+        return False, (
+            f"Mean correlation {mean_corr:.2f} > {threshold:.2f} with same-sector positions: {tickers_str}"
+        )
+
+    return True, f"correlation check passed (mean={mean_corr:.2f}, threshold={threshold:.2f})"
+
+
 def compute_drawdown_multiplier(
     portfolio_nav: float,
     peak_nav: float,
@@ -76,6 +181,7 @@ def check_order(
     market_regime: str,
     signal: dict,
     config: dict,
+    price_histories: dict[str, list[dict]] | None = None,
 ) -> tuple[bool, str]:
     """
     Validate an order against all risk rules.
@@ -157,6 +263,14 @@ def check_order(
     max_equity = config.get("max_equity_pct", 0.90)
     if equity_pct > max_equity:
         return False, f"Total equity exposure {equity_pct:.1%} would exceed max {max_equity:.1%}"
+
+    # 8. Cross-ticker correlation
+    if price_histories is not None:
+        corr_approved, corr_reason = check_correlation(
+            ticker, current_positions, price_histories, config,
+        )
+        if not corr_approved:
+            return False, corr_reason
 
     return True, (
         f"ENTER approved | score={score:.1f} conviction={conviction} "

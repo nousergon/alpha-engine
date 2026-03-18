@@ -50,6 +50,11 @@ _TRADES_MIGRATIONS = [
     "ALTER TABLE trades ADD COLUMN status TEXT",
     "ALTER TABLE trades ADD COLUMN exit_reason TEXT",
     "ALTER TABLE trades ADD COLUMN filled_shares INTEGER",
+    "ALTER TABLE trades ADD COLUMN execution_latency_ms INTEGER",
+]
+
+_EOD_MIGRATIONS = [
+    "ALTER TABLE eod_pnl ADD COLUMN spy_close REAL",
 ]
 
 CREATE_EOD_TABLE = """
@@ -70,6 +75,12 @@ def init_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.executescript(CREATE_TRADES_TABLE + CREATE_EOD_TABLE)
     for migration in _TRADES_MIGRATIONS:
+        try:
+            conn.execute(migration)
+            conn.commit()
+        except Exception:
+            pass  # Column already exists
+    for migration in _EOD_MIGRATIONS:
         try:
             conn.execute(migration)
             conn.commit()
@@ -97,8 +108,8 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
             sector_rating, market_regime, price_target_upside,
             thesis_summary, fill_price, fill_time, ib_order_id,
             predicted_direction, prediction_confidence, rationale_json,
-            status, exit_reason, filled_shares, created_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            status, exit_reason, filled_shares, execution_latency_ms, created_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             trade_id,
@@ -125,6 +136,7 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
             trade.get("status"),
             trade.get("exit_reason"),
             trade.get("filled_shares"),
+            trade.get("execution_latency_ms"),
             datetime.now(timezone.utc).isoformat(),
         ),
     )
@@ -140,8 +152,8 @@ def log_eod(conn: sqlite3.Connection, eod: dict) -> None:
         """
         INSERT OR REPLACE INTO eod_pnl
             (date, portfolio_nav, daily_return_pct, spy_return_pct,
-             daily_alpha_pct, positions_snapshot, created_at)
-        VALUES (?,?,?,?,?,?,?)
+             daily_alpha_pct, positions_snapshot, spy_close, created_at)
+        VALUES (?,?,?,?,?,?,?,?)
         """,
         (
             eod["date"],
@@ -150,6 +162,7 @@ def log_eod(conn: sqlite3.Connection, eod: dict) -> None:
             eod.get("spy_return_pct"),
             eod.get("daily_alpha_pct"),
             json.dumps(eod.get("positions_snapshot", {})),
+            eod.get("spy_close"),
             datetime.now(timezone.utc).isoformat(),
         ),
     )

@@ -24,7 +24,7 @@ import json
 import logging
 import os
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import yaml
@@ -37,7 +37,7 @@ from executor.position_sizer import compute_position_size
 from executor.risk_guard import check_order, compute_drawdown_multiplier
 from executor.signal_reader import get_actionable_signals, read_signals_with_fallback
 from executor.strategies.config import load_strategy_config
-from executor.strategies.exit_manager import evaluate_exits
+from executor.strategies.exit_manager import evaluate_exits, SECTOR_ETF_MAP
 from executor.price_cache import load_price_histories
 from executor.trade_logger import backup_to_s3, get_entry_dates, init_db, log_trade
 
@@ -60,6 +60,17 @@ _PARAM_MAP = {
     "time_decay_exit_days": ("strategy", "exit_manager", "time_decay_exit_days"),
     "min_score": ("min_score_to_enter",),
     "max_position_pct": ("max_position_pct",),
+    "reduce_fraction": ("reduce_fraction",),
+    "atr_sizing_target_risk": ("atr_sizing_target_risk",),
+    "confidence_sizing_min": ("confidence_sizing_min",),
+    "confidence_sizing_range": ("confidence_sizing_range",),
+    "staleness_decay_per_day": ("staleness_decay_per_day",),
+    "earnings_sizing_reduction": ("earnings_sizing_reduction",),
+    "earnings_proximity_days": ("earnings_proximity_days",),
+    "momentum_gate_threshold": ("momentum_gate_threshold",),
+    "correlation_block_threshold": ("correlation_block_threshold",),
+    "profit_take_pct": ("strategy", "exit_manager", "profit_take_pct"),
+    "momentum_exit_threshold": ("strategy", "exit_manager", "momentum_exit_threshold"),
 }
 
 
@@ -109,8 +120,9 @@ def _load_executor_params_from_s3(bucket: str) -> dict | None:
                 _executor_params_cache = safe
                 return _executor_params_cache
     except Exception as e2:
-        logger.debug("Could not read local executor params cache: %s", e2)
+        logger.warning("Could not read local executor params cache: %s", e2)
 
+    logger.warning("Both S3 and local cache failed for executor params — using hardcoded defaults")
     return None
 
 
@@ -275,6 +287,7 @@ def run(
             host=config["ibkr_host"],
             port=config["ibkr_port"],
             client_id=config["ibkr_client_id"],
+            reconnect_attempts=config.get("ibkr_reconnect_attempts", 3),
         )
     portfolio_nav = ibkr.get_portfolio_nav()
     current_positions = ibkr.get_positions()
@@ -312,11 +325,31 @@ def run(
             signals_by_ticker[t] = s
 
     # Load price histories from predictor S3 cache (unless injected by backtester)
-    if price_histories is None and current_positions:
-        price_histories = load_price_histories(
-            tickers=list(current_positions.keys()),
-            signals_bucket=signals_bucket,
-        )
+    # Include ENTER tickers for ATR sizing, momentum gate, and correlation check
+    if price_histories is None:
+        enter_tickers = [s["ticker"] for s in signals.get("enter", [])]
+        all_tickers = list(set(list(current_positions.keys()) + enter_tickers))
+        # Also load sector ETF histories for sector-relative exit veto
+        held_sectors = set(pos.get("sector", "") for pos in current_positions.values())
+        etf_tickers = [SECTOR_ETF_MAP.get(s, "SPY") for s in held_sectors if s]
+        etf_tickers = list(set(etf_tickers))
+        all_tickers_with_etfs = list(set(all_tickers + etf_tickers))
+        if all_tickers_with_etfs:
+            price_histories = load_price_histories(
+                tickers=all_tickers_with_etfs,
+                signals_bucket=signals_bucket,
+            )
+        else:
+            price_histories = {}
+
+    # Separate sector ETF histories for exit manager
+    sector_etf_histories = {
+        t: price_histories[t] for t in SECTOR_ETF_MAP.values()
+        if t in (price_histories or {})
+    }
+    # Also include SPY as fallback
+    if "SPY" in (price_histories or {}):
+        sector_etf_histories["SPY"] = price_histories["SPY"]
 
     strategy_exits = evaluate_exits(
         current_positions=current_positions,
@@ -325,6 +358,7 @@ def run(
         price_histories=price_histories or {},
         ibkr_client=ibkr,
         strategy_config=strategy_config,
+        sector_etf_histories=sector_etf_histories or None,
     )
 
     if strategy_exits:
@@ -335,6 +369,80 @@ def run(
 
     enter_signals = signals["enter"]
     n_entered = 0
+
+    # ── 2e. Compute signal age for staleness discount ─────────────────────
+    signals_date_str = signals_raw.get("date", run_date)
+    try:
+        signals_date = date.fromisoformat(signals_date_str)
+        signal_age_days = (date.fromisoformat(run_date) - signals_date).days
+    except (ValueError, TypeError):
+        signal_age_days = 0
+
+    # ── 2f. Batch-fetch earnings dates for ENTER candidates ──────────────
+    earnings_by_ticker: dict[str, int | None] = {}
+    if config.get("earnings_sizing_enabled", True) and not simulate:
+        for sig in enter_signals:
+            t = sig["ticker"]
+            try:
+                import yfinance as yf_mod
+                cal = yf_mod.Ticker(t).calendar
+                if cal is not None and not cal.empty:
+                    # calendar returns a DataFrame; first column is next earnings date
+                    next_date = cal.iloc[0, 0] if hasattr(cal, 'iloc') else None
+                    if next_date is not None:
+                        from datetime import datetime as dt_mod
+                        if hasattr(next_date, 'date'):
+                            next_date = next_date.date()
+                        elif isinstance(next_date, str):
+                            next_date = date.fromisoformat(next_date)
+                        days_until = (next_date - date.fromisoformat(run_date)).days
+                        if days_until >= 0:
+                            earnings_by_ticker[t] = days_until
+            except Exception:
+                pass  # graceful fallback: no earnings data
+
+    # ── 2g. Drawdown forced exits ─────────────────────────────────────────
+    if strategy_config.get("drawdown_forced_exit_enabled", True) and dd_multiplier < 1.0:
+        # Determine tier: tier 2 (dd_mult <= 0.50), tier 3 (dd_mult <= 0.25)
+        forced_exit_count = 0
+        if dd_multiplier <= 0.25:
+            forced_exit_count = strategy_config.get("drawdown_forced_exit_tier3_count", 2)
+        elif dd_multiplier <= 0.50:
+            forced_exit_count = strategy_config.get("drawdown_forced_exit_tier2_count", 1)
+
+        if forced_exit_count > 0 and current_positions:
+            # Collect tickers already scheduled for exit (research + strategy)
+            existing_exit_tickers = set(
+                s["ticker"] for s in signals.get("exit", [])
+            ) | set(
+                s["ticker"] for s in strategy_exits if s["action"] == "EXIT"
+            )
+
+            # Rank held positions by conviction (lowest first), then market_value (smallest first)
+            def _conviction_rank(ticker_pos):
+                t, pos = ticker_pos
+                sig_data = signals_by_ticker.get(t, {})
+                score = sig_data.get("score", 50)
+                mv = pos.get("market_value", 0)
+                return (score, mv)
+
+            ranked = sorted(current_positions.items(), key=_conviction_rank)
+            for t, pos in ranked[:forced_exit_count]:
+                # Only force-exit if not already in exit list
+                if t not in existing_exit_tickers:
+                    shares_held = int(pos.get("shares", 0))
+                    if shares_held > 0:
+                        forced_sig = {
+                            "ticker": t,
+                            "action": "EXIT",
+                            "reason": "drawdown_forced_exit",
+                            "detail": f"forced exit due to drawdown (dd_mult={dd_multiplier})",
+                        }
+                        strategy_exits.append(forced_sig)
+                        logger.info(
+                            f"DRAWDOWN FORCED EXIT: {t} (score={_conviction_rank((t, pos))[0]}, "
+                            f"dd_multiplier={dd_multiplier})"
+                        )
 
     # ── 3. Process ENTER signals ─────────────────────────────────────────────
     for sig in enter_signals:
@@ -347,11 +455,22 @@ def run(
             logger.info(f"SKIP ENTER {ticker} — already in portfolio")
             continue
 
+        # ── Momentum confirmation gate (Task 3.1) ────────────────────────
+        if config.get("momentum_gate_enabled", True) and price_histories:
+            ticker_history = price_histories.get(ticker, [])
+            if len(ticker_history) >= 21:
+                momentum_20d = (ticker_history[-1]["close"] / ticker_history[-21]["close"] - 1) * 100
+                mom_threshold = config.get("momentum_gate_threshold", -5.0)
+                if momentum_20d < mom_threshold:
+                    logger.info(
+                        f"SKIP ENTER {ticker} — momentum gate: 20d={momentum_20d:.1f}% < {mom_threshold}%"
+                    )
+                    continue
+
         # O10: Earnings proximity warning — entering right before earnings is high-risk
-        # Check predictor predictions for next_earnings_days (populated by earnings_fetcher)
         earnings_warning_days = config.get("earnings_proximity_warning_days", 2)
         pred_data = predictions_by_ticker.get(ticker, {})
-        next_earnings_days = pred_data.get("next_earnings_days") or sig.get("next_earnings_days")
+        next_earnings_days = earnings_by_ticker.get(ticker) or pred_data.get("next_earnings_days") or sig.get("next_earnings_days")
         if next_earnings_days is not None and next_earnings_days <= earnings_warning_days:
             logger.warning(
                 f"EARNINGS WARNING: {ticker} reports in {next_earnings_days} day(s) — "
@@ -363,6 +482,19 @@ def run(
             logger.warning(f"SKIP ENTER {ticker} — no price available")
             continue
 
+        # Compute ATR % for ATR-based sizing
+        atr_pct = None
+        if config.get("atr_sizing_enabled", True) and price_histories:
+            ticker_history = price_histories.get(ticker, [])
+            if ticker_history:
+                from executor.strategies.exit_manager import _compute_atr
+                atr_val = _compute_atr(ticker_history, period=14)
+                if atr_val and current_price > 0:
+                    atr_pct = atr_val / current_price
+
+        # Get prediction confidence for confidence-weighted sizing
+        pred_confidence = pred_data.get("prediction_confidence")
+
         sizing = compute_position_size(
             ticker=ticker,
             portfolio_nav=portfolio_nav,
@@ -372,6 +504,10 @@ def run(
             current_price=current_price,
             config=config,
             drawdown_multiplier=dd_multiplier,
+            atr_pct=atr_pct,
+            prediction_confidence=pred_confidence,
+            signal_age_days=signal_age_days,
+            days_to_earnings=earnings_by_ticker.get(ticker),
         )
 
         if sizing["shares"] == 0:
@@ -392,6 +528,7 @@ def run(
             market_regime=market_regime,
             signal=sig_with_sector,
             config=config,
+            price_histories=price_histories,
         )
 
         if not approved:
@@ -423,7 +560,9 @@ def run(
                 "thesis_summary": sig.get("thesis_summary"),
             })
         elif not dry_run:
+            t_before = datetime.now()
             order_result = ibkr.place_market_order(ticker, "BUY", sizing["shares"])
+            latency_ms = int((datetime.now() - t_before).total_seconds() * 1000)
             if order_result["status"] in ("Rejected", "Timeout"):
                 logger.warning(
                     f"ENTER {ticker} order {order_result['status']} — skipping trade log"
@@ -464,13 +603,19 @@ def run(
                         "conviction_adj": sizing.get("conviction_adj"),
                         "upside_adj": sizing.get("upside_adj"),
                         "dd_multiplier": sizing.get("dd_multiplier"),
+                        "atr_adj": sizing.get("atr_adj"),
+                        "confidence_adj": sizing.get("confidence_adj"),
+                        "staleness_adj": sizing.get("staleness_adj"),
+                        "earnings_adj": sizing.get("earnings_adj"),
                     },
                     "risk_guard_reason": reason,
+                    "execution_latency_ms": latency_ms,
                 }),
                 "fill_price": order_result.get("fill_price"),
                 "fill_time": order_result.get("fill_time"),
                 "filled_shares": order_result.get("filled_shares"),
                 "status": order_result.get("status"),
+                "execution_latency_ms": latency_ms,
             })
 
     # Flow Doctor: report if all entry signals were blocked
@@ -529,7 +674,9 @@ def run(
             })
         elif not dry_run:
             current_price = ibkr.get_current_price(ticker)
+            t_before = datetime.now()
             order_result = ibkr.place_market_order(ticker, "SELL", shares_held)
+            latency_ms = int((datetime.now() - t_before).total_seconds() * 1000)
             if order_result["status"] in ("Rejected", "Timeout"):
                 logger.warning(
                     f"EXIT {ticker} order {order_result['status']} — skipping trade log"
@@ -559,12 +706,14 @@ def run(
                     "research_score": sig.get("score"),
                     "predicted_direction": pred.get("predicted_direction"),
                     "predicted_alpha": pred.get("predicted_alpha"),
+                    "execution_latency_ms": latency_ms,
                 }),
                 "fill_price": order_result.get("fill_price"),
                 "fill_time": order_result.get("fill_time"),
                 "filled_shares": order_result.get("filled_shares"),
                 "status": order_result.get("status"),
                 "exit_reason": sig.get("reason", "research_signal"),
+                "execution_latency_ms": latency_ms,
             })
 
     # ── 5. Process REDUCE signals (Research + Strategy) ─────────────────────
@@ -588,15 +737,16 @@ def run(
             continue
 
         shares_held = int(current_positions[ticker]["shares"])
-        shares_to_sell = shares_held // 2
+        reduce_frac = config.get("reduce_fraction", 0.50)
+        shares_to_sell = int(shares_held * reduce_frac)
         if shares_to_sell == 0:
-            logger.info(f"SKIP REDUCE {ticker} — position too small to halve")
+            logger.info(f"SKIP REDUCE {ticker} — position too small to reduce")
             continue
 
         reason_tag = f" ({sig.get('reason', 'research')})" if sig.get("reason") else ""
         logger.info(
             f"{'[DRY RUN] ' if dry_run else ''}ORDER REDUCE {ticker} "
-            f"{shares_to_sell} shares (50% reduction){reason_tag}"
+            f"{shares_to_sell} shares ({reduce_frac:.0%} reduction){reason_tag}"
         )
 
         if simulate:
@@ -619,7 +769,9 @@ def run(
             })
         elif not dry_run:
             current_price = ibkr.get_current_price(ticker)
+            t_before = datetime.now()
             order_result = ibkr.place_market_order(ticker, "SELL", shares_to_sell)
+            latency_ms = int((datetime.now() - t_before).total_seconds() * 1000)
             if order_result["status"] in ("Rejected", "Timeout"):
                 logger.warning(
                     f"REDUCE {ticker} order {order_result['status']} — skipping trade log"
@@ -650,12 +802,14 @@ def run(
                     "research_score": sig.get("score"),
                     "predicted_direction": pred.get("predicted_direction"),
                     "predicted_alpha": pred.get("predicted_alpha"),
+                    "execution_latency_ms": latency_ms,
                 }),
                 "fill_price": order_result.get("fill_price"),
                 "fill_time": order_result.get("fill_time"),
                 "filled_shares": order_result.get("filled_shares"),
                 "status": order_result.get("status"),
                 "exit_reason": sig.get("reason", "research_signal"),
+                "execution_latency_ms": latency_ms,
             })
 
     # ── 6. Backup and disconnect ─────────────────────────────────────────────
