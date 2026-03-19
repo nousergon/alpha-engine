@@ -241,6 +241,21 @@ def run(run_date: str | None = None):
     positions = ibkr.get_positions()
     ibkr.disconnect()
 
+    # Enrich positions with sector from signals.json
+    signals_bucket = config.get("signals_bucket", "alpha-engine-research")
+    try:
+        sig_data, _ = _load_signals_from_s3(signals_bucket, run_date, fd=fd)
+        sector_lookup = {}
+        for s in (sig_data.get("universe", []) + sig_data.get("buy_candidates", [])):
+            t = s.get("ticker")
+            if t and s.get("sector"):
+                sector_lookup[t] = s["sector"]
+        for ticker in positions:
+            if not positions[ticker].get("sector") and ticker in sector_lookup:
+                positions[ticker]["sector"] = sector_lookup[ticker]
+    except Exception as e:
+        logger.warning(f"Sector enrichment failed: {e}")
+
     # Prior day's NAV (to compute daily return)
     prior_row = conn.execute(
         "SELECT portfolio_nav FROM eod_pnl ORDER BY date DESC LIMIT 1"
