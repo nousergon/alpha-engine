@@ -66,6 +66,7 @@ def check_atr_trailing_stop(
         return None
 
     if not price_history or current_price is None:
+        logger.info("ATR skip %s: no price history or current_price", ticker)
         return None
 
     period = strategy_config.get("atr_period", 14)
@@ -76,12 +77,14 @@ def check_atr_trailing_stop(
     post_entry = [b for b in price_history if date.fromisoformat(b["date"]) >= entry_dt]
 
     if len(post_entry) < 2:
-        # Not enough data since entry to compute trailing stop
+        logger.info("ATR skip %s: %d bars since entry %s (need 2+)", ticker, len(post_entry), entry_date)
         return None
 
     # Compute ATR from the full price history (need period+1 bars minimum)
     atr = _compute_atr(price_history, period)
     if atr is None or atr <= 0:
+        logger.info("ATR skip %s: insufficient data for ATR(%d) (have %d bars)",
+                     ticker, period, len(price_history))
         return None
 
     # Highest high since entry
@@ -108,6 +111,42 @@ def check_atr_trailing_stop(
             "highest_high": round(highest_high, 2),
         }
 
+    return None
+
+
+def check_fallback_stop(
+    ticker: str,
+    current_price: float,
+    entry_price: float | None,
+    strategy_config: dict,
+) -> dict | None:
+    """
+    Fallback fixed-percentage stop when ATR has insufficient data.
+    Simple safety net: exit if price falls below entry * (1 - fallback_stop_pct).
+    """
+    if not strategy_config.get("fallback_stop_enabled", True):
+        return None
+    if not entry_price or entry_price <= 0 or not current_price:
+        return None
+
+    stop_pct = strategy_config.get("fallback_stop_pct", 0.10)
+    stop_level = entry_price * (1 - stop_pct)
+
+    if current_price <= stop_level:
+        loss_pct = (current_price / entry_price - 1) * 100
+        logger.info(
+            "FALLBACK STOP %s: price=$%.2f <= stop=$%.2f (entry=$%.2f - %.0f%%, loss=%.1f%%)",
+            ticker, current_price, stop_level, entry_price, stop_pct * 100, loss_pct,
+        )
+        return {
+            "ticker": ticker,
+            "action": "EXIT",
+            "reason": "fallback_stop",
+            "detail": (f"price=${current_price:.2f} <= fallback stop=${stop_level:.2f} "
+                       f"(entry=${entry_price:.2f} - {stop_pct:.0%})"),
+            "stop_level": round(stop_level, 2),
+            "entry_price": round(entry_price, 2),
+        }
     return None
 
 
@@ -417,6 +456,17 @@ def evaluate_exits(
             else:
                 strategy_signals.append(atr_signal)
                 continue  # ATR exit takes priority over other checks
+        elif strategy_config.get("fallback_stop_enabled", True):
+            # ATR returned None — try fallback fixed-percentage stop
+            fallback_signal = check_fallback_stop(
+                ticker=ticker,
+                current_price=current_price,
+                entry_price=pos.get("avg_cost"),
+                strategy_config=strategy_config,
+            )
+            if fallback_signal:
+                strategy_signals.append(fallback_signal)
+                continue
 
         # 2. Profit-taking
         avg_cost = pos.get("avg_cost")

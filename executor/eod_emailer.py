@@ -82,6 +82,7 @@ def build_eod_email(
     conn: sqlite3.Connection,
     position_narratives: dict[str, str] | None = None,
     sector_attribution: dict | None = None,
+    data_warnings: list[str] | None = None,
 ) -> tuple[str, str, str]:
     """
     Build the EOD email subject + (html_body, plain_body).
@@ -110,6 +111,18 @@ def build_eod_email(
         f"Daily Alpha:  {_plain_pct(alpha)}",
         "",
     ]
+
+    # ── Data warnings banner ──────────────────────────────────────────────
+    if data_warnings:
+        html_parts.append('<div style="background:#fff3cd;border:1px solid #ffc107;padding:10px;margin:10px 0;">')
+        html_parts.append('<strong>DATA WARNINGS:</strong><ul>')
+        for w in data_warnings:
+            html_parts.append(f'<li>{w}</li>')
+        html_parts.append('</ul></div>')
+        plain_parts.append("!! DATA WARNINGS !!")
+        for w in data_warnings:
+            plain_parts.append(f"  - {w}")
+        plain_parts.append("")
 
     # ── Positions ────────────────────────────────────────────────────────────
     html_parts.append("<h2>Open Positions</h2>")
@@ -240,11 +253,13 @@ def send_eod_email(
     region: str = "us-east-1",
     position_narratives: dict[str, str] | None = None,
     sector_attribution: dict | None = None,
+    data_warnings: list[str] | None = None,
 ) -> None:
     subject, html_body, plain_body = build_eod_email(
         run_date, nav, daily_return, spy_return, alpha, positions, conn,
         position_narratives=position_narratives,
         sector_attribution=sector_attribution,
+        data_warnings=data_warnings,
     )
 
     app_password = os.environ.get("GMAIL_APP_PASSWORD", "").replace(" ", "")

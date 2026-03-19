@@ -48,28 +48,30 @@ def _spy_close(run_date: str) -> float | None:
     return None
 
 
-def _load_signals_from_s3(bucket: str, run_date: str, fd=None) -> dict:
-    """Load today's signals.json from S3. Returns {} on failure."""
+def _load_signals_from_s3(bucket: str, run_date: str, fd=None) -> tuple[dict, str | None]:
+    """Load today's signals.json from S3. Returns ({}, warning_msg) on failure."""
     s3 = boto3.client("s3")
     for dt in [run_date]:
         try:
             obj = s3.get_object(Bucket=bucket, Key=f"signals/{dt}/signals.json")
-            return json.loads(obj["Body"].read())
+            return json.loads(obj["Body"].read()), None
         except Exception as e:
+            logger.error("Failed to load signals from S3 for %s: %s", dt, e)
             if fd: fd.report(e, severity="warning", context={"site": "load_signals_s3", "date": dt})
-    return {}
+    return {}, f"Signals unavailable from S3 for {run_date}"
 
 
-def _load_predictions_from_s3(bucket: str, fd=None) -> dict:
-    """Load latest predictions from S3. Returns {ticker: pred_dict}."""
+def _load_predictions_from_s3(bucket: str, fd=None) -> tuple[dict, str | None]:
+    """Load latest predictions from S3. Returns ({ticker: pred_dict}, warning_msg) on failure."""
     s3 = boto3.client("s3")
     try:
         obj = s3.get_object(Bucket=bucket, Key="predictor/predictions/latest.json")
         data = json.loads(obj["Body"].read())
-        return {p["ticker"]: p for p in data.get("predictions", []) if "ticker" in p}
+        return {p["ticker"]: p for p in data.get("predictions", []) if "ticker" in p}, None
     except Exception as e:
+        logger.error("Failed to load predictions from S3: %s", e)
         if fd: fd.report(e, severity="warning", context={"site": "load_predictions_s3"})
-        return {}
+        return {}, "Predictions unavailable from S3"
 
 
 def _build_position_contexts(
@@ -78,10 +80,18 @@ def _build_position_contexts(
     signals_bucket: str,
     run_date: str,
     fd=None,
-) -> list[dict]:
-    """Assemble per-position context for rationale synthesis."""
-    signals_data = _load_signals_from_s3(signals_bucket, run_date, fd=fd)
-    predictions = _load_predictions_from_s3(signals_bucket, fd=fd)
+) -> tuple[list[dict], list[str]]:
+    """Assemble per-position context for rationale synthesis.
+
+    Returns (contexts, data_warnings).
+    """
+    data_warnings: list[str] = []
+    signals_data, sig_warn = _load_signals_from_s3(signals_bucket, run_date, fd=fd)
+    predictions, pred_warn = _load_predictions_from_s3(signals_bucket, fd=fd)
+    if sig_warn:
+        data_warnings.append(sig_warn)
+    if pred_warn:
+        data_warnings.append(pred_warn)
 
     # Build signals lookup
     signals_by_ticker = {}
@@ -133,7 +143,7 @@ def _build_position_contexts(
         }
         contexts.append(ctx)
 
-    return contexts
+    return contexts, data_warnings
 
 
 def _synthesize_rationales(contexts: list[dict], fd=None) -> dict[str, str]:
@@ -316,9 +326,10 @@ def run(run_date: str | None = None):
     # Build position rationale narratives
     signals_bucket = config.get("signals_bucket", "alpha-engine-research")
     position_narratives = {}
+    data_warnings: list[str] = []
     try:
         if positions:
-            contexts = _build_position_contexts(positions, conn, signals_bucket, run_date, fd=fd)
+            contexts, data_warnings = _build_position_contexts(positions, conn, signals_bucket, run_date, fd=fd)
             position_narratives = _synthesize_rationales(contexts, fd=fd)
             logger.info(f"Position narratives generated for {len(position_narratives)} tickers")
     except Exception as e:
@@ -338,6 +349,7 @@ def run(run_date: str | None = None):
             recipients=config["email_recipients"],
             position_narratives=position_narratives,
             sector_attribution=sector_attribution,
+            data_warnings=data_warnings,
         )
     except Exception as e:
         logger.error(f"EOD email failed: {e}")

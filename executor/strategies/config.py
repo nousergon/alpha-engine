@@ -32,6 +32,10 @@ MOMENTUM_EXIT_ENABLED = True
 MOMENTUM_EXIT_THRESHOLD = -15.0  # 20d momentum % threshold
 MOMENTUM_EXIT_RSI = 30           # RSI(14) threshold
 
+# Fallback fixed-percentage stop (when ATR has insufficient price history)
+FALLBACK_STOP_ENABLED = True
+FALLBACK_STOP_PCT = 0.10          # 10% loss from entry triggers exit
+
 # ── Graduated Drawdown defaults ──────────────────────────────────────────────
 
 GRADUATED_DRAWDOWN_ENABLED = True
@@ -84,6 +88,10 @@ def load_strategy_config(config: dict) -> dict:
         "momentum_exit_enabled": exit_cfg.get("momentum_exit_enabled", MOMENTUM_EXIT_ENABLED),
         "momentum_exit_threshold": exit_cfg.get("momentum_exit_threshold", MOMENTUM_EXIT_THRESHOLD),
         "momentum_exit_rsi": exit_cfg.get("momentum_exit_rsi", MOMENTUM_EXIT_RSI),
+
+        # Fallback stop (when ATR unavailable)
+        "fallback_stop_enabled": exit_cfg.get("fallback_stop_enabled", FALLBACK_STOP_ENABLED),
+        "fallback_stop_pct": exit_cfg.get("fallback_stop_pct", FALLBACK_STOP_PCT),
 
         # Graduated drawdown
         "graduated_drawdown_enabled": drawdown_cfg.get("enabled", GRADUATED_DRAWDOWN_ENABLED),
