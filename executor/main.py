@@ -160,6 +160,12 @@ def run(
     run_date = str(date.today())
     logger.info(f"Executor starting | date={run_date} | dry_run={dry_run} | simulate={simulate}")
 
+    # ── Market hours gate (fail fast before any work) ─────────────────────────
+    if not simulate and not dry_run:
+        if not is_market_hours():
+            logger.warning("Market is not open — skipping live order placement")
+            return
+
     # Flow Doctor: structured error capture (skip in backtester simulate mode)
     fd = None
     if not simulate:
@@ -167,8 +173,10 @@ def run(
             import flow_doctor
             fd = flow_doctor.init(config_path=os.path.join(
                 os.path.dirname(os.path.dirname(__file__)), "flow-doctor.yaml"))
-        except Exception:
-            pass
+        except ImportError:
+            pass  # flow-doctor not installed — optional dependency
+        except Exception as e:
+            logger.warning("flow-doctor init failed: %s", e)
 
     config = load_config()
     if config_override:
@@ -273,12 +281,6 @@ def run(
         f"REDUCE={len(signals['reduce'])} HOLD={len(signals['hold'])}"
     )
 
-    # ── 1b. Market hours gate ────────────────────────────────────────────────
-    if not simulate and not dry_run:
-        if not is_market_hours():
-            logger.warning("Market is not open — skipping live order placement")
-            return
-
     # ── 2. Connect to IBKR (or use injected simulated client) ───────────────
     if simulate:
         ibkr = ibkr_client
@@ -289,540 +291,556 @@ def run(
             client_id=config["ibkr_client_id"],
             reconnect_attempts=config.get("ibkr_reconnect_attempts", 3),
         )
-    portfolio_nav = ibkr.get_portfolio_nav()
-    current_positions = ibkr.get_positions()
-    peak_nav = ibkr.get_peak_nav(conn)
 
-    # Enrich positions with sector data from signals
-    universe_sectors = {
-        s["ticker"]: s.get("sector", "")
-        for s in signals_raw.get("universe", []) + signals_raw.get("buy_candidates", [])
-        if s.get("ticker")
-    }
-    for ticker, pos in current_positions.items():
-        pos["sector"] = universe_sectors.get(ticker, "")
-
-    # ── 2b. Enrich positions with entry_date from trades.db ──────────────────
-    if conn and current_positions:
-        entry_dates = get_entry_dates(conn, list(current_positions.keys()))
-        for ticker, pos in current_positions.items():
-            pos["entry_date"] = entry_dates.get(ticker)
-        logger.info(f"Entry dates resolved for {len(entry_dates)}/{len(current_positions)} positions")
-
-    # ── 2c. Compute graduated drawdown multiplier ──────────────────────────
-    dd_multiplier, dd_reason = compute_drawdown_multiplier(portfolio_nav, peak_nav, config)
-    if dd_multiplier < 1.0:
-        logger.info(f"Drawdown tier active: {dd_reason}")
-
-    # ── 2d. Strategy layer: evaluate exit rules on held positions ──────────
-    strategy_config = load_strategy_config(config)
-
-    # Build signals lookup for exit manager
-    signals_by_ticker = {}
-    for s in (signals_raw.get("universe", []) + signals_raw.get("buy_candidates", [])):
-        t = s.get("ticker")
-        if t and t not in signals_by_ticker:
-            signals_by_ticker[t] = s
-
-    # Load price histories from predictor S3 cache (unless injected by backtester)
-    # Include ENTER tickers for ATR sizing, momentum gate, and correlation check
-    if price_histories is None:
-        enter_tickers = [s["ticker"] for s in signals.get("enter", [])]
-        all_tickers = list(set(list(current_positions.keys()) + enter_tickers))
-        # Also load sector ETF histories for sector-relative exit veto
-        held_sectors = set(pos.get("sector", "") for pos in current_positions.values())
-        etf_tickers = [SECTOR_ETF_MAP.get(s, "SPY") for s in held_sectors if s]
-        etf_tickers = list(set(etf_tickers))
-        all_tickers_with_etfs = list(set(all_tickers + etf_tickers))
-        if all_tickers_with_etfs:
-            price_histories = load_price_histories(
-                tickers=all_tickers_with_etfs,
-                signals_bucket=signals_bucket,
-            )
-        else:
-            price_histories = {}
-
-    # Separate sector ETF histories for exit manager
-    sector_etf_histories = {
-        t: price_histories[t] for t in SECTOR_ETF_MAP.values()
-        if t in (price_histories or {})
-    }
-    # Also include SPY as fallback
-    if "SPY" in (price_histories or {}):
-        sector_etf_histories["SPY"] = price_histories["SPY"]
-
-    strategy_exits = evaluate_exits(
-        current_positions=current_positions,
-        signals_by_ticker=signals_by_ticker,
-        run_date=run_date,
-        price_histories=price_histories or {},
-        ibkr_client=ibkr,
-        strategy_config=strategy_config,
-        sector_etf_histories=sector_etf_histories or None,
-    )
-
-    if strategy_exits:
-        logger.info(
-            f"Strategy layer generated {len(strategy_exits)} exit signal(s): "
-            + ", ".join(f"{s['ticker']}({s['action']}: {s['reason']})" for s in strategy_exits)
-        )
-
-    enter_signals = signals["enter"]
-    n_entered = 0
-
-    # ── 2e. Compute signal age for staleness discount ─────────────────────
-    signals_date_str = signals_raw.get("date", run_date)
     try:
-        signals_date = date.fromisoformat(signals_date_str)
-        signal_age_days = (date.fromisoformat(run_date) - signals_date).days
-    except (ValueError, TypeError):
-        signal_age_days = 0
+        portfolio_nav = ibkr.get_portfolio_nav()
+        current_positions = ibkr.get_positions()
+        peak_nav = ibkr.get_peak_nav(conn)
 
-    # ── 2f. Batch-fetch earnings dates for ENTER candidates ──────────────
-    earnings_by_ticker: dict[str, int | None] = {}
-    if config.get("earnings_sizing_enabled", True) and not simulate:
-        for sig in enter_signals:
-            t = sig["ticker"]
-            try:
-                import yfinance as yf_mod
-                cal = yf_mod.Ticker(t).calendar
-                if cal is not None and not cal.empty:
-                    # calendar returns a DataFrame; first column is next earnings date
-                    next_date = cal.iloc[0, 0] if hasattr(cal, 'iloc') else None
-                    if next_date is not None:
-                        from datetime import datetime as dt_mod
-                        if hasattr(next_date, 'date'):
-                            next_date = next_date.date()
-                        elif isinstance(next_date, str):
-                            next_date = date.fromisoformat(next_date)
-                        days_until = (next_date - date.fromisoformat(run_date)).days
-                        if days_until >= 0:
-                            earnings_by_ticker[t] = days_until
-            except Exception:
-                pass  # graceful fallback: no earnings data
-
-    # ── 2g. Drawdown forced exits ─────────────────────────────────────────
-    if strategy_config.get("drawdown_forced_exit_enabled", True) and dd_multiplier < 1.0:
-        # Determine tier: tier 2 (dd_mult <= 0.50), tier 3 (dd_mult <= 0.25)
-        forced_exit_count = 0
-        if dd_multiplier <= 0.25:
-            forced_exit_count = strategy_config.get("drawdown_forced_exit_tier3_count", 2)
-        elif dd_multiplier <= 0.50:
-            forced_exit_count = strategy_config.get("drawdown_forced_exit_tier2_count", 1)
-
-        if forced_exit_count > 0 and current_positions:
-            # Collect tickers already scheduled for exit (research + strategy)
-            existing_exit_tickers = set(
-                s["ticker"] for s in signals.get("exit", [])
-            ) | set(
-                s["ticker"] for s in strategy_exits if s["action"] == "EXIT"
-            )
-
-            # Rank held positions by conviction (lowest first), then market_value (smallest first)
-            def _conviction_rank(ticker_pos):
-                t, pos = ticker_pos
-                sig_data = signals_by_ticker.get(t, {})
-                score = sig_data.get("score", 50)
-                mv = pos.get("market_value", 0)
-                return (score, mv)
-
-            ranked = sorted(current_positions.items(), key=_conviction_rank)
-            for t, pos in ranked[:forced_exit_count]:
-                # Only force-exit if not already in exit list
-                if t not in existing_exit_tickers:
-                    shares_held = int(pos.get("shares", 0))
-                    if shares_held > 0:
-                        forced_sig = {
-                            "ticker": t,
-                            "action": "EXIT",
-                            "reason": "drawdown_forced_exit",
-                            "detail": f"forced exit due to drawdown (dd_mult={dd_multiplier})",
-                        }
-                        strategy_exits.append(forced_sig)
-                        logger.info(
-                            f"DRAWDOWN FORCED EXIT: {t} (score={_conviction_rank((t, pos))[0]}, "
-                            f"dd_multiplier={dd_multiplier})"
-                        )
-
-    # ── 3. Process ENTER signals ─────────────────────────────────────────────
-    for sig in enter_signals:
-        ticker = sig["ticker"]
-        sector = sig.get("sector", "Technology")
-        sector_info = sector_ratings.get(sector, {})
-        sector_rating_str = sector_info.get("rating", "market_weight")
-
-        if ticker in current_positions:
-            logger.info(f"SKIP ENTER {ticker} — already in portfolio")
-            continue
-
-        # ── Momentum confirmation gate (Task 3.1) ────────────────────────
-        if config.get("momentum_gate_enabled", True) and price_histories:
-            ticker_history = price_histories.get(ticker, [])
-            if len(ticker_history) >= 21:
-                momentum_20d = (ticker_history[-1]["close"] / ticker_history[-21]["close"] - 1) * 100
-                mom_threshold = config.get("momentum_gate_threshold", -5.0)
-                if momentum_20d < mom_threshold:
-                    logger.info(
-                        f"SKIP ENTER {ticker} — momentum gate: 20d={momentum_20d:.1f}% < {mom_threshold}%"
-                    )
-                    continue
-
-        # O10: Earnings proximity warning — entering right before earnings is high-risk
-        earnings_warning_days = config.get("earnings_proximity_warning_days", 2)
-        pred_data = predictions_by_ticker.get(ticker, {})
-        next_earnings_days = earnings_by_ticker.get(ticker) or pred_data.get("next_earnings_days") or sig.get("next_earnings_days")
-        if next_earnings_days is not None and next_earnings_days <= earnings_warning_days:
-            logger.warning(
-                f"EARNINGS WARNING: {ticker} reports in {next_earnings_days} day(s) — "
-                f"entering before earnings carries elevated event risk"
-            )
-
-        current_price = ibkr.get_current_price(ticker)
-        if not current_price:
-            logger.warning(f"SKIP ENTER {ticker} — no price available")
-            continue
-
-        # Compute ATR % for ATR-based sizing
-        atr_pct = None
-        if config.get("atr_sizing_enabled", True) and price_histories:
-            ticker_history = price_histories.get(ticker, [])
-            if ticker_history:
-                from executor.strategies.exit_manager import _compute_atr
-                atr_val = _compute_atr(ticker_history, period=14)
-                if atr_val and current_price > 0:
-                    atr_pct = atr_val / current_price
-
-        # Get prediction confidence for confidence-weighted sizing
-        pred_confidence = pred_data.get("prediction_confidence")
-
-        sizing = compute_position_size(
-            ticker=ticker,
-            portfolio_nav=portfolio_nav,
-            enter_signals=enter_signals,
-            signal=sig,
-            sector_rating=sector_rating_str,
-            current_price=current_price,
-            config=config,
-            drawdown_multiplier=dd_multiplier,
-            atr_pct=atr_pct,
-            prediction_confidence=pred_confidence,
-            signal_age_days=signal_age_days,
-            days_to_earnings=earnings_by_ticker.get(ticker),
-        )
-
-        if sizing["shares"] == 0:
-            logger.info(f"SKIP ENTER {ticker} — position too small (${sizing['dollar_size']:.0f})")
-            continue
-
-        # Inject sector_rating into signal for risk guard
-        sig_with_sector = {**sig, "sector_rating": sector_rating_str}
-
-        approved, reason = check_order(
-            ticker=ticker,
-            action="ENTER",
-            dollar_size=sizing["dollar_size"],
-            portfolio_nav=portfolio_nav,
-            peak_nav=peak_nav,
-            current_positions=current_positions,
-            sector=sector,
-            market_regime=market_regime,
-            signal=sig_with_sector,
-            config=config,
-            price_histories=price_histories,
-        )
-
-        if not approved:
-            logger.info(f"BLOCKED {ticker} — {reason}")
-            continue
-
-        logger.info(
-            f"{'[DRY RUN] ' if dry_run else ''}ORDER ENTER {ticker} "
-            f"{sizing['shares']} shares @ ~${current_price:.2f} "
-            f"(${sizing['dollar_size']:.0f}, {sizing['position_pct']*100:.1f}% NAV)"
-        )
-
-        n_entered += 1
-        if simulate:
-            orders.append({
-                "date": run_date,
-                "ticker": ticker,
-                "action": "ENTER",
-                "shares": sizing["shares"],
-                "price_at_order": current_price,
-                "portfolio_nav_at_order": portfolio_nav,
-                "position_pct": sizing["position_pct"],
-                "research_score": sig.get("score"),
-                "research_conviction": sig.get("conviction"),
-                "research_rating": sig.get("rating"),
-                "sector_rating": sector_rating_str,
-                "market_regime": market_regime,
-                "price_target_upside": sig.get("price_target_upside"),
-                "thesis_summary": sig.get("thesis_summary"),
-            })
-        elif not dry_run:
-            t_before = datetime.now()
-            order_result = ibkr.place_market_order(ticker, "BUY", sizing["shares"])
-            latency_ms = int((datetime.now() - t_before).total_seconds() * 1000)
-            if order_result["status"] in ("Rejected", "Timeout"):
-                logger.warning(
-                    f"ENTER {ticker} order {order_result['status']} — skipping trade log"
+        # Enrich positions with sector data from signals
+        universe_sectors = {
+            s["ticker"]: s.get("sector", "")
+            for s in signals_raw.get("universe", []) + signals_raw.get("buy_candidates", [])
+            if s.get("ticker")
+        }
+        for ticker, pos in current_positions.items():
+            pos["sector"] = universe_sectors.get(ticker, "")
+    
+        # ── 2b. Enrich positions with entry_date from trades.db ──────────────────
+        if conn and current_positions:
+            entry_dates = get_entry_dates(conn, list(current_positions.keys()))
+            for ticker, pos in current_positions.items():
+                pos["entry_date"] = entry_dates.get(ticker)
+            logger.info(f"Entry dates resolved for {len(entry_dates)}/{len(current_positions)} positions")
+    
+        # ── 2c. Compute graduated drawdown multiplier ──────────────────────────
+        dd_multiplier, dd_reason = compute_drawdown_multiplier(portfolio_nav, peak_nav, config)
+        if dd_multiplier < 1.0:
+            logger.info(f"Drawdown tier active: {dd_reason}")
+    
+        # ── 2d. Strategy layer: evaluate exit rules on held positions ──────────
+        strategy_config = load_strategy_config(config)
+    
+        # Build signals lookup for exit manager
+        signals_by_ticker = {}
+        for s in (signals_raw.get("universe", []) + signals_raw.get("buy_candidates", [])):
+            t = s.get("ticker")
+            if t and t not in signals_by_ticker:
+                signals_by_ticker[t] = s
+    
+        # Load price histories from predictor S3 cache (unless injected by backtester)
+        # Include ENTER tickers for ATR sizing, momentum gate, and correlation check
+        if price_histories is None:
+            enter_tickers = [s["ticker"] for s in signals.get("enter", [])]
+            all_tickers = list(set(list(current_positions.keys()) + enter_tickers))
+            # Also load sector ETF histories for sector-relative exit veto
+            held_sectors = set(pos.get("sector", "") for pos in current_positions.values())
+            etf_tickers = [SECTOR_ETF_MAP.get(s, "SPY") for s in held_sectors if s]
+            etf_tickers = list(set(etf_tickers))
+            all_tickers_with_etfs = list(set(all_tickers + etf_tickers))
+            if all_tickers_with_etfs:
+                price_histories = load_price_histories(
+                    tickers=all_tickers_with_etfs,
+                    signals_bucket=signals_bucket,
                 )
+            else:
+                price_histories = {}
+    
+        # Separate sector ETF histories for exit manager
+        sector_etf_histories = {
+            t: price_histories[t] for t in SECTOR_ETF_MAP.values()
+            if t in (price_histories or {})
+        }
+        # Also include SPY as fallback
+        if "SPY" in (price_histories or {}):
+            sector_etf_histories["SPY"] = price_histories["SPY"]
+    
+        strategy_exits = evaluate_exits(
+            current_positions=current_positions,
+            signals_by_ticker=signals_by_ticker,
+            run_date=run_date,
+            price_histories=price_histories or {},
+            ibkr_client=ibkr,
+            strategy_config=strategy_config,
+            sector_etf_histories=sector_etf_histories or None,
+        )
+    
+        if strategy_exits:
+            logger.info(
+                f"Strategy layer generated {len(strategy_exits)} exit signal(s): "
+                + ", ".join(f"{s['ticker']}({s['action']}: {s['reason']})" for s in strategy_exits)
+            )
+    
+        enter_signals = signals["enter"]
+        n_entered = 0
+    
+        # ── 2e. Compute signal age for staleness discount ─────────────────────
+        signals_date_str = signals_raw.get("date", run_date)
+        try:
+            signals_date = date.fromisoformat(signals_date_str)
+            signal_age_days = (date.fromisoformat(run_date) - signals_date).days
+        except (ValueError, TypeError):
+            signal_age_days = 0
+    
+        # ── 2f. Batch-fetch earnings dates for ENTER candidates ──────────────
+        earnings_by_ticker: dict[str, int | None] = {}
+        if config.get("earnings_sizing_enabled", True) and not simulate:
+            for sig in enter_signals:
+                t = sig["ticker"]
+                try:
+                    import yfinance as yf_mod
+                    cal = yf_mod.Ticker(t).calendar
+                    if cal is not None and not cal.empty:
+                        # calendar returns a DataFrame; first column is next earnings date
+                        next_date = cal.iloc[0, 0] if hasattr(cal, 'iloc') else None
+                        if next_date is not None:
+                            from datetime import datetime as dt_mod
+                            if hasattr(next_date, 'date'):
+                                next_date = next_date.date()
+                            elif isinstance(next_date, str):
+                                next_date = date.fromisoformat(next_date)
+                            days_until = (next_date - date.fromisoformat(run_date)).days
+                            if days_until >= 0:
+                                earnings_by_ticker[t] = days_until
+                except Exception:
+                    pass  # graceful fallback: no earnings data
+    
+        # ── 2g. Drawdown forced exits ─────────────────────────────────────────
+        if strategy_config.get("drawdown_forced_exit_enabled", True) and dd_multiplier < 1.0:
+            # Determine tier: tier 2 (dd_mult <= 0.50), tier 3 (dd_mult <= 0.25)
+            forced_exit_count = 0
+            if dd_multiplier <= 0.25:
+                forced_exit_count = strategy_config.get("drawdown_forced_exit_tier3_count", 2)
+            elif dd_multiplier <= 0.50:
+                forced_exit_count = strategy_config.get("drawdown_forced_exit_tier2_count", 1)
+    
+            if forced_exit_count > 0 and current_positions:
+                # Collect tickers already scheduled for exit (research + strategy)
+                existing_exit_tickers = set(
+                    s["ticker"] for s in signals.get("exit", [])
+                ) | set(
+                    s["ticker"] for s in strategy_exits if s["action"] == "EXIT"
+                )
+    
+                # Rank held positions by conviction (lowest first), then market_value (smallest first)
+                def _conviction_rank(ticker_pos):
+                    t, pos = ticker_pos
+                    sig_data = signals_by_ticker.get(t, {})
+                    score = sig_data.get("score", 50)
+                    mv = pos.get("market_value", 0)
+                    return (score, mv)
+    
+                ranked = sorted(current_positions.items(), key=_conviction_rank)
+                for t, pos in ranked[:forced_exit_count]:
+                    # Only force-exit if not already in exit list
+                    if t not in existing_exit_tickers:
+                        shares_held = int(pos.get("shares", 0))
+                        if shares_held > 0:
+                            forced_sig = {
+                                "ticker": t,
+                                "action": "EXIT",
+                                "reason": "drawdown_forced_exit",
+                                "detail": f"forced exit due to drawdown (dd_mult={dd_multiplier})",
+                            }
+                            strategy_exits.append(forced_sig)
+                            logger.info(
+                                f"DRAWDOWN FORCED EXIT: {t} (score={_conviction_rank((t, pos))[0]}, "
+                                f"dd_multiplier={dd_multiplier})"
+                            )
+    
+        # ── 3. Process ENTER signals ─────────────────────────────────────────────
+        for sig in enter_signals:
+            ticker = sig["ticker"]
+            sector = sig.get("sector", "Technology")
+            sector_info = sector_ratings.get(sector, {})
+            sector_rating_str = sector_info.get("rating", "market_weight")
+    
+            if ticker in current_positions:
+                logger.info(f"SKIP ENTER {ticker} — already in portfolio")
                 continue
-            pred = predictions_by_ticker.get(ticker, {})
-            log_trade(conn, {
-                "date": run_date,
-                "ticker": ticker,
-                "action": "ENTER",
-                "shares": sizing["shares"],
-                "price_at_order": current_price,
-                "portfolio_nav_at_order": portfolio_nav,
-                "position_pct": sizing["position_pct"],
-                "research_score": sig.get("score"),
-                "research_conviction": sig.get("conviction"),
-                "research_rating": sig.get("rating"),
-                "sector_rating": sector_rating_str,
-                "market_regime": market_regime,
-                "price_target_upside": sig.get("price_target_upside"),
-                "thesis_summary": sig.get("thesis_summary"),
-                "ib_order_id": order_result.get("ib_order_id"),
-                "predicted_direction": pred.get("predicted_direction"),
-                "prediction_confidence": pred.get("prediction_confidence"),
-                "rationale_json": json.dumps({
+    
+            # ── Momentum confirmation gate (Task 3.1) ────────────────────────
+            if config.get("momentum_gate_enabled", True) and price_histories:
+                ticker_history = price_histories.get(ticker, [])
+                if len(ticker_history) >= 21:
+                    momentum_20d = (ticker_history[-1]["close"] / ticker_history[-21]["close"] - 1) * 100
+                    mom_threshold = config.get("momentum_gate_threshold", -5.0)
+                    if momentum_20d < mom_threshold:
+                        logger.info(
+                            f"SKIP ENTER {ticker} — momentum gate: 20d={momentum_20d:.1f}% < {mom_threshold}%"
+                        )
+                        continue
+    
+            # O10: Earnings proximity warning — entering right before earnings is high-risk
+            earnings_warning_days = config.get("earnings_proximity_warning_days", 2)
+            pred_data = predictions_by_ticker.get(ticker, {})
+            next_earnings_days = earnings_by_ticker.get(ticker) or pred_data.get("next_earnings_days") or sig.get("next_earnings_days")
+            if next_earnings_days is not None and next_earnings_days <= earnings_warning_days:
+                logger.warning(
+                    f"EARNINGS WARNING: {ticker} reports in {next_earnings_days} day(s) — "
+                    f"entering before earnings carries elevated event risk"
+                )
+    
+            current_price = ibkr.get_current_price(ticker)
+            if not current_price:
+                logger.warning(f"SKIP ENTER {ticker} — no price available")
+                continue
+    
+            # Compute ATR % for ATR-based sizing
+            atr_pct = None
+            if config.get("atr_sizing_enabled", True) and price_histories:
+                ticker_history = price_histories.get(ticker, [])
+                if ticker_history:
+                    from executor.strategies.exit_manager import _compute_atr
+                    atr_val = _compute_atr(ticker_history, period=14)
+                    if atr_val and current_price > 0:
+                        atr_pct = atr_val / current_price
+    
+            # Get prediction confidence for confidence-weighted sizing
+            pred_confidence = pred_data.get("prediction_confidence")
+    
+            sizing = compute_position_size(
+                ticker=ticker,
+                portfolio_nav=portfolio_nav,
+                enter_signals=enter_signals,
+                signal=sig,
+                sector_rating=sector_rating_str,
+                current_price=current_price,
+                config=config,
+                drawdown_multiplier=dd_multiplier,
+                atr_pct=atr_pct,
+                prediction_confidence=pred_confidence,
+                signal_age_days=signal_age_days,
+                days_to_earnings=earnings_by_ticker.get(ticker),
+            )
+    
+            if sizing["shares"] == 0:
+                logger.info(f"SKIP ENTER {ticker} — position too small (${sizing['dollar_size']:.0f})")
+                continue
+    
+            # Inject sector_rating into signal for risk guard
+            sig_with_sector = {**sig, "sector_rating": sector_rating_str}
+    
+            approved, reason = check_order(
+                ticker=ticker,
+                action="ENTER",
+                dollar_size=sizing["dollar_size"],
+                portfolio_nav=portfolio_nav,
+                peak_nav=peak_nav,
+                current_positions=current_positions,
+                sector=sector,
+                market_regime=market_regime,
+                signal=sig_with_sector,
+                config=config,
+                price_histories=price_histories,
+            )
+    
+            if not approved:
+                logger.info(f"BLOCKED {ticker} — {reason}")
+                continue
+    
+            logger.info(
+                f"{'[DRY RUN] ' if dry_run else ''}ORDER ENTER {ticker} "
+                f"{sizing['shares']} shares @ ~${current_price:.2f} "
+                f"(${sizing['dollar_size']:.0f}, {sizing['position_pct']*100:.1f}% NAV)"
+            )
+    
+            n_entered += 1
+            if simulate:
+                orders.append({
+                    "date": run_date,
+                    "ticker": ticker,
                     "action": "ENTER",
+                    "shares": sizing["shares"],
+                    "price_at_order": current_price,
+                    "portfolio_nav_at_order": portfolio_nav,
+                    "position_pct": sizing["position_pct"],
                     "research_score": sig.get("score"),
-                    "conviction": sig.get("conviction"),
-                    "thesis_summary": sig.get("thesis_summary"),
-                    "price_target_upside": sig.get("price_target_upside"),
+                    "research_conviction": sig.get("conviction"),
+                    "research_rating": sig.get("rating"),
                     "sector_rating": sector_rating_str,
                     "market_regime": market_regime,
+                    "price_target_upside": sig.get("price_target_upside"),
+                    "thesis_summary": sig.get("thesis_summary"),
+                })
+            elif not dry_run:
+                t_before = datetime.now()
+                order_result = ibkr.place_market_order(ticker, "BUY", sizing["shares"])
+                latency_ms = int((datetime.now() - t_before).total_seconds() * 1000)
+                if order_result["status"] in ("Rejected", "Timeout"):
+                    logger.warning(
+                        f"ENTER {ticker} order {order_result['status']} — skipping trade log"
+                    )
+                    continue
+                pred = predictions_by_ticker.get(ticker, {})
+                log_trade(conn, {
+                    "date": run_date,
+                    "ticker": ticker,
+                    "action": "ENTER",
+                    "shares": sizing["shares"],
+                    "price_at_order": current_price,
+                    "portfolio_nav_at_order": portfolio_nav,
+                    "position_pct": sizing["position_pct"],
+                    "research_score": sig.get("score"),
+                    "research_conviction": sig.get("conviction"),
+                    "research_rating": sig.get("rating"),
+                    "sector_rating": sector_rating_str,
+                    "market_regime": market_regime,
+                    "price_target_upside": sig.get("price_target_upside"),
+                    "thesis_summary": sig.get("thesis_summary"),
+                    "ib_order_id": order_result.get("ib_order_id"),
                     "predicted_direction": pred.get("predicted_direction"),
                     "prediction_confidence": pred.get("prediction_confidence"),
-                    "predicted_alpha": pred.get("predicted_alpha"),
-                    "sizing_factors": {
-                        "sector_adj": sizing.get("sector_adj"),
-                        "conviction_adj": sizing.get("conviction_adj"),
-                        "upside_adj": sizing.get("upside_adj"),
-                        "dd_multiplier": sizing.get("dd_multiplier"),
-                        "atr_adj": sizing.get("atr_adj"),
-                        "confidence_adj": sizing.get("confidence_adj"),
-                        "staleness_adj": sizing.get("staleness_adj"),
-                        "earnings_adj": sizing.get("earnings_adj"),
-                    },
-                    "risk_guard_reason": reason,
+                    "rationale_json": json.dumps({
+                        "action": "ENTER",
+                        "research_score": sig.get("score"),
+                        "conviction": sig.get("conviction"),
+                        "thesis_summary": sig.get("thesis_summary"),
+                        "price_target_upside": sig.get("price_target_upside"),
+                        "sector_rating": sector_rating_str,
+                        "market_regime": market_regime,
+                        "predicted_direction": pred.get("predicted_direction"),
+                        "prediction_confidence": pred.get("prediction_confidence"),
+                        "predicted_alpha": pred.get("predicted_alpha"),
+                        "sizing_factors": {
+                            "sector_adj": sizing.get("sector_adj"),
+                            "conviction_adj": sizing.get("conviction_adj"),
+                            "upside_adj": sizing.get("upside_adj"),
+                            "dd_multiplier": sizing.get("dd_multiplier"),
+                            "atr_adj": sizing.get("atr_adj"),
+                            "confidence_adj": sizing.get("confidence_adj"),
+                            "staleness_adj": sizing.get("staleness_adj"),
+                            "earnings_adj": sizing.get("earnings_adj"),
+                        },
+                        "risk_guard_reason": reason,
+                        "execution_latency_ms": latency_ms,
+                    }),
+                    "fill_price": order_result.get("fill_price"),
+                    "fill_time": order_result.get("fill_time"),
+                    "filled_shares": order_result.get("filled_shares"),
+                    "status": order_result.get("status"),
                     "execution_latency_ms": latency_ms,
-                }),
-                "fill_price": order_result.get("fill_price"),
-                "fill_time": order_result.get("fill_time"),
-                "filled_shares": order_result.get("filled_shares"),
-                "status": order_result.get("status"),
-                "execution_latency_ms": latency_ms,
-            })
-
-    # Flow Doctor: report if all entry signals were blocked
-    if fd and len(enter_signals) > 0 and n_entered == 0:
-        fd.report(
-            severity="warning",
-            message=f"All {len(enter_signals)} ENTER signals blocked by risk guard",
-            context={
-                "site": "all_entries_blocked",
-                "run_date": run_date,
-                "market_regime": market_regime,
-                "n_candidates": len(enter_signals),
-            },
-        )
-
-    # ── 4. Process EXIT signals (Research + Strategy) ───────────────────────
-    # Merge Research exits with strategy-generated exits (deduplicate by ticker)
-    all_exit_tickers = set()
-    all_exits = []
-    for sig in signals["exit"]:
-        t = sig["ticker"]
-        if t not in all_exit_tickers:
-            all_exit_tickers.add(t)
-            all_exits.append(sig)
-    for strat_sig in strategy_exits:
-        if strat_sig["action"] == "EXIT" and strat_sig["ticker"] not in all_exit_tickers:
-            all_exit_tickers.add(strat_sig["ticker"])
-            all_exits.append(strat_sig)
-
-    for sig in all_exits:
-        ticker = sig["ticker"]
-        if ticker not in current_positions:
-            logger.info(f"SKIP EXIT {ticker} — not in portfolio")
-            continue
-
-        shares_held = int(current_positions[ticker]["shares"])
-        reason_tag = f" ({sig.get('reason', 'research')})" if sig.get("reason") else ""
-        logger.info(f"{'[DRY RUN] ' if dry_run else ''}ORDER EXIT {ticker} {shares_held} shares{reason_tag}")
-
-        if simulate:
-            current_price = ibkr.get_current_price(ticker)
-            orders.append({
-                "date": run_date,
-                "ticker": ticker,
-                "action": "EXIT",
-                "shares": shares_held,
-                "price_at_order": current_price,
-                "portfolio_nav_at_order": portfolio_nav,
-                "position_pct": 0.0,
-                "research_score": sig.get("score"),
-                "research_conviction": sig.get("conviction"),
-                "research_rating": sig.get("rating"),
-                "sector_rating": current_positions[ticker].get("sector", ""),
-                "market_regime": market_regime,
-                "exit_reason": sig.get("reason"),
-            })
-        elif not dry_run:
-            current_price = ibkr.get_current_price(ticker)
-            t_before = datetime.now()
-            order_result = ibkr.place_market_order(ticker, "SELL", shares_held)
-            latency_ms = int((datetime.now() - t_before).total_seconds() * 1000)
-            if order_result["status"] in ("Rejected", "Timeout"):
-                logger.warning(
-                    f"EXIT {ticker} order {order_result['status']} — skipping trade log"
-                )
+                })
+    
+        # Flow Doctor: report if all entry signals were blocked
+        if fd and len(enter_signals) > 0 and n_entered == 0:
+            fd.report(
+                severity="warning",
+                message=f"All {len(enter_signals)} ENTER signals blocked by risk guard",
+                context={
+                    "site": "all_entries_blocked",
+                    "run_date": run_date,
+                    "market_regime": market_regime,
+                    "n_candidates": len(enter_signals),
+                },
+            )
+    
+        # ── 4. Process EXIT signals (Research + Strategy) ───────────────────────
+        # Merge Research exits with strategy-generated exits (deduplicate by ticker)
+        all_exit_tickers = set()
+        all_exits = []
+        for sig in signals["exit"]:
+            t = sig["ticker"]
+            if t not in all_exit_tickers:
+                all_exit_tickers.add(t)
+                all_exits.append(sig)
+        for strat_sig in strategy_exits:
+            if strat_sig["action"] == "EXIT" and strat_sig["ticker"] not in all_exit_tickers:
+                all_exit_tickers.add(strat_sig["ticker"])
+                all_exits.append(strat_sig)
+    
+        for sig in all_exits:
+            ticker = sig["ticker"]
+            if ticker not in current_positions:
+                logger.info(f"SKIP EXIT {ticker} — not in portfolio")
                 continue
-            pred = predictions_by_ticker.get(ticker, {})
-            log_trade(conn, {
-                "date": run_date,
-                "ticker": ticker,
-                "action": "EXIT",
-                "shares": shares_held,
-                "price_at_order": current_price,
-                "portfolio_nav_at_order": portfolio_nav,
-                "position_pct": 0.0,
-                "research_score": sig.get("score"),
-                "research_conviction": sig.get("conviction"),
-                "research_rating": sig.get("rating"),
-                "sector_rating": current_positions[ticker].get("sector", ""),
-                "market_regime": market_regime,
-                "ib_order_id": order_result.get("ib_order_id"),
-                "predicted_direction": pred.get("predicted_direction"),
-                "prediction_confidence": pred.get("prediction_confidence"),
-                "rationale_json": json.dumps({
+    
+            shares_held = int(current_positions[ticker]["shares"])
+            reason_tag = f" ({sig.get('reason', 'research')})" if sig.get("reason") else ""
+            logger.info(f"{'[DRY RUN] ' if dry_run else ''}ORDER EXIT {ticker} {shares_held} shares{reason_tag}")
+    
+            if simulate:
+                current_price = ibkr.get_current_price(ticker)
+                if current_price is None:
+                    current_price = current_positions[ticker].get("avg_cost", 0)
+                orders.append({
+                    "date": run_date,
+                    "ticker": ticker,
                     "action": "EXIT",
-                    "exit_reason": sig.get("reason", "research_signal"),
-                    "exit_detail": sig.get("detail", ""),
+                    "shares": shares_held,
+                    "price_at_order": current_price,
+                    "portfolio_nav_at_order": portfolio_nav,
+                    "position_pct": 0.0,
                     "research_score": sig.get("score"),
+                    "research_conviction": sig.get("conviction"),
+                    "research_rating": sig.get("rating"),
+                    "sector_rating": current_positions[ticker].get("sector", ""),
+                    "market_regime": market_regime,
+                    "exit_reason": sig.get("reason"),
+                })
+            elif not dry_run:
+                current_price = ibkr.get_current_price(ticker)
+                if current_price is None:
+                    logger.warning(f"EXIT {ticker} — no price; using last known price")
+                    current_price = current_positions[ticker].get("avg_cost", 0)
+                t_before = datetime.now()
+                order_result = ibkr.place_market_order(ticker, "SELL", shares_held)
+                latency_ms = int((datetime.now() - t_before).total_seconds() * 1000)
+                if order_result["status"] in ("Rejected", "Timeout"):
+                    logger.warning(
+                        f"EXIT {ticker} order {order_result['status']} — skipping trade log"
+                    )
+                    continue
+                pred = predictions_by_ticker.get(ticker, {})
+                log_trade(conn, {
+                    "date": run_date,
+                    "ticker": ticker,
+                    "action": "EXIT",
+                    "shares": shares_held,
+                    "price_at_order": current_price,
+                    "portfolio_nav_at_order": portfolio_nav,
+                    "position_pct": 0.0,
+                    "research_score": sig.get("score"),
+                    "research_conviction": sig.get("conviction"),
+                    "research_rating": sig.get("rating"),
+                    "sector_rating": current_positions[ticker].get("sector", ""),
+                    "market_regime": market_regime,
+                    "ib_order_id": order_result.get("ib_order_id"),
                     "predicted_direction": pred.get("predicted_direction"),
-                    "predicted_alpha": pred.get("predicted_alpha"),
+                    "prediction_confidence": pred.get("prediction_confidence"),
+                    "rationale_json": json.dumps({
+                        "action": "EXIT",
+                        "exit_reason": sig.get("reason", "research_signal"),
+                        "exit_detail": sig.get("detail", ""),
+                        "research_score": sig.get("score"),
+                        "predicted_direction": pred.get("predicted_direction"),
+                        "predicted_alpha": pred.get("predicted_alpha"),
+                        "execution_latency_ms": latency_ms,
+                    }),
+                    "fill_price": order_result.get("fill_price"),
+                    "fill_time": order_result.get("fill_time"),
+                    "filled_shares": order_result.get("filled_shares"),
+                    "status": order_result.get("status"),
+                    "exit_reason": sig.get("reason", "research_signal"),
                     "execution_latency_ms": latency_ms,
-                }),
-                "fill_price": order_result.get("fill_price"),
-                "fill_time": order_result.get("fill_time"),
-                "filled_shares": order_result.get("filled_shares"),
-                "status": order_result.get("status"),
-                "exit_reason": sig.get("reason", "research_signal"),
-                "execution_latency_ms": latency_ms,
-            })
+                })
+    
+        # ── 5. Process REDUCE signals (Research + Strategy) ─────────────────────
+        all_reduce_tickers = set()
+        all_reduces = []
+        for sig in signals["reduce"]:
+            t = sig["ticker"]
+            if t not in all_reduce_tickers:
+                all_reduce_tickers.add(t)
+                all_reduces.append(sig)
+        for strat_sig in strategy_exits:
+            if strat_sig["action"] == "REDUCE" and strat_sig["ticker"] not in all_reduce_tickers:
+                # Also skip if we already have an EXIT for this ticker
+                if strat_sig["ticker"] not in all_exit_tickers:
+                    all_reduce_tickers.add(strat_sig["ticker"])
+                    all_reduces.append(strat_sig)
+    
+        for sig in all_reduces:
+            ticker = sig["ticker"]
+            if ticker not in current_positions:
+                continue
+    
+            shares_held = int(current_positions[ticker]["shares"])
+            reduce_frac = config.get("reduce_fraction", 0.50)
+            shares_to_sell = int(shares_held * reduce_frac)
+            if shares_to_sell == 0:
+                logger.info(f"SKIP REDUCE {ticker} — position too small to reduce")
+                continue
+    
+            reason_tag = f" ({sig.get('reason', 'research')})" if sig.get("reason") else ""
+            logger.info(
+                f"{'[DRY RUN] ' if dry_run else ''}ORDER REDUCE {ticker} "
+                f"{shares_to_sell} shares ({reduce_frac:.0%} reduction){reason_tag}"
+            )
+    
+            if simulate:
+                current_price = ibkr.get_current_price(ticker)
+                if current_price is None:
+                    current_price = current_positions[ticker].get("avg_cost", 0)
+                remaining_value = (shares_held - shares_to_sell) * (current_price or 0)
+                orders.append({
+                    "date": run_date,
+                    "ticker": ticker,
+                    "action": "REDUCE",
+                    "shares": shares_to_sell,
+                    "price_at_order": current_price,
+                    "portfolio_nav_at_order": portfolio_nav,
+                    "position_pct": remaining_value / portfolio_nav if portfolio_nav else 0,
+                    "research_score": sig.get("score"),
+                    "research_conviction": sig.get("conviction"),
+                    "research_rating": sig.get("rating"),
+                    "sector_rating": current_positions[ticker].get("sector", ""),
+                    "market_regime": market_regime,
+                    "exit_reason": sig.get("reason"),
+                })
+            elif not dry_run:
+                current_price = ibkr.get_current_price(ticker)
+                if current_price is None:
+                    logger.warning(f"REDUCE {ticker} — no price; using last known price")
+                    current_price = current_positions[ticker].get("avg_cost", 0)
+                t_before = datetime.now()
+                order_result = ibkr.place_market_order(ticker, "SELL", shares_to_sell)
+                latency_ms = int((datetime.now() - t_before).total_seconds() * 1000)
+                if order_result["status"] in ("Rejected", "Timeout"):
+                    logger.warning(
+                        f"REDUCE {ticker} order {order_result['status']} — skipping trade log"
+                    )
+                    continue
+                remaining_value = (shares_held - shares_to_sell) * (current_price or 0)
+                pred = predictions_by_ticker.get(ticker, {})
+                log_trade(conn, {
+                    "date": run_date,
+                    "ticker": ticker,
+                    "action": "REDUCE",
+                    "shares": shares_to_sell,
+                    "price_at_order": current_price,
+                    "portfolio_nav_at_order": portfolio_nav,
+                    "position_pct": remaining_value / portfolio_nav if portfolio_nav else 0,
+                    "research_score": sig.get("score"),
+                    "research_conviction": sig.get("conviction"),
+                    "research_rating": sig.get("rating"),
+                    "sector_rating": current_positions[ticker].get("sector", ""),
+                    "market_regime": market_regime,
+                    "ib_order_id": order_result.get("ib_order_id"),
+                    "predicted_direction": pred.get("predicted_direction"),
+                    "prediction_confidence": pred.get("prediction_confidence"),
+                    "rationale_json": json.dumps({
+                        "action": "REDUCE",
+                        "exit_reason": sig.get("reason", "research_signal"),
+                        "exit_detail": sig.get("detail", ""),
+                        "research_score": sig.get("score"),
+                        "predicted_direction": pred.get("predicted_direction"),
+                        "predicted_alpha": pred.get("predicted_alpha"),
+                        "execution_latency_ms": latency_ms,
+                    }),
+                    "fill_price": order_result.get("fill_price"),
+                    "fill_time": order_result.get("fill_time"),
+                    "filled_shares": order_result.get("filled_shares"),
+                    "status": order_result.get("status"),
+                    "exit_reason": sig.get("reason", "research_signal"),
+                    "execution_latency_ms": latency_ms,
+                })
+    
+        # ── 6. Backup and disconnect ─────────────────────────────────────────
+        if not dry_run and not simulate:
+            backup_to_s3(db_path, run_date, trades_bucket)
 
-    # ── 5. Process REDUCE signals (Research + Strategy) ─────────────────────
-    all_reduce_tickers = set()
-    all_reduces = []
-    for sig in signals["reduce"]:
-        t = sig["ticker"]
-        if t not in all_reduce_tickers:
-            all_reduce_tickers.add(t)
-            all_reduces.append(sig)
-    for strat_sig in strategy_exits:
-        if strat_sig["action"] == "REDUCE" and strat_sig["ticker"] not in all_reduce_tickers:
-            # Also skip if we already have an EXIT for this ticker
-            if strat_sig["ticker"] not in all_exit_tickers:
-                all_reduce_tickers.add(strat_sig["ticker"])
-                all_reduces.append(strat_sig)
-
-    for sig in all_reduces:
-        ticker = sig["ticker"]
-        if ticker not in current_positions:
-            continue
-
-        shares_held = int(current_positions[ticker]["shares"])
-        reduce_frac = config.get("reduce_fraction", 0.50)
-        shares_to_sell = int(shares_held * reduce_frac)
-        if shares_to_sell == 0:
-            logger.info(f"SKIP REDUCE {ticker} — position too small to reduce")
-            continue
-
-        reason_tag = f" ({sig.get('reason', 'research')})" if sig.get("reason") else ""
-        logger.info(
-            f"{'[DRY RUN] ' if dry_run else ''}ORDER REDUCE {ticker} "
-            f"{shares_to_sell} shares ({reduce_frac:.0%} reduction){reason_tag}"
-        )
+        logger.info(f"Executor complete | dry_run={dry_run} | simulate={simulate}")
 
         if simulate:
-            current_price = ibkr.get_current_price(ticker)
-            remaining_value = (shares_held - shares_to_sell) * (current_price or 0)
-            orders.append({
-                "date": run_date,
-                "ticker": ticker,
-                "action": "REDUCE",
-                "shares": shares_to_sell,
-                "price_at_order": current_price,
-                "portfolio_nav_at_order": portfolio_nav,
-                "position_pct": remaining_value / portfolio_nav if portfolio_nav else 0,
-                "research_score": sig.get("score"),
-                "research_conviction": sig.get("conviction"),
-                "research_rating": sig.get("rating"),
-                "sector_rating": current_positions[ticker].get("sector", ""),
-                "market_regime": market_regime,
-                "exit_reason": sig.get("reason"),
-            })
-        elif not dry_run:
-            current_price = ibkr.get_current_price(ticker)
-            t_before = datetime.now()
-            order_result = ibkr.place_market_order(ticker, "SELL", shares_to_sell)
-            latency_ms = int((datetime.now() - t_before).total_seconds() * 1000)
-            if order_result["status"] in ("Rejected", "Timeout"):
-                logger.warning(
-                    f"REDUCE {ticker} order {order_result['status']} — skipping trade log"
-                )
-                continue
-            remaining_value = (shares_held - shares_to_sell) * (current_price or 0)
-            pred = predictions_by_ticker.get(ticker, {})
-            log_trade(conn, {
-                "date": run_date,
-                "ticker": ticker,
-                "action": "REDUCE",
-                "shares": shares_to_sell,
-                "price_at_order": current_price,
-                "portfolio_nav_at_order": portfolio_nav,
-                "position_pct": remaining_value / portfolio_nav if portfolio_nav else 0,
-                "research_score": sig.get("score"),
-                "research_conviction": sig.get("conviction"),
-                "research_rating": sig.get("rating"),
-                "sector_rating": current_positions[ticker].get("sector", ""),
-                "market_regime": market_regime,
-                "ib_order_id": order_result.get("ib_order_id"),
-                "predicted_direction": pred.get("predicted_direction"),
-                "prediction_confidence": pred.get("prediction_confidence"),
-                "rationale_json": json.dumps({
-                    "action": "REDUCE",
-                    "exit_reason": sig.get("reason", "research_signal"),
-                    "exit_detail": sig.get("detail", ""),
-                    "research_score": sig.get("score"),
-                    "predicted_direction": pred.get("predicted_direction"),
-                    "predicted_alpha": pred.get("predicted_alpha"),
-                    "execution_latency_ms": latency_ms,
-                }),
-                "fill_price": order_result.get("fill_price"),
-                "fill_time": order_result.get("fill_time"),
-                "filled_shares": order_result.get("filled_shares"),
-                "status": order_result.get("status"),
-                "exit_reason": sig.get("reason", "research_signal"),
-                "execution_latency_ms": latency_ms,
-            })
-
-    # ── 6. Backup and disconnect ─────────────────────────────────────────────
-    if not dry_run and not simulate:
-        backup_to_s3(db_path, run_date, trades_bucket)
-
-    ibkr.disconnect()
-    if conn:
-        conn.close()
-    logger.info(f"Executor complete | dry_run={dry_run} | simulate={simulate}")
-
-    if simulate:
-        return orders
+            return orders
+    except Exception:
+        logger.exception("Executor error — ensuring IBKR disconnect")
+        raise
+    finally:
+        ibkr.disconnect()
+        if conn:
+            conn.close()
 
 
 if __name__ == "__main__":

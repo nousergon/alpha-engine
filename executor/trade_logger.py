@@ -78,14 +78,22 @@ def init_db(db_path: str) -> sqlite3.Connection:
         try:
             conn.execute(migration)
             conn.commit()
-        except Exception:
-            pass  # Column already exists
+        except sqlite3.OperationalError as e:
+            if "duplicate column" in str(e).lower() or "already exists" in str(e).lower():
+                pass  # Column already exists — expected on re-run
+            else:
+                logging.getLogger(__name__).error("Migration failed: %s — %s", migration.strip()[:80], e)
+                raise
     for migration in _EOD_MIGRATIONS:
         try:
             conn.execute(migration)
             conn.commit()
-        except Exception:
-            pass  # Column already exists
+        except sqlite3.OperationalError as e:
+            if "duplicate column" in str(e).lower() or "already exists" in str(e).lower():
+                pass  # Column already exists — expected on re-run
+            else:
+                logging.getLogger(__name__).error("Migration failed: %s — %s", migration.strip()[:80], e)
+                raise
     conn.commit()
     logger.info(f"trades.db initialized at {db_path}")
     return conn

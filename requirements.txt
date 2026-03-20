@@ -1,8 +1,9 @@
-ib_insync>=0.9.86
-boto3>=1.34
-pyyaml>=6.0
-yfinance>=0.2.50
-pandas>=2.0.0
-pyarrow>=14.0
-anthropic>=0.40
-flow-doctor
+ib_insync~=0.9.86
+boto3~=1.34
+pyyaml~=6.0
+yfinance~=0.2.54
+pandas~=2.2
+pyarrow~=14.0
+anthropic~=0.40
+flow-doctor~=0.1
+exchange-calendars~=4.5

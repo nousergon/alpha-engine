@@ -8,43 +8,40 @@
 #
 # Both cron lines:
 #   1. git pull --ff-only (auto-deploy latest code)
-#   2. Run the Python script with required env vars
+#   2. Source secrets from ~/.alpha-engine.env
+#   3. Run the Python script
 #
-# Required env vars (passed inline to avoid cron env issues):
-#   GMAIL_APP_PASSWORD  — Gmail app password for email delivery
-#   ANTHROPIC_API_KEY   — Anthropic API key for LLM rationale synthesis (EOD)
+# Secrets file (~/.alpha-engine.env, chmod 600):
+#   GMAIL_APP_PASSWORD=xxx
+#   ANTHROPIC_API_KEY=yyy
 #
 # Usage:
-#   GMAIL_APP_PASSWORD=xxx ANTHROPIC_API_KEY=yyy bash infrastructure/add-cron.sh
-#
-# Or if already set in shell:
 #   bash infrastructure/add-cron.sh
+#
+# First-time setup (create the env file):
+#   cat > ~/.alpha-engine.env << 'EOF'
+#   GMAIL_APP_PASSWORD=your-app-password
+#   ANTHROPIC_API_KEY=your-api-key
+#   EOF
+#   chmod 600 ~/.alpha-engine.env
 
 set -euo pipefail
 
 REPO_DIR="/home/ec2-user/alpha-engine"
+ENV_FILE="/home/ec2-user/.alpha-engine.env"
 
-# ── Resolve credentials ──────────────────────────────────────────────────────
-GMAIL_PW="${GMAIL_APP_PASSWORD:-}"
-ANTHROPIC_KEY="${ANTHROPIC_API_KEY:-}"
-
-if [ -z "$GMAIL_PW" ]; then
-    echo "ERROR: GMAIL_APP_PASSWORD not set. Pass it as env var or export it first."
+# ── Validate env file exists ─────────────────────────────────────────────────
+if [ ! -f "$ENV_FILE" ]; then
+    echo "ERROR: ${ENV_FILE} not found."
+    echo "Create it with GMAIL_APP_PASSWORD and ANTHROPIC_API_KEY, then chmod 600."
     exit 1
 fi
 
-if [ -z "$ANTHROPIC_KEY" ]; then
-    echo "WARNING: ANTHROPIC_API_KEY not set. EOD rationale will use template fallback."
-fi
+# ── Build cron lines (source env file instead of inline secrets) ─────────────
+SOURCE_ENV=". ${ENV_FILE} &&"
 
-# ── Build cron lines ─────────────────────────────────────────────────────────
-ENV_VARS="GMAIL_APP_PASSWORD=${GMAIL_PW}"
-if [ -n "$ANTHROPIC_KEY" ]; then
-    ENV_VARS="${ENV_VARS} ANTHROPIC_API_KEY=${ANTHROPIC_KEY}"
-fi
-
-EXECUTOR_CRON="30 13 * * 1-5  cd ${REPO_DIR} && git pull --ff-only >> /var/log/executor.log 2>&1 && ${ENV_VARS} .venv/bin/python executor/main.py >> /var/log/executor.log 2>&1"
-EOD_CRON="5 21 * * 1-5  cd ${REPO_DIR} && git pull --ff-only >> /var/log/eod.log 2>&1 && ${ENV_VARS} .venv/bin/python executor/eod_reconcile.py >> /var/log/eod.log 2>&1"
+EXECUTOR_CRON="30 13 * * 1-5  cd ${REPO_DIR} && git pull --ff-only >> /var/log/executor.log 2>&1 && ${SOURCE_ENV} .venv/bin/python executor/main.py >> /var/log/executor.log 2>&1"
+EOD_CRON="5 21 * * 1-5  cd ${REPO_DIR} && git pull --ff-only >> /var/log/eod.log 2>&1 && ${SOURCE_ENV} .venv/bin/python executor/eod_reconcile.py >> /var/log/eod.log 2>&1"
 
 # ── Replace existing entries ─────────────────────────────────────────────────
 # Remove any existing alpha-engine executor/eod lines, then add new ones.
@@ -61,6 +58,7 @@ FILTERED=$(echo "$EXISTING" | grep -v "alpha-engine/.*executor/main.py" | grep -
 echo "Executor cron jobs registered:"
 echo "  Executor: weekdays 13:30 UTC (6:30 AM PT)"
 echo "  EOD:      weekdays 21:05 UTC (4:05 PM ET)"
+echo "  Secrets:  sourced from ${ENV_FILE}"
 echo ""
 echo "Current crontab:"
 crontab -l

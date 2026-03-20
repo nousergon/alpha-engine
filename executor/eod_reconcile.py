@@ -220,8 +220,10 @@ def run(run_date: str | None = None):
         import flow_doctor
         fd = flow_doctor.init(config_path=os.path.join(
             os.path.dirname(os.path.dirname(__file__)), "flow-doctor-eod.yaml"))
-    except Exception:
-        pass
+    except ImportError:
+        pass  # flow-doctor not installed — optional dependency
+    except Exception as e:
+        logging.getLogger(__name__).warning("flow-doctor init failed: %s", e)
 
     with open(CONFIG_PATH) as f:
         config = yaml.safe_load(f)
@@ -262,7 +264,11 @@ def run(run_date: str | None = None):
     ).fetchone()
     prior_nav = prior_row[0] if prior_row else None
 
-    daily_return = ((nav - prior_nav) / prior_nav * 100) if prior_nav else None
+    if prior_nav is None:
+        logger.info("First trading day — no prior NAV, daily return will be 0%%")
+        daily_return = 0.0
+    else:
+        daily_return = ((nav - prior_nav) / prior_nav * 100)
 
     # SPY return for the day
     spy_price = _spy_close(run_date)

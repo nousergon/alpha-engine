@@ -155,6 +155,101 @@ config/risk.yaml.example      # Safe template — copy to config/risk.yaml
 
 ---
 
+## Executor Architecture
+
+### Daily Execution Flow
+
+The executor is **not a continuous trading system**. It runs a single ~5-minute pass at market open, places all orders, and exits. No intraday monitoring, no price checks, no order adjustments.
+
+| Step | Time (ET) | What happens |
+|------|-----------|--------------|
+| **Executor** | 9:30 AM | Single morning pass — read signals, evaluate exits, apply risk rules, size positions, place all orders |
+| **EOD Reconcile** | 4:05 PM | Capture final NAV, compute daily return vs SPY, log alpha, send email report |
+
+### Decision Pipeline
+
+Every ENTER signal flows through this deterministic pipeline:
+
+```
+signals.json (S3)
+       │
+       ▼
+Signal Reader ──── read today's signals; fall back up to 5 prior trading days
+       │
+       ▼
+Exit Manager ──── evaluate held positions against ATR stops + time decay
+       │
+       ▼
+Risk Guard ──── 7 rule layers (all must pass):
+  1. Score minimum (score >= min_score_to_enter, default 70)
+  2. Conviction gate (blocks "declining" conviction)
+  3. Graduated drawdown (tiered sizing reduction → halt at circuit breaker)
+  4. Max single position (% of NAV, adjustable by regime)
+  5. Bear regime block (blocks new entries in underweight sectors)
+  6. Sector exposure limit (default 25% NAV)
+  7. Max total equity (default 90% NAV)
+       │
+       ▼
+Position Sizer ──── compute shares:
+  base_weight = 1 / n_enter_signals
+  × sector_adj (overweight 1.05, market 1.0, underweight 0.85)
+  × conviction_adj (declining → 0.70)
+  × upside_adj (< min_upside → 0.70)
+  × confidence_adj (from GBM p_up, configurable tiers)
+  × atr_adj (inverse volatility scaling, if enabled)
+  × drawdown_multiplier (from graduated drawdown tier)
+  → capped at max_position_pct
+       │
+       ▼
+IBKR ──── place BUY/SELL market orders on paper account (port 4002)
+       │
+       ▼
+Trade Logger ──── persist to SQLite + S3 backup
+```
+
+### Data Sources
+
+The executor consumes six data streams — all read-only, no feedback during execution:
+
+| Source | What | Updated |
+|--------|------|---------|
+| `signals/{date}/signals.json` | Per-ticker signal (ENTER/EXIT/REDUCE/HOLD), score, conviction, price target, sector rating | Weekly (Monday, by Research) |
+| `predictor/predictions/{date}.json` | Per-ticker predicted direction, confidence, predicted alpha | Daily (by Predictor) |
+| IBKR account state | Live NAV, positions, current prices | Real-time via IB Gateway |
+| `predictor/price_cache_slim/*.parquet` | 2-year OHLCV per ticker (for ATR computation) | Weekly |
+| `trades.db` (SQLite) | Peak NAV, entry dates, trade history | After each execution |
+| `config/executor_params.json` (S3) | Backtester-tuned parameters | Weekly (Monday, by Backtester) |
+
+### Exit Strategies
+
+Three backtestable exit rules run independently on held positions:
+
+| Strategy | Trigger | Default | Config key |
+|----------|---------|---------|------------|
+| **ATR trailing stop** | Price falls below `highest_high - ATR(period) × multiplier` | period=14, multiplier=2.5 | `strategy.exit_manager.atr_*` |
+| **Time-based decay** | Position held > N trading days AND Research signal is HOLD (not reaffirming) | reduce at 7d, exit at 14d | `strategy.exit_manager.time_decay_*` |
+| **Graduated drawdown** | Portfolio drawdown exceeds tier thresholds | 1.0× at -2%, 0.5× at -4%, 0.25× at -6%, halt at -8% | `strategy.graduated_drawdown.*` |
+
+EXIT and REDUCE signals from Research always bypass all risk rules — reducing exposure is never blocked.
+
+### EC2 Infrastructure
+
+The executor shares an EC2 instance with other system components:
+
+| Process | Type | Schedule | Port |
+|---------|------|----------|------|
+| Nginx (reverse proxy + SSL) | Always-on | 24/7 | 80, 443 |
+| nousergon.ai (Streamlit) | Always-on | 24/7 | 8502 |
+| dashboard.nousergon.ai (Streamlit) | Always-on | 24/7 | 8501 |
+| IB Gateway (paper trading) | Always-on | 24/7 | 4002 |
+| Executor (`main.py`) | Cron | 9:30 AM ET weekdays | — |
+| EOD Reconcile (`eod_reconcile.py`) | Cron | 4:05 PM ET weekdays | — |
+| Backtester | Cron | Monday 3:00 AM ET | — |
+
+The executor uses ~7 minutes of compute per day (two cron jobs). The instance runs 24/7 to serve the public website and dashboard.
+
+---
+
 ## Auto-Optimization
 
 The backtester writes three S3 config files that upstream modules read on cold-start, closing the feedback loop automatically:
