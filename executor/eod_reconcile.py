@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import sys
+import time as _time
 from datetime import date, timedelta
 
 import boto3
@@ -213,6 +214,7 @@ def _synthesize_rationales(contexts: list[dict], fd=None) -> dict[str, str]:
 
 def run(run_date: str | None = None):
     run_date = run_date or str(date.today())
+    _health_start = _time.time()
     logger.info(f"EOD reconciliation | date={run_date}")
 
     fd = None
@@ -375,6 +377,25 @@ def run(run_date: str | None = None):
     except Exception as e:
         logger.error(f"EOD email failed: {e}")
         if fd: fd.report(e, severity="error", context={"site": "send_eod_email"})
+
+    # Write health status
+    try:
+        from executor.health_status import write_health
+        write_health(
+            bucket=trades_bucket,
+            module_name="eod_reconcile",
+            status="ok",
+            run_date=run_date,
+            duration_seconds=_time.time() - _health_start,
+            summary={
+                "nav": round(nav, 2),
+                "daily_return": round(daily_return, 4) if daily_return is not None else None,
+                "alpha": round(alpha, 4) if alpha is not None else None,
+                "n_positions": len(positions),
+            },
+        )
+    except Exception as _he:
+        logger.warning("Health status write failed: %s", _he)
 
     conn.close()
     logger.info("EOD reconciliation complete")

@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import sys
+import time as _time
 from datetime import date, datetime
 from pathlib import Path
 
@@ -158,6 +159,7 @@ def run(
     """
     orders = []
     run_date = str(date.today())
+    _health_start = _time.time()
     logger.info(f"Executor starting | date={run_date} | dry_run={dry_run} | simulate={simulate}")
 
     # ── Market hours gate (fail fast before any work) ─────────────────────────
@@ -198,6 +200,30 @@ def run(
     db_path = config["db_path"]
     signals_bucket = config["signals_bucket"]
     trades_bucket = config["trades_bucket"]
+
+    # ── 0. Check upstream health (warn-only, never blocks) ────────────────
+    if not simulate:
+        try:
+            from executor.health_status import check_upstream_health
+            upstream = check_upstream_health(
+                signals_bucket,
+                ["research", "predictor_inference"],
+                max_age_hours=48,
+            )
+            for mod, info in upstream.items():
+                if info["status"] == "unknown":
+                    logger.warning("Upstream %s: no health data found", mod)
+                elif info["stale"]:
+                    max_hrs = 192 if mod == "research" else 48  # 8 days vs 2 days
+                    if info["age_hours"] > max_hrs:
+                        logger.warning(
+                            "Upstream %s data is %.1f hours (%.1f days) stale",
+                            mod, info["age_hours"], info["age_hours"] / 24,
+                        )
+                elif info["status"] == "failed":
+                    logger.warning("Upstream %s last run FAILED", mod)
+        except Exception as _ue:
+            logger.debug("Upstream health check failed (non-blocking): %s", _ue)
 
     conn = None if simulate else init_db(db_path)
 
@@ -830,12 +856,47 @@ def run(
         if not dry_run and not simulate:
             backup_to_s3(db_path, run_date, trades_bucket)
 
+        # ── 7. Write health status ────────────────────────────────────────────
+        if not simulate:
+            try:
+                from executor.health_status import write_health
+                n_exit = len(all_exits) if 'all_exits' in dir() else 0
+                n_blocked = len(enter_signals) - n_entered if 'enter_signals' in dir() else 0
+                write_health(
+                    bucket=signals_bucket,
+                    module_name="executor",
+                    status="ok",
+                    run_date=run_date,
+                    duration_seconds=_time.time() - _health_start,
+                    summary={
+                        "n_orders": n_entered + n_exit,
+                        "n_enter": n_entered,
+                        "n_exit": n_exit,
+                        "n_blocked": n_blocked,
+                    },
+                )
+            except Exception as _he:
+                logger.warning("Health status write failed: %s", _he)
+
         logger.info(f"Executor complete | dry_run={dry_run} | simulate={simulate}")
 
         if simulate:
             return orders
     except Exception:
         logger.exception("Executor error — ensuring IBKR disconnect")
+        if not simulate:
+            try:
+                from executor.health_status import write_health
+                write_health(
+                    bucket=config.get("signals_bucket", "alpha-engine-research") if 'config' in dir() else "alpha-engine-research",
+                    module_name="executor",
+                    status="failed",
+                    run_date=run_date,
+                    duration_seconds=_time.time() - _health_start,
+                    error=str(sys.exc_info()[1]),
+                )
+            except Exception:
+                pass
         raise
     finally:
         ibkr.disconnect()

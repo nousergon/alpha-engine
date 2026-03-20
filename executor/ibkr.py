@@ -18,6 +18,8 @@ from datetime import datetime
 
 from ib_insync import IB, Stock, MarketOrder
 
+from executor.retry import retry
+
 logger = logging.getLogger(__name__)
 
 
@@ -39,30 +41,22 @@ class IBKRClient:
         """Check IB Gateway connection; reconnect with exponential backoff if down."""
         if self.ib.isConnected():
             return
-
         logger.warning("IB Gateway connection lost — attempting reconnect")
-        for attempt in range(1, self._reconnect_attempts + 1):
-            delay = 2 ** attempt  # 2, 4, 8, ...
-            logger.info(f"Reconnect attempt {attempt}/{self._reconnect_attempts} "
-                        f"(waiting {delay}s)")
-            time.sleep(delay)
-            try:
-                self.ib.connect(self._host, self._port,
-                                clientId=self._client_id, timeout=20)
-                if self.ib.isConnected():
-                    logger.info("Reconnected to IB Gateway")
-                    return
-            except Exception as e:
-                logger.warning(f"Reconnect attempt {attempt} failed: {e}")
+        self._reconnect()
 
-        raise RuntimeError(
-            f"Failed to reconnect to IB Gateway after {self._reconnect_attempts} attempts"
-        )
+    @retry(max_attempts=3, retryable=(Exception,), label="ibkr_connect")
+    def _reconnect(self) -> None:
+        """Attempt a single IB Gateway reconnect (retried by @retry)."""
+        self.ib.connect(self._host, self._port,
+                        clientId=self._client_id, timeout=20)
+        if not self.ib.isConnected():
+            raise RuntimeError("IB Gateway connect returned but isConnected() is False")
 
     # ── Account ───────────────────────────────────────────────────────────────
 
     def get_portfolio_nav(self) -> float:
         """Return current Net Liquidation Value from account summary."""
+        self.ensure_connected()
         summary = {s.tag: s for s in self.ib.accountSummary()}
         nav = float(summary["NetLiquidation"].value)
         logger.info(f"Portfolio NAV: ${nav:,.2f}")
@@ -75,6 +69,7 @@ class IBKRClient:
         Returns:
             {ticker: {"shares": int, "market_value": float, "avg_cost": float, "sector": str}}
         """
+        self.ensure_connected()
         positions = {}
         for p in self.ib.portfolio():
             ticker = p.contract.symbol
