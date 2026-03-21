@@ -23,6 +23,7 @@ def _default_book(run_date: str | None = None) -> dict:
     return {
         "date": run_date or date.today().isoformat(),
         "approved_entries": [],
+        "urgent_exits": [],
         "active_stops": [],
         "executed_today": [],
     }
@@ -62,10 +63,12 @@ class OrderBook:
         return self._data
 
     def all_tickers(self) -> list[str]:
-        """All unique tickers across entries and stops."""
+        """All unique tickers across entries, urgent exits, and stops."""
         tickers = set()
         for entry in self._data.get("approved_entries", []):
             tickers.add(entry["ticker"])
+        for urgent in self._data.get("urgent_exits", []):
+            tickers.add(urgent["ticker"])
         for stop in self._data.get("active_stops", []):
             tickers.add(stop["ticker"])
         return sorted(tickers)
@@ -81,12 +84,32 @@ class OrderBook:
         """Return all active stop records."""
         return self._data.get("active_stops", [])
 
+    def pending_urgent_exits(self) -> list[dict]:
+        """Return urgent exits with status == 'pending'."""
+        return [
+            e for e in self._data.get("urgent_exits", [])
+            if e.get("status") == "pending"
+        ]
+
+    def has_content(self) -> bool:
+        """Return True if the book has any entries, exits, or stops."""
+        return bool(
+            self._data.get("approved_entries")
+            or self._data.get("urgent_exits")
+            or self._data.get("active_stops")
+        )
+
     # ── Mutations ────────────────────────────────────────────────────────────
 
     def add_entry(self, entry: dict) -> None:
         """Add an approved entry to the book."""
         entry.setdefault("status", "pending")
         self._data.setdefault("approved_entries", []).append(entry)
+
+    def add_urgent_exit(self, record: dict) -> None:
+        """Add an urgent exit/reduce to the book (executed immediately by daemon)."""
+        record.setdefault("status", "pending")
+        self._data.setdefault("urgent_exits", []).append(record)
 
     def add_stop(self, stop: dict) -> None:
         """Add an active stop record."""
@@ -104,6 +127,20 @@ class OrderBook:
                 break
         self._data["approved_entries"] = [
             e for e in entries if not (e["ticker"] == ticker and e.get("status") == "executed")
+        ]
+
+    def mark_urgent_executed(self, ticker: str, action: str) -> None:
+        """Mark an urgent exit as executed and move to executed_today."""
+        exits = self._data.get("urgent_exits", [])
+        for record in exits:
+            if record["ticker"] == ticker and record.get("signal") == action and record.get("status") == "pending":
+                record["status"] = "executed"
+                record["executed_at"] = datetime.now().isoformat()
+                self._data.setdefault("executed_today", []).append(record)
+                break
+        self._data["urgent_exits"] = [
+            e for e in exits
+            if not (e["ticker"] == ticker and e.get("signal") == action and e.get("status") == "executed")
         ]
 
     def remove_stop(self, ticker: str) -> None:

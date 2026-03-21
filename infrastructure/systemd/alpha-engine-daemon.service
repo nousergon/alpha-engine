@@ -1,12 +1,13 @@
 [Unit]
 Description=Alpha Engine Intraday Trading Daemon
-After=network.target ibgateway.service
-Wants=ibgateway.service
+After=alpha-engine-morning.service ibgateway.service
+Requires=ibgateway.service
 
 [Service]
 Type=simple
 User=ec2-user
 WorkingDirectory=/home/ec2-user/alpha-engine
+EnvironmentFile=/home/ec2-user/.alpha-engine.env
 ExecStart=/home/ec2-user/alpha-engine/.venv/bin/python -m executor.daemon
 Restart=on-failure
 RestartSec=30

@@ -131,10 +131,11 @@ strategy:
     trail_atr_multiple: 2.0             # trailing stop = ATR(14) * this value
 
 # ── Intraday Daemon ─────────────────────────────────────────────────────────
-# Monitors positions and approved entries during market hours using 15-min
-# delayed streaming data from IB Gateway. Runs as a separate process (clientId=2).
+# The daemon is the sole order executor. main.py writes the order book (entries,
+# urgent exits, stops); the daemon reads it and executes all trades.
+# Urgent exits execute immediately. Entries wait for technical triggers.
 intraday:
-  enabled: false                        # opt-in: set true to activate daemon
+  enabled: true                         # required: daemon is the sole executor
   client_id: 2                          # separate from morning batch (clientId=1)
   poll_interval_sec: 60                 # how often to check prices (data updates ~15 min)
 

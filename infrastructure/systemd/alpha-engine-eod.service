@@ -1,0 +1,14 @@
+[Unit]
+Description=Alpha Engine EOD Reconciliation
+After=ibgateway.service
+Requires=ibgateway.service
+
+[Service]
+Type=oneshot
+User=ec2-user
+WorkingDirectory=/home/ec2-user/alpha-engine
+EnvironmentFile=/home/ec2-user/.alpha-engine.env
+ExecStart=/home/ec2-user/alpha-engine/.venv/bin/python executor/eod_reconcile.py
+StandardOutput=append:/var/log/eod.log
+StandardError=append:/var/log/eod.log
+Environment=PYTHONPATH=/home/ec2-user/alpha-engine

@@ -1,14 +1,16 @@
 """
-Alpha Engine Intraday Daemon — monitors positions and entries during market hours.
+Alpha Engine Intraday Daemon — sole order executor during market hours.
 
 Runs from ~6:45 AM to 4:00 PM ET on trading days. Uses 15-minute delayed
 streaming data from IB Gateway (free, no subscription required).
 
 Architecture:
-  - Morning batch (main.py) writes approved entries and stop state to order_book.json
-  - Daemon reads the order book, subscribes to prices, and evaluates:
-    1. Entry triggers (pullback, VWAP, support, time expiry) → BUY
-    2. Exit rules (trailing stop, profit-take, collapse) → SELL
+  - Morning batch (main.py) writes the order book: approved entries, urgent
+    exits/reduces, and active stop records. It places NO orders.
+  - Daemon is the sole order executor:
+    Phase 0: Execute urgent exits/reduces immediately (no trigger delay)
+    Phase 1: Monitor entries for technical triggers (pullback, VWAP, support, expiry)
+    Phase 2: Monitor stops for exit rules (trailing stop, profit-take, collapse)
   - All trades logged to trades.db with source="intraday_daemon"
   - Telegram notifications sent for each trade
 
@@ -91,7 +93,7 @@ def run_daemon(dry_run: bool = False) -> None:
 
     # Load order book
     order_book = OrderBook.load()
-    if not order_book.all_tickers():
+    if not order_book.has_content():
         logger.info("Order book is empty — nothing to monitor. Exiting.")
         return
 
@@ -114,10 +116,12 @@ def run_daemon(dry_run: bool = False) -> None:
     tickers = order_book.all_tickers()
     monitor.subscribe(tickers)
 
+    n_urgent = len(order_book.pending_urgent_exits())
     send_daemon_status(
         f"\u2705 *Daemon started*\n"
         f"Date: {run_date}\n"
         f"Monitoring: {len(tickers)} tickers\n"
+        f"Urgent exits: {n_urgent}\n"
         f"Entries: {len(order_book.pending_entries())}\n"
         f"Stops: {len(order_book.active_stops())}"
     )
@@ -125,6 +129,86 @@ def run_daemon(dry_run: bool = False) -> None:
     trades_executed = 0
 
     try:
+        # ── Wait for market open (daemon may start before 9:30 AM ET) ────
+        if not is_market_hours():
+            logger.info("Market not yet open — waiting for 9:30 AM ET...")
+            while not _shutdown_requested and not is_market_hours():
+                ibkr.ib.sleep(15)
+            if _shutdown_requested:
+                return
+            logger.info("Market is open — proceeding")
+
+        # ── Phase 0: Execute urgent exits immediately (no trigger delay) ──
+        for urgent in order_book.pending_urgent_exits():
+            ticker = urgent["ticker"]
+            action = urgent["signal"]  # "EXIT" or "REDUCE"
+            shares = urgent["shares"]
+            reason = urgent.get("reason", "research_signal")
+
+            logger.info(
+                "%sURGENT %s %s: %d shares | reason: %s",
+                "[DRY RUN] " if dry_run else "",
+                action, ticker, shares, reason,
+            )
+
+            if not dry_run:
+                order_result = ibkr.place_market_order(ticker, "SELL", shares)
+                if order_result["status"] in ("Rejected", "Timeout"):
+                    logger.warning("URGENT %s %s order %s", action, ticker, order_result["status"])
+                    continue
+
+                fill_price = order_result.get("fill_price") or ibkr.get_current_price(ticker) or 0
+                log_trade(conn, {
+                    "date": run_date,
+                    "ticker": ticker,
+                    "action": action,
+                    "shares": shares,
+                    "price_at_order": fill_price,
+                    "portfolio_nav_at_order": None,
+                    "position_pct": None,
+                    "ib_order_id": order_result.get("ib_order_id"),
+                    "fill_price": fill_price,
+                    "fill_time": order_result.get("fill_time"),
+                    "filled_shares": order_result.get("filled_shares"),
+                    "status": order_result.get("status"),
+                    "research_score": urgent.get("research_score"),
+                    "research_conviction": urgent.get("research_conviction"),
+                    "research_rating": urgent.get("research_rating"),
+                    "sector_rating": urgent.get("sector_rating"),
+                    "market_regime": urgent.get("market_regime"),
+                    "predicted_direction": urgent.get("predicted_direction"),
+                    "prediction_confidence": urgent.get("prediction_confidence"),
+                    "exit_reason": reason,
+                    "rationale_json": json.dumps({
+                        "action": action,
+                        "exit_reason": reason,
+                        "exit_detail": urgent.get("detail", ""),
+                        "source": "intraday_daemon",
+                        "phase": "urgent",
+                    }),
+                    "execution_latency_ms": None,
+                })
+
+                order_book.mark_urgent_executed(ticker, action)
+                if action == "EXIT":
+                    order_book.remove_stop(ticker)
+
+                send_trade_alert(
+                    action="SELL",
+                    ticker=ticker,
+                    shares=shares,
+                    price=fill_price,
+                    trigger=f"urgent_{reason}",
+                    source="daemon",
+                )
+
+            trades_executed += 1
+
+        if n_urgent > 0:
+            order_book.save()
+            logger.info("Phase 0 complete: %d urgent exits processed", n_urgent)
+
+        # ── Phase 1+2: Monitor entries and exits ──────────────────────────
         while not _shutdown_requested:
             # Check market hours
             if not is_market_hours():
@@ -320,16 +404,27 @@ def _execute_entry(
         "shares": shares,
         "price_at_order": current_price,
         "portfolio_nav_at_order": None,
-        "position_pct": None,
+        "position_pct": entry.get("position_pct"),
         "ib_order_id": order_result.get("ib_order_id"),
         "fill_price": fill_price,
         "fill_time": order_result.get("fill_time"),
         "filled_shares": order_result.get("filled_shares"),
         "status": order_result.get("status"),
+        "research_score": entry.get("research_score"),
+        "research_conviction": entry.get("research_conviction"),
+        "research_rating": entry.get("research_rating"),
+        "sector_rating": entry.get("sector_rating"),
+        "market_regime": entry.get("market_regime"),
+        "price_target_upside": entry.get("price_target_upside"),
+        "predicted_direction": entry.get("predicted_direction"),
+        "prediction_confidence": entry.get("prediction_confidence"),
         "rationale_json": json.dumps({
             "action": "ENTER",
             "trigger_reason": trigger_reason,
             "source": "intraday_daemon",
+            "planned_price": entry.get("current_price"),
+            "sizing_factors": entry.get("sizing_factors"),
+            "predicted_alpha": entry.get("predicted_alpha"),
         }),
         "execution_latency_ms": None,
     })

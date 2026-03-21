@@ -1,20 +1,20 @@
 """
-Alpha Engine Executor — daily morning trading loop.
+Alpha Engine Executor — daily morning order-book planner.
 
 Reads signals.json from S3, applies risk rules and position sizing,
-places market orders via IB Gateway (paper trading).
+writes approved entries and urgent exits to the intraday order book.
+The daemon (daemon.py) is the sole order executor — it uses technical
+triggers to time entries and executes exits immediately.
 
-Strategy layer (added 2026-03-14):
-  - Graduated drawdown response scales position sizes by drawdown tier
-  - ATR trailing stops exit positions when price falls below trailing stop
-  - Time-based decay reduces/exits stale positions after N trading days
+No orders are placed by this module. All trade execution happens in
+the daemon via IB Gateway.
 
-Cron (EC2, America/Los_Angeles):
-    30 6 * * 1-5  python /home/ec2-user/alpha-engine/executor/main.py >> /var/log/executor.log 2>&1
+Runs on boot via systemd (alpha-engine-morning.service) on the trading
+instance, which is started/stopped daily by the micro instance's cron.
 
 Usage:
-    python main.py              # live paper trading
-    python main.py --dry-run    # print orders without placing them
+    python main.py              # write order book (requires IB Gateway for NAV/positions)
+    python main.py --dry-run    # print planned orders without writing order book
 """
 
 from __future__ import annotations
@@ -32,10 +32,8 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from executor.bracket_orders import place_bracket_with_stop
 from executor.ibkr import IBKRClient, SimulatedIBKRClient
 from executor.order_book import OrderBook
-from executor.market_hours import is_market_hours
 from executor.position_sizer import compute_position_size
 from executor.risk_guard import check_order, compute_drawdown_multiplier
 from executor.signal_reader import get_actionable_signals, read_signals_with_fallback
@@ -147,6 +145,15 @@ def load_config() -> dict:
         return yaml.safe_load(f)
 
 
+def _compute_support_level(price_history: list[dict], strategy_config: dict) -> float | None:
+    """Compute N-day low from price history for support-bounce entry trigger."""
+    lookback = strategy_config.get("intraday_support_lookback_days", 20)
+    if not price_history or len(price_history) < lookback:
+        return None
+    recent = price_history[-lookback:]
+    return min(bar["low"] for bar in recent if bar.get("low"))
+
+
 def run(
     dry_run: bool = False,
     simulate: bool = False,
@@ -163,12 +170,6 @@ def run(
     run_date = str(date.today())
     _health_start = _time.time()
     logger.info(f"Executor starting | date={run_date} | dry_run={dry_run} | simulate={simulate}")
-
-    # ── Market hours gate (fail fast before any work) ─────────────────────────
-    if not simulate and not dry_run:
-        if not is_market_hours():
-            logger.warning("Market is not open — skipping live order placement")
-            return
 
     # Flow Doctor: structured error capture (skip in backtester simulate mode)
     fd = None
@@ -401,6 +402,10 @@ def run(
     
         enter_signals = signals["enter"]
         n_entered = 0
+
+        # Initialize order book for the day (daemon reads this after main.py completes)
+        ob = OrderBook.load()
+        ob.set_date(run_date)
     
         # ── 2e. Compute signal age for staleness discount ─────────────────────
         signals_date_str = signals_raw.get("date", run_date)
@@ -592,47 +597,25 @@ def run(
                     "thesis_summary": sig.get("thesis_summary"),
                 })
             elif not dry_run:
-                t_before = datetime.now()
+                # Write approved entry to order book — daemon executes via technical triggers
+                from executor.strategies.exit_manager import _compute_atr
+                ticker_hist = (price_histories or {}).get(ticker, [])
+                atr_dollar = _compute_atr(ticker_hist, period=14) if ticker_hist else None
 
-                # Use bracket order (BUY + trailing stop) when enabled and ATR is available
-                use_bracket = strategy_config.get("bracket_stop_enabled", True) and atr_pct is not None
-                if use_bracket:
-                    from executor.strategies.exit_manager import _compute_atr
-                    ticker_hist = (price_histories or {}).get(ticker, [])
-                    atr_dollar = _compute_atr(ticker_hist, period=14) if ticker_hist else None
-                    if atr_dollar and atr_dollar > 0:
-                        bracket_mult = strategy_config.get("bracket_trail_atr_multiple", 2.0)
-                        order_result = place_bracket_with_stop(
-                            ibkr, ticker, sizing["shares"],
-                            atr_value=atr_dollar,
-                            atr_multiple=bracket_mult,
-                        )
-                        if order_result.get("trail_amount"):
-                            logger.info(
-                                f"Bracket stop placed for {ticker}: "
-                                f"trail=${order_result['trail_amount']:.2f} "
-                                f"(ATR=${atr_dollar:.2f} × {bracket_mult})"
-                            )
-                    else:
-                        order_result = ibkr.place_market_order(ticker, "BUY", sizing["shares"])
-                else:
-                    order_result = ibkr.place_market_order(ticker, "BUY", sizing["shares"])
-
-                latency_ms = int((datetime.now() - t_before).total_seconds() * 1000)
-                if order_result["status"] in ("Rejected", "Timeout"):
-                    logger.warning(
-                        f"ENTER {ticker} order {order_result['status']} — skipping trade log"
-                    )
-                    continue
                 pred = predictions_by_ticker.get(ticker, {})
-                log_trade(conn, {
-                    "date": run_date,
+                ob.add_entry({
                     "ticker": ticker,
-                    "action": "ENTER",
+                    "signal": "ENTER",
                     "shares": sizing["shares"],
-                    "price_at_order": current_price,
-                    "portfolio_nav_at_order": portfolio_nav,
+                    "current_price": current_price,
+                    "dollar_size": sizing["dollar_size"],
                     "position_pct": sizing["position_pct"],
+                    "atr_value": atr_dollar or 0,
+                    "triggers": {
+                        "pullback_pct": strategy_config.get("intraday_pullback_pct", 0.02),
+                        "vwap_discount": strategy_config.get("intraday_vwap_discount_pct", 0.005),
+                        "support_level": _compute_support_level(ticker_hist, strategy_config),
+                    },
                     "research_score": sig.get("score"),
                     "research_conviction": sig.get("conviction"),
                     "research_rating": sig.get("rating"),
@@ -640,38 +623,19 @@ def run(
                     "market_regime": market_regime,
                     "price_target_upside": sig.get("price_target_upside"),
                     "thesis_summary": sig.get("thesis_summary"),
-                    "ib_order_id": order_result.get("ib_order_id"),
                     "predicted_direction": pred.get("predicted_direction"),
                     "prediction_confidence": pred.get("prediction_confidence"),
-                    "rationale_json": json.dumps({
-                        "action": "ENTER",
-                        "research_score": sig.get("score"),
-                        "conviction": sig.get("conviction"),
-                        "thesis_summary": sig.get("thesis_summary"),
-                        "price_target_upside": sig.get("price_target_upside"),
-                        "sector_rating": sector_rating_str,
-                        "market_regime": market_regime,
-                        "predicted_direction": pred.get("predicted_direction"),
-                        "prediction_confidence": pred.get("prediction_confidence"),
-                        "predicted_alpha": pred.get("predicted_alpha"),
-                        "sizing_factors": {
-                            "sector_adj": sizing.get("sector_adj"),
-                            "conviction_adj": sizing.get("conviction_adj"),
-                            "upside_adj": sizing.get("upside_adj"),
-                            "dd_multiplier": sizing.get("dd_multiplier"),
-                            "atr_adj": sizing.get("atr_adj"),
-                            "confidence_adj": sizing.get("confidence_adj"),
-                            "staleness_adj": sizing.get("staleness_adj"),
-                            "earnings_adj": sizing.get("earnings_adj"),
-                        },
-                        "risk_guard_reason": reason,
-                        "execution_latency_ms": latency_ms,
-                    }),
-                    "fill_price": order_result.get("fill_price"),
-                    "fill_time": order_result.get("fill_time"),
-                    "filled_shares": order_result.get("filled_shares"),
-                    "status": order_result.get("status"),
-                    "execution_latency_ms": latency_ms,
+                    "predicted_alpha": pred.get("predicted_alpha"),
+                    "sizing_factors": {
+                        "sector_adj": sizing.get("sector_adj"),
+                        "conviction_adj": sizing.get("conviction_adj"),
+                        "upside_adj": sizing.get("upside_adj"),
+                        "dd_multiplier": sizing.get("dd_multiplier"),
+                        "atr_adj": sizing.get("atr_adj"),
+                        "confidence_adj": sizing.get("confidence_adj"),
+                        "staleness_adj": sizing.get("staleness_adj"),
+                        "earnings_adj": sizing.get("earnings_adj"),
+                    },
                 })
     
         # Flow Doctor: report if all entry signals were blocked
@@ -731,50 +695,22 @@ def run(
                     "exit_reason": sig.get("reason"),
                 })
             elif not dry_run:
-                current_price = ibkr.get_current_price(ticker)
-                if current_price is None:
-                    logger.warning(f"EXIT {ticker} — no price; using last known price")
-                    current_price = current_positions[ticker].get("avg_cost", 0)
-                t_before = datetime.now()
-                order_result = ibkr.place_market_order(ticker, "SELL", shares_held)
-                latency_ms = int((datetime.now() - t_before).total_seconds() * 1000)
-                if order_result["status"] in ("Rejected", "Timeout"):
-                    logger.warning(
-                        f"EXIT {ticker} order {order_result['status']} — skipping trade log"
-                    )
-                    continue
+                # Write urgent exit to order book — daemon executes immediately
                 pred = predictions_by_ticker.get(ticker, {})
-                log_trade(conn, {
-                    "date": run_date,
+                ob.add_urgent_exit({
                     "ticker": ticker,
-                    "action": "EXIT",
+                    "signal": "EXIT",
                     "shares": shares_held,
-                    "price_at_order": current_price,
-                    "portfolio_nav_at_order": portfolio_nav,
-                    "position_pct": 0.0,
+                    "reason": sig.get("reason", "research_signal"),
+                    "detail": sig.get("detail", ""),
                     "research_score": sig.get("score"),
                     "research_conviction": sig.get("conviction"),
                     "research_rating": sig.get("rating"),
                     "sector_rating": current_positions[ticker].get("sector", ""),
                     "market_regime": market_regime,
-                    "ib_order_id": order_result.get("ib_order_id"),
                     "predicted_direction": pred.get("predicted_direction"),
                     "prediction_confidence": pred.get("prediction_confidence"),
-                    "rationale_json": json.dumps({
-                        "action": "EXIT",
-                        "exit_reason": sig.get("reason", "research_signal"),
-                        "exit_detail": sig.get("detail", ""),
-                        "research_score": sig.get("score"),
-                        "predicted_direction": pred.get("predicted_direction"),
-                        "predicted_alpha": pred.get("predicted_alpha"),
-                        "execution_latency_ms": latency_ms,
-                    }),
-                    "fill_price": order_result.get("fill_price"),
-                    "fill_time": order_result.get("fill_time"),
-                    "filled_shares": order_result.get("filled_shares"),
-                    "status": order_result.get("status"),
-                    "exit_reason": sig.get("reason", "research_signal"),
-                    "execution_latency_ms": latency_ms,
+                    "predicted_alpha": pred.get("predicted_alpha"),
                 })
     
         # ── 5. Process REDUCE signals (Research + Strategy) ─────────────────────
@@ -831,65 +767,38 @@ def run(
                     "exit_reason": sig.get("reason"),
                 })
             elif not dry_run:
-                current_price = ibkr.get_current_price(ticker)
-                if current_price is None:
-                    logger.warning(f"REDUCE {ticker} — no price; using last known price")
-                    current_price = current_positions[ticker].get("avg_cost", 0)
-                t_before = datetime.now()
-                order_result = ibkr.place_market_order(ticker, "SELL", shares_to_sell)
-                latency_ms = int((datetime.now() - t_before).total_seconds() * 1000)
-                if order_result["status"] in ("Rejected", "Timeout"):
-                    logger.warning(
-                        f"REDUCE {ticker} order {order_result['status']} — skipping trade log"
-                    )
-                    continue
-                remaining_value = (shares_held - shares_to_sell) * (current_price or 0)
+                # Write urgent reduce to order book — daemon executes immediately
                 pred = predictions_by_ticker.get(ticker, {})
-                log_trade(conn, {
-                    "date": run_date,
+                ob.add_urgent_exit({
                     "ticker": ticker,
-                    "action": "REDUCE",
+                    "signal": "REDUCE",
                     "shares": shares_to_sell,
-                    "price_at_order": current_price,
-                    "portfolio_nav_at_order": portfolio_nav,
-                    "position_pct": remaining_value / portfolio_nav if portfolio_nav else 0,
+                    "reason": sig.get("reason", "research_signal"),
+                    "detail": sig.get("detail", ""),
                     "research_score": sig.get("score"),
                     "research_conviction": sig.get("conviction"),
                     "research_rating": sig.get("rating"),
                     "sector_rating": current_positions[ticker].get("sector", ""),
                     "market_regime": market_regime,
-                    "ib_order_id": order_result.get("ib_order_id"),
                     "predicted_direction": pred.get("predicted_direction"),
                     "prediction_confidence": pred.get("prediction_confidence"),
-                    "rationale_json": json.dumps({
-                        "action": "REDUCE",
-                        "exit_reason": sig.get("reason", "research_signal"),
-                        "exit_detail": sig.get("detail", ""),
-                        "research_score": sig.get("score"),
-                        "predicted_direction": pred.get("predicted_direction"),
-                        "predicted_alpha": pred.get("predicted_alpha"),
-                        "execution_latency_ms": latency_ms,
-                    }),
-                    "fill_price": order_result.get("fill_price"),
-                    "fill_time": order_result.get("fill_time"),
-                    "filled_shares": order_result.get("filled_shares"),
-                    "status": order_result.get("status"),
-                    "exit_reason": sig.get("reason", "research_signal"),
-                    "execution_latency_ms": latency_ms,
+                    "predicted_alpha": pred.get("predicted_alpha"),
                 })
     
-        # ── 6. Write intraday order book for daemon ────────────────────────────
-        if not simulate and not dry_run and strategy_config.get("intraday_enabled", False):
+        # ── 6. Write stop records and save order book for daemon ────────────────
+        if not simulate and not dry_run:
             try:
                 from executor.strategies.exit_manager import _compute_atr
-                ob = OrderBook.load()
-                ob.set_date(run_date)
 
-                # Add stop records for all current positions (after ENTER fills)
-                refreshed_positions = ibkr.get_positions()
-                for t, pos in refreshed_positions.items():
-                    shares_held = int(pos.get("shares", 0))
-                    if shares_held <= 0:
+                # Add stop records for all current positions
+                current_pos = ibkr.get_positions()
+                for t, pos in current_pos.items():
+                    pos_shares = int(pos.get("shares", 0))
+                    if pos_shares <= 0:
+                        continue
+                    # Skip tickers with pending urgent exits (they'll be sold by daemon)
+                    urgent_exit_tickers = {u["ticker"] for u in ob.pending_urgent_exits()}
+                    if t in urgent_exit_tickers:
                         continue
                     ticker_hist = (price_histories or {}).get(t, [])
                     atr_val = _compute_atr(ticker_hist, period=14) if ticker_hist else None
@@ -904,16 +813,17 @@ def run(
                         "atr_multiple": atr_mult,
                         "high_water": entry_price,
                         "entry_date": (conn and get_entry_dates(conn, [t]).get(t)) or run_date,
-                        "shares": shares_held,
+                        "shares": pos_shares,
                     })
 
                 ob.save()
                 logger.info(
-                    "Order book written: %d stops, %d pending entries",
-                    len(ob.active_stops()), len(ob.pending_entries()),
+                    "Order book written: %d entries, %d urgent exits, %d stops",
+                    len(ob.pending_entries()), len(ob.pending_urgent_exits()),
+                    len(ob.active_stops()),
                 )
             except Exception as e:
-                logger.warning("Failed to write intraday order book: %s", e)
+                logger.warning("Failed to write order book: %s", e)
 
         # ── 7. Backup and disconnect ─────────────────────────────────────────
         if not dry_run and not simulate:

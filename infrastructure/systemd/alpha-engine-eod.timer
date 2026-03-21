@@ -1,0 +1,9 @@
+[Unit]
+Description=Trigger Alpha Engine EOD Reconciliation at 1:05 PM PT
+
+[Timer]
+OnCalendar=Mon..Fri 13:05 America/Los_Angeles
+Persistent=false
+
+[Install]
+WantedBy=timers.target

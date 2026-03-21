@@ -49,17 +49,35 @@ def _spy_close(run_date: str) -> float | None:
     return None
 
 
-def _load_signals_from_s3(bucket: str, run_date: str, fd=None) -> tuple[dict, str | None]:
-    """Load today's signals.json from S3. Returns ({}, warning_msg) on failure."""
+def _load_signals_from_s3(bucket: str, run_date: str, fd=None, max_lookback: int = 5) -> tuple[dict, str | None]:
+    """Load signals.json from S3, falling back to prior trading days.
+
+    Research only runs on Mondays, so on Tue–Fri the exact run_date won't
+    have a signals file.  Walk back up to *max_lookback* calendar days
+    (skipping weekends) before giving up.
+    """
     s3 = boto3.client("s3")
-    for dt in [run_date]:
+    start = date.fromisoformat(run_date)
+    for days_back in range(max_lookback + 1):
+        candidate = start - timedelta(days=days_back)
+        if candidate.weekday() >= 5:  # skip Sat/Sun
+            continue
+        dt = str(candidate)
         try:
             obj = s3.get_object(Bucket=bucket, Key=f"signals/{dt}/signals.json")
+            if days_back > 0:
+                logger.info("No signals for %s — using %s (%d day(s) old)", run_date, dt, days_back)
             return json.loads(obj["Body"].read()), None
-        except Exception as e:
-            logger.error("Failed to load signals from S3 for %s: %s", dt, e)
-            if fd: fd.report(e, severity="warning", context={"site": "load_signals_s3", "date": dt})
-    return {}, f"Signals unavailable from S3 for {run_date}"
+        except Exception:
+            continue
+    logger.error("No signals found within %d days of %s", max_lookback, run_date)
+    if fd:
+        fd.report(
+            RuntimeError(f"Signals unavailable within {max_lookback}d of {run_date}"),
+            severity="warning",
+            context={"site": "load_signals_s3", "date": run_date},
+        )
+    return {}, f"Signals unavailable from S3 for {run_date} (checked {max_lookback} days back)"
 
 
 def _load_predictions_from_s3(bucket: str, fd=None) -> tuple[dict, str | None]:

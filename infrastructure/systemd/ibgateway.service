@@ -1,0 +1,16 @@
+[Unit]
+Description=IB Gateway Docker Container (paper trading)
+After=boot-pull.service docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=ec2-user
+ExecStart=/home/ec2-user/alpha-engine/infrastructure/fetch-ib-secrets.sh
+ExecStop=/usr/bin/docker compose -f /home/ec2-user/alpha-engine/infrastructure/docker-compose.yml down
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

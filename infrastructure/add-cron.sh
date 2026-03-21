@@ -1,15 +1,13 @@
 #!/bin/bash
-# Register the executor + EOD cron jobs.
-# Safe to run multiple times — replaces existing entries.
+# Register cron jobs for the micro (dashboard) instance.
 #
-# Schedule (all times UTC, weekdays only):
-#   13:30  executor/main.py       — morning trading loop
-#   21:05  executor/eod_reconcile.py — EOD P&L + rationale email
+# The micro instance runs 24/7 and handles:
+#   1. Starting the trading instance before market open (6:15 AM PT)
+#   2. Stopping the trading instance after EOD (1:30 PM PT)
+#   3. Launching the backtester spot instance (Monday 08:00 UTC)
 #
-# Both cron lines:
-#   1. git pull --ff-only (auto-deploy latest code)
-#   2. Source secrets from ~/.alpha-engine.env
-#   3. Run the Python script
+# All trading (executor, daemon, EOD) runs on the trading instance via
+# systemd services triggered on boot. No executor crons here.
 #
 # Secrets file (~/.alpha-engine.env, chmod 600):
 #   GMAIL_APP_PASSWORD=xxx
@@ -18,54 +16,63 @@
 #   TELEGRAM_CHAT_ID=xxx
 #
 # Usage:
-#   bash infrastructure/add-cron.sh
-#
-# First-time setup (create the env file):
-#   cat > ~/.alpha-engine.env << 'EOF'
-#   GMAIL_APP_PASSWORD=your-app-password
-#   ANTHROPIC_API_KEY=your-api-key
-#   TELEGRAM_BOT_TOKEN=your-bot-token
-#   TELEGRAM_CHAT_ID=your-chat-id
-#   EOF
-#   chmod 600 ~/.alpha-engine.env
+#   TRADING_INSTANCE_ID=i-xxx bash infrastructure/add-cron.sh
 
 set -euo pipefail
 
-REPO_DIR="/home/ec2-user/alpha-engine"
 ENV_FILE="/home/ec2-user/.alpha-engine.env"
+
+if [ -z "${TRADING_INSTANCE_ID:-}" ]; then
+    echo "ERROR: TRADING_INSTANCE_ID must be set"
+    echo "Usage: TRADING_INSTANCE_ID=i-xxx bash infrastructure/add-cron.sh"
+    exit 1
+fi
 
 # ── Validate env file exists ─────────────────────────────────────────────────
 if [ ! -f "$ENV_FILE" ]; then
     echo "ERROR: ${ENV_FILE} not found."
-    echo "Create it with GMAIL_APP_PASSWORD and ANTHROPIC_API_KEY, then chmod 600."
     exit 1
 fi
 
-# ── Build cron lines (source env file instead of inline secrets) ─────────────
+# ── Build cron lines ─────────────────────────────────────────────────────────
 SOURCE_ENV=". ${ENV_FILE} &&"
+REGION="us-east-1"
 
-EXECUTOR_CRON="30 13 * * 1-5  cd ${REPO_DIR} && git pull --ff-only >> /var/log/executor.log 2>&1 && ${SOURCE_ENV} .venv/bin/python executor/main.py >> /var/log/executor.log 2>&1"
-DAEMON_CRON="45 13 * * 1-5  cd ${REPO_DIR} && ${SOURCE_ENV} .venv/bin/python -m executor.daemon >> /var/log/daemon.log 2>&1"
-EOD_CRON="5 21 * * 1-5  cd ${REPO_DIR} && git pull --ff-only >> /var/log/eod.log 2>&1 && ${SOURCE_ENV} .venv/bin/python executor/eod_reconcile.py >> /var/log/eod.log 2>&1"
+CRON_TZ_LINE="CRON_TZ=America/Los_Angeles"
+
+# Start trading instance 15 min before market open
+START_CRON="15 6 * * 1-5  aws ec2 start-instances --instance-ids ${TRADING_INSTANCE_ID} --region ${REGION} >> /var/log/trading-lifecycle.log 2>&1"
+
+# Stop trading instance 25 min after EOD reconciliation
+STOP_CRON="30 13 * * 1-5  aws ec2 stop-instances --instance-ids ${TRADING_INSTANCE_ID} --region ${REGION} >> /var/log/trading-lifecycle.log 2>&1"
+
+# Backtester spot launch (Monday 08:00 UTC — fixed UTC, not PT)
+BACKTESTER_CRON="0 8 * * 1  cd /home/ec2-user/alpha-engine-backtester && git pull --ff-only >> /var/log/backtester.log 2>&1 && ${SOURCE_ENV} bash infrastructure/spot_backtest.sh >> /var/log/backtester.log 2>&1"
 
 # ── Replace existing entries ─────────────────────────────────────────────────
-# Remove any existing alpha-engine executor/eod/daemon lines, then add new ones.
-# Preserve backtester and other cron entries.
 EXISTING=$(crontab -l 2>/dev/null || true)
-FILTERED=$(echo "$EXISTING" | grep -v "alpha-engine/.*executor/main.py" | grep -v "alpha-engine/.*executor/eod_reconcile.py" | grep -v "alpha-engine/.*executor.daemon" || true)
+# Remove old executor/daemon/eod/lifecycle/backtester lines
+FILTERED=$(echo "$EXISTING" | grep -v "alpha-engine/.*executor/main.py" \
+    | grep -v "alpha-engine/.*executor/eod_reconcile.py" \
+    | grep -v "alpha-engine/.*executor.daemon" \
+    | grep -v "ec2 start-instances" \
+    | grep -v "ec2 stop-instances" \
+    | grep -v "spot_backtest.sh" \
+    | grep -v "^CRON_TZ=America/Los_Angeles$" || true)
 
 {
     echo "$FILTERED"
-    echo "$EXECUTOR_CRON"
-    echo "$DAEMON_CRON"
-    echo "$EOD_CRON"
+    echo "$CRON_TZ_LINE"
+    echo "$START_CRON"
+    echo "$STOP_CRON"
+    echo "$BACKTESTER_CRON"
 } | crontab -
 
-echo "Executor cron jobs registered:"
-echo "  Executor: weekdays 13:30 UTC (9:30 AM ET)"
-echo "  Daemon:   weekdays 13:45 UTC (9:45 AM ET) — self-terminates at 4:00 PM ET"
-echo "  EOD:      weekdays 21:05 UTC (4:05 PM ET)"
-echo "  Secrets:  sourced from ${ENV_FILE}"
+echo "Micro instance cron jobs registered:"
+echo "  Trading start:  weekdays 6:15 AM PT"
+echo "  Trading stop:   weekdays 1:30 PM PT"
+echo "  Backtester:     Mondays 08:00 UTC (spot instance)"
+echo "  Trading ID:     ${TRADING_INSTANCE_ID}"
 echo ""
 echo "Current crontab:"
 crontab -l

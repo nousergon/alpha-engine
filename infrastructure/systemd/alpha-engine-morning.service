@@ -1,0 +1,19 @@
+[Unit]
+Description=Alpha Engine Morning Batch (order book planner)
+After=ibgateway.service boot-pull.service
+Requires=ibgateway.service
+
+[Service]
+Type=oneshot
+User=ec2-user
+WorkingDirectory=/home/ec2-user/alpha-engine
+EnvironmentFile=/home/ec2-user/.alpha-engine.env
+# Give IB Gateway 30s to authenticate via TOTP and become ready
+ExecStartPre=/bin/sleep 30
+ExecStart=/home/ec2-user/alpha-engine/.venv/bin/python executor/main.py
+StandardOutput=append:/var/log/executor.log
+StandardError=append:/var/log/executor.log
+Environment=PYTHONPATH=/home/ec2-user/alpha-engine
+
+[Install]
+WantedBy=multi-user.target
