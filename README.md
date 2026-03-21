@@ -37,10 +37,10 @@ Five modules run on AWS, connected through a shared S3 bucket. Each module reads
 │  Predictor (6:15 AM PT) ──── reads latest signals.json from S3     │
 │       │                                                             │
 │       ▼  predictions.json                                           │
-│  Executor (6:30 AM PT) ──── trades ───► Interactive Brokers        │
+│  Executor (6:20 AM PT) ──── order book ───► entries + exits        │
 │       │                                                             │
-│       ▼  order book (approved entries + stop state)                 │
-│  Intraday Daemon (6:45 AM – 1:00 PM PT) ──── monitor + execute    │
+│       ▼  order book (approved entries + urgent exits + stops)       │
+│  Intraday Daemon (6:25 AM – 1:00 PM PT) ──── sole order executor  │
 │       │                                                             │
 │       ▼  (market close)                                             │
 │  EOD Reconcile (1:05 PM PT) ──── NAV, return, alpha ───► email     │
@@ -81,10 +81,10 @@ LightGBM model that predicts 5-day market-relative returns for each ticker. Prod
 
 ### 3. Executor — [`alpha-engine`](https://github.com/cipher813/alpha-engine) *(this repo)*
 
-Reads signals and predictions from S3, applies hard risk rules, sizes positions, and executes orders on Interactive Brokers (paper trading). Includes an intraday daemon for continuous position monitoring and optimized entry/exit timing.
+Reads signals and predictions from S3, applies hard risk rules, sizes positions, and writes the intraday order book. The daemon is the sole order executor — no orders are placed at market open. Entry timing is optimized via technical triggers; exits execute immediately.
 
-- Morning batch: signal ingestion, risk evaluation, position sizing, bracket order placement
-- Intraday daemon: 15-minute delayed streaming via IB Gateway for exit monitoring and entry triggers
+- Morning planner: signal ingestion, risk evaluation, position sizing → writes order book (no orders placed)
+- Intraday daemon: sole order executor using 15-min delayed streaming via IB Gateway
 - Graduated drawdown response with configurable halt threshold
 - ATR-based trailing stops (volatility-adaptive) with time-decay exit rules
 - Broker-side trailing stops via bracket orders for crash protection
@@ -148,15 +148,15 @@ python executor/main.py --dry-run    # full loop, no orders placed
 ### Key Files
 
 ```
-executor/main.py              # Daily trading loop (entry point)
+executor/main.py              # Morning order-book planner (no orders placed)
+executor/daemon.py            # Sole order executor — urgent exits + technical entry triggers
+executor/order_book.py        # JSON-based intraday order book (entries, urgent exits, stops)
 executor/signal_reader.py     # Reads signals.json from S3
 executor/risk_guard.py        # 8-rule enforcement + graduated drawdown
 executor/position_sizer.py    # Equal-weight base with 9 sizing adjustments
 executor/ibkr.py              # IB Gateway wrapper (ib_insync)
 executor/bracket_orders.py    # BUY + trailing stop as parent/child IB orders
 executor/strategies/          # ATR trailing stops, time-decay, profit-take, momentum exits
-executor/daemon.py            # Intraday monitoring loop (9:45 AM – 4:00 PM ET)
-executor/order_book.py        # JSON-based intraday order book (entries, stops)
 executor/price_monitor.py     # 15-min delayed streaming subscriptions
 executor/intraday_exit_manager.py  # Intraday exit rules (trail, profit-take, collapse)
 executor/entry_triggers.py    # Intraday entry triggers (pullback, VWAP, support, expiry)
@@ -172,15 +172,15 @@ config/risk.yaml.example      # Safe template — copy to config/risk.yaml
 
 ### Daily Execution Flow
 
-The executor operates in two phases: a morning batch that makes all trading decisions, and an intraday daemon that optimizes execution timing and monitors positions in real time.
+The executor operates in three phases: a morning planner that writes the order book, an intraday daemon that executes all trades, and EOD reconciliation.
 
-| Step | Time (ET) | What happens |
+| Step | Time (PT) | What happens |
 |------|-----------|--------------|
-| **Morning Batch** | 9:30 AM | Read signals, evaluate exits, apply risk rules, size positions, place bracket orders, write order book |
-| **Intraday Daemon** | 9:45 AM – 4:00 PM | Monitor positions via 15-min delayed streaming; execute entry triggers and exit rules |
-| **EOD Reconcile** | 4:05 PM | Capture final NAV, compute daily return vs SPY, log alpha, send email report |
+| **Morning Planner** | ~6:20 AM | Read signals, evaluate exits, apply risk rules, size positions → write order book (no orders) |
+| **Intraday Daemon** | ~6:25 AM – 1:00 PM | Wait for market open (6:30 AM PT). Execute urgent exits immediately. Monitor entries for technical triggers. Monitor stops for exit rules. |
+| **EOD Reconcile** | 1:05 PM | Capture final NAV, compute daily return vs SPY, log alpha, send email report |
 
-The morning batch is the **decision-maker** (what to buy/sell and how much). The daemon is the **execution optimizer** (when to buy/sell during the day). Both write to the same SQLite trade log and S3 backup.
+The morning planner is the **decision-maker** (what to buy/sell and how much). The daemon is the **sole executor** (when to buy/sell during the day, with a hard safety check that the connected account is paper). Both write to the same SQLite trade log and S3 backup.
 
 ### Decision Pipeline
 
@@ -226,15 +226,23 @@ Position Sizer ──── compute shares:
   → capped at max_position_pct
        │
        ▼
-Bracket Orders ──── place BUY market order + trailing stop as parent/child
+Order Book ──── write approved entry to order_book.json with:
+  - shares, sizing factors, ATR value
+  - entry triggers (pullback %, VWAP discount, support level)
+  - full metadata for daemon's trade logging
        │
        ▼
-Trade Logger ──── persist to SQLite + S3 backup
+Daemon ──── waits for technical trigger, then places bracket order + logs trade
 ```
 
 ### Intraday Daemon
 
-After the morning batch completes, the intraday daemon starts at 9:45 AM ET and runs until market close. It connects to IB Gateway on a separate `clientId` (2) to avoid conflicts with the morning batch (clientId 1).
+The daemon is the **sole order executor**. It starts after the morning planner completes, waits for market open (9:30 AM ET / 6:30 AM PT), then runs until market close. It connects to IB Gateway on a separate `clientId` (2) to avoid conflicts with the planner (clientId 1). A runtime safety check verifies the connected account starts with "D" (paper prefix) before placing any orders.
+
+**Execution phases:**
+
+1. **Phase 0 — Urgent exits** (immediately at market open): EXIT and REDUCE signals from Research and strategy rules execute as market orders with no trigger delay. Risk reduction is never deferred.
+2. **Phase 1+2 — Entry triggers + stop monitoring** (polling loop until market close): Pending entries wait for technical triggers. Active stops are monitored for exit rules.
 
 **Price monitoring:** Subscribes to IB Gateway's free 15-minute delayed streaming data (`reqMarketDataType(3)`) for all tracked tickers. Prices update via `pendingTickersEvent` callbacks.
 
@@ -273,22 +281,37 @@ The executor consumes six data streams — all read-only, no feedback during exe
 
 EXIT and REDUCE signals from Research always bypass all risk rules — reducing exposure is never blocked.
 
-### EC2 Infrastructure
+### EC2 Infrastructure (Two Instances)
 
-The executor shares an EC2 instance with other system components:
+The system runs on two EC2 instances to separate always-on hosting from market-hours trading:
 
-| Process | Type | Schedule | Port |
-|---------|------|----------|------|
-| Nginx (reverse proxy + SSL) | Always-on | 24/7 | 80, 443 |
-| nousergon.ai (Streamlit) | Always-on | 24/7 | 8502 |
-| dashboard.nousergon.ai (Streamlit) | Always-on | 24/7 | 8501 |
-| IB Gateway (paper trading) | Always-on | 24/7 | 4002 |
-| Executor (`main.py`) | Cron | 9:30 AM ET weekdays | — |
-| Intraday Daemon (`daemon.py`) | Cron | 9:45 AM – 4:00 PM ET weekdays | — |
-| EOD Reconcile (`eod_reconcile.py`) | Cron | 4:05 PM ET weekdays | — |
-| Backtester (spot launcher) | Cron | Monday 3:00 AM ET | — |
+**Micro instance (t3.micro, 24/7) — dashboard host:**
 
-The instance runs 24/7 to serve the public website, dashboard, and IB Gateway.
+| Process | Type | Port |
+|---------|------|------|
+| Nginx (reverse proxy + SSL) | Always-on | 80, 443 |
+| nousergon.ai (Streamlit) | Always-on | 8502 |
+| dashboard.nousergon.ai (Streamlit) | Always-on | 8501 |
+
+**Trading instance (t3.small, market hours only) — started/stopped by EventBridge:**
+
+| Process | Type | Trigger |
+|---------|------|---------|
+| Xvfb (virtual display) | systemd | On boot |
+| IB Gateway (paper account, IBC) | systemd | After Xvfb |
+| Morning planner (`main.py`) | systemd oneshot | After IB Gateway ready (port 4002 poll) |
+| Intraday daemon (`daemon.py`) | systemd | After morning planner |
+| EOD reconcile (`eod_reconcile.py`) | systemd timer | 1:05 PM PT |
+
+**EventBridge Scheduler (serverless, no cron):**
+
+| Schedule | Time | Target |
+|----------|------|--------|
+| Start trading instance | Weekdays 6:15 AM PT | EC2 StartInstances |
+| Stop trading instance | Weekdays 1:30 PM PT | EC2 StopInstances |
+| Backtester spot launch | Mondays 08:00 UTC | SSM RunCommand → micro |
+
+**IB Gateway:** Uses IBC (IB Controller) with paper account credentials stored in `~/ibc/config.ini`. The paper account has its own dedicated username/password, separate from the live brokerage account. Paper accounts do not require 2FA. The daemon includes a runtime safety check that hard-exits if connected to a non-paper account.
 
 ---
 
