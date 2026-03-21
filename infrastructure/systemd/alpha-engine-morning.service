@@ -9,7 +9,7 @@ User=ec2-user
 WorkingDirectory=/home/ec2-user/alpha-engine
 EnvironmentFile=/home/ec2-user/.alpha-engine.env
 # Give IB Gateway 30s to authenticate via TOTP and become ready
-ExecStartPre=/bin/sleep 30
+ExecStartPre=/home/ec2-user/alpha-engine/infrastructure/wait-for-ibgateway.sh
 ExecStart=/home/ec2-user/alpha-engine/.venv/bin/python executor/main.py
 StandardOutput=append:/var/log/executor.log
 StandardError=append:/var/log/executor.log
