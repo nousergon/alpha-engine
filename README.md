@@ -1,6 +1,6 @@
 # Nous Ergon: Alpha Engine
 
-**See the Nous Ergon public dashboard at [nousergon.ai](nousergon.ai) and blog series on [Hashnode](https://nous-ergon.hashnode.dev/)**
+**See the Nous Ergon public dashboard at [nousergon.ai](https://nousergon.ai) and blog series on [Hashnode](https://nousergon.ai/blog)**
 
 **Nous Ergon** (νοῦς ἔργον — "intelligence at work") is a fully autonomous trading system that combines AI-driven research, quantitative prediction, and rule-based execution to generate market alpha.
 
