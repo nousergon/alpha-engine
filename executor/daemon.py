@@ -498,20 +498,23 @@ def _execute_entry(
     # Mark entry as executed in order book
     order_book.mark_entry_executed(ticker, trigger_reason)
 
-    # Add stop record for the new position
+    # Add stop record for the new position (skip if ATR unavailable)
     trail_atr = entry.get("atr_value", 0)
     atr_mult = strategy_config.get("intraday_trailing_stop_atr_multiple", 2.0)
-    stop_price = round(fill_price - trail_atr * atr_mult, 2) if trail_atr else 0
-    order_book.add_stop({
-        "ticker": ticker,
-        "entry_price": fill_price,
-        "current_stop": stop_price,
-        "trail_atr": trail_atr,
-        "atr_multiple": atr_mult,
-        "high_water": fill_price,
-        "entry_date": run_date,
-        "shares": shares,
-    })
+    if trail_atr and trail_atr > 0:
+        stop_price = round(fill_price - trail_atr * atr_mult, 2)
+        order_book.add_stop({
+            "ticker": ticker,
+            "entry_price": fill_price,
+            "current_stop": stop_price,
+            "trail_atr": trail_atr,
+            "atr_multiple": atr_mult,
+            "high_water": fill_price,
+            "entry_date": run_date,
+            "shares": shares,
+        })
+    else:
+        logger.warning("No ATR for %s — position entered without trailing stop", ticker)
     order_book.save()
 
     send_trade_alert(

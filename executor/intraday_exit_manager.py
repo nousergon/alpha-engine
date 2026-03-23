@@ -74,6 +74,9 @@ class IntradayExitManager:
             return None
 
         trail_atr = stop.get("trail_atr", 0)
+        if not trail_atr or trail_atr <= 0:
+            return None  # no ATR data — cannot compute meaningful trail distance
+
         atr_multiple = stop.get("atr_multiple", 2.0)
 
         # Time-based tightening: after N days, reduce multiplier

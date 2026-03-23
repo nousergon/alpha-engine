@@ -804,7 +804,10 @@ def run(
                     atr_val = _compute_atr(ticker_hist, period=14) if ticker_hist else None
                     entry_price = pos.get("avg_cost", 0)
                     atr_mult = strategy_config.get("intraday_trailing_stop_atr_multiple", 2.0)
-                    stop_price = round(entry_price - atr_val * atr_mult, 2) if atr_val else 0
+                    if not atr_val or atr_val <= 0:
+                        logger.warning("No ATR for %s — skipping stop (no price history)", t)
+                        continue
+                    stop_price = round(entry_price - atr_val * atr_mult, 2)
                     ob.add_stop({
                         "ticker": t,
                         "entry_price": entry_price,
