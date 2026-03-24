@@ -55,6 +55,13 @@ logger = logging.getLogger(__name__)
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "risk.yaml")
 
+# Exception types that indicate a dropped IB Gateway connection
+try:
+    from asyncio import IncompleteReadError, TimeoutError as AsyncTimeoutError
+    asyncio_exceptions = (IncompleteReadError, AsyncTimeoutError)
+except ImportError:
+    asyncio_exceptions = ()
+
 _shutdown_requested = False
 
 
@@ -62,6 +69,60 @@ def _handle_signal(signum, frame):
     global _shutdown_requested
     logger.info("Shutdown signal received (%s)", signum)
     _shutdown_requested = True
+
+
+def _reconnect(
+    ibkr: IBKRClient,
+    monitor: "PriceMonitor",
+    order_book: "OrderBook",
+    config: dict,
+    client_id: int,
+    max_attempts: int = 10,
+    backoff_base: int = 30,
+) -> tuple:
+    """Reconnect to IB Gateway after a connection drop.
+
+    Returns (new_ibkr, new_monitor) tuple. Raises after max_attempts.
+    """
+    # Clean up old connection
+    try:
+        monitor.unsubscribe_all()
+    except Exception:
+        pass
+    try:
+        ibkr.disconnect()
+    except Exception:
+        pass
+
+    send_daemon_status(
+        "\u26a0\ufe0f *IB Gateway connection lost* — attempting reconnect..."
+    )
+
+    for attempt in range(1, max_attempts + 1):
+        if _shutdown_requested:
+            raise KeyboardInterrupt("Shutdown during reconnect")
+        wait = min(backoff_base * attempt, 300)
+        logger.info("Reconnect attempt %d/%d — waiting %ds...", attempt, max_attempts, wait)
+        _time.sleep(wait)
+        try:
+            new_ibkr = IBKRClient(
+                host=config["ibkr_host"],
+                port=config["ibkr_port"],
+                client_id=client_id,
+                reconnect_attempts=config.get("ibkr_reconnect_attempts", 3),
+            )
+            new_monitor = PriceMonitor(new_ibkr.ib)
+            new_monitor.subscribe(order_book.all_tickers())
+            logger.info("Reconnected to IB Gateway successfully")
+            send_daemon_status("\u2705 *IB Gateway reconnected*")
+            return new_ibkr, new_monitor
+        except Exception as e:
+            logger.warning("Reconnect attempt %d/%d failed: %s", attempt, max_attempts, e)
+            if attempt == max_attempts:
+                send_daemon_status(
+                    f"\u274c *IB Gateway reconnect failed after {max_attempts} attempts* — daemon exiting"
+                )
+                raise
 
 
 def load_config() -> dict:
@@ -142,37 +203,56 @@ def run_daemon(dry_run: bool = False) -> None:
         )
         logger.info("Order book arrived after market open — proceeding with late start")
 
-    # Connect to IB Gateway
+    # Connect to IB Gateway (with retry)
     db_path = config["db_path"]
     conn = init_db(db_path)
 
-    ibkr = IBKRClient(
-        host=config["ibkr_host"],
-        port=config["ibkr_port"],
-        client_id=client_id,
-        reconnect_attempts=config.get("ibkr_reconnect_attempts", 3),
-    )
+    max_connect_attempts = config.get("ibkr_daemon_max_connect_attempts", 10)
+    connect_backoff_base = 30  # seconds
 
-    # ── Paper account safety check ────────────────────────────────────
-    # IB paper accounts start with "D" (e.g., DU1234567). Hard-exit if
-    # connected to a live account to prevent real-money trades.
-    try:
-        accounts = ibkr.ib.managedAccounts()
-        if accounts:
-            acct = accounts[0]
-            if not acct.startswith("D"):
-                logger.critical(
-                    "SAFETY HALT: connected to live account %s — daemon refusing to trade. "
-                    "Paper accounts start with 'D'. Check TRADING_MODE and ibkr_port.",
-                    acct,
+    def _connect_ibkr() -> IBKRClient:
+        """Connect to IB Gateway with exponential backoff. Raises after max attempts."""
+        for attempt in range(1, max_connect_attempts + 1):
+            try:
+                client = IBKRClient(
+                    host=config["ibkr_host"],
+                    port=config["ibkr_port"],
+                    client_id=client_id,
+                    reconnect_attempts=config.get("ibkr_reconnect_attempts", 3),
                 )
-                ibkr.disconnect()
-                if conn:
-                    conn.close()
-                return
-            logger.info("Paper account verified: %s", acct)
-    except Exception as e:
-        logger.warning("Could not verify paper account (non-blocking): %s", e)
+                # Paper account safety check
+                try:
+                    accounts = client.ib.managedAccounts()
+                    if accounts:
+                        acct = accounts[0]
+                        if not acct.startswith("D"):
+                            logger.critical(
+                                "SAFETY HALT: connected to live account %s — daemon refusing to trade.",
+                                acct,
+                            )
+                            client.disconnect()
+                            raise SystemExit(1)
+                        logger.info("Paper account verified: %s", acct)
+                except SystemExit:
+                    raise
+                except Exception as e:
+                    logger.warning("Could not verify paper account (non-blocking): %s", e)
+                return client
+            except SystemExit:
+                raise
+            except Exception as e:
+                wait = min(connect_backoff_base * attempt, 300)
+                logger.warning(
+                    "IB Gateway connection attempt %d/%d failed: %s — retrying in %ds",
+                    attempt, max_connect_attempts, e, wait,
+                )
+                if attempt == max_connect_attempts:
+                    raise
+                _time.sleep(wait)
+                if _shutdown_requested:
+                    raise KeyboardInterrupt("Shutdown during reconnect")
+
+    ibkr = _connect_ibkr()
 
     monitor = PriceMonitor(ibkr.ib)
     exit_mgr = IntradayExitManager(strategy_config)
@@ -281,8 +361,13 @@ def run_daemon(dry_run: bool = False) -> None:
                 logger.info("Market closed — daemon shutting down")
                 break
 
-            # Let ib_insync process events and update tickers
-            ibkr.ib.sleep(poll_interval)
+            try:
+                # Let ib_insync process events and update tickers
+                ibkr.ib.sleep(poll_interval)
+            except (ConnectionError, OSError, asyncio_exceptions) as e:
+                logger.warning("IB Gateway connection lost during poll: %s — reconnecting", e)
+                ibkr, monitor = _reconnect(ibkr, monitor, order_book, config, client_id)
+                continue
 
             # Reload order book in case morning batch updated it
             order_book = OrderBook.load()
@@ -308,11 +393,16 @@ def run_daemon(dry_run: bool = False) -> None:
                 # Check exit rules
                 exit_signal = exit_mgr.evaluate(stop, price_state)
                 if exit_signal:
-                    _execute_exit(
-                        ibkr, conn, order_book, exit_signal, price_state,
-                        run_date, dry_run,
-                    )
-                    trades_executed += 1
+                    try:
+                        _execute_exit(
+                            ibkr, conn, order_book, exit_signal, price_state,
+                            run_date, dry_run,
+                        )
+                        trades_executed += 1
+                    except (ConnectionError, OSError, asyncio_exceptions) as e:
+                        logger.warning("Connection lost during exit %s: %s — reconnecting", exit_signal.get("ticker"), e)
+                        ibkr, monitor = _reconnect(ibkr, monitor, order_book, config, client_id)
+                        break
 
             # ── Check entries ────────────────────────────────────────
             if strategy_config.get("intraday_entry_triggers_enabled", True):
@@ -324,19 +414,30 @@ def run_daemon(dry_run: bool = False) -> None:
 
                     should_enter, reason = entry_engine.should_enter(entry, price_state)
                     if should_enter:
-                        _execute_entry(
-                            ibkr, conn, order_book, entry, price_state, reason,
-                            run_date, strategy_config, dry_run,
-                        )
-                        trades_executed += 1
+                        try:
+                            _execute_entry(
+                                ibkr, conn, order_book, entry, price_state, reason,
+                                run_date, strategy_config, dry_run,
+                            )
+                            trades_executed += 1
+                        except (ConnectionError, OSError, asyncio_exceptions) as e:
+                            logger.warning("Connection lost during entry %s: %s — reconnecting", ticker, e)
+                            ibkr, monitor = _reconnect(ibkr, monitor, order_book, config, client_id)
+                            break
 
     except Exception:
         logger.exception("Daemon error")
         send_daemon_status("\u274c *Daemon crashed* — check logs")
         raise
     finally:
-        monitor.unsubscribe_all()
-        ibkr.disconnect()
+        try:
+            monitor.unsubscribe_all()
+        except Exception:
+            pass
+        try:
+            ibkr.disconnect()
+        except Exception:
+            pass
         if conn:
             conn.close()
         send_daemon_status(
