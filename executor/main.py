@@ -204,8 +204,9 @@ def run(
     signals_bucket = config["signals_bucket"]
     trades_bucket = config["trades_bucket"]
 
-    # ── 0. Check upstream health (warn-only, never blocks) ────────────────
+    # ── 0. Check upstream health (warn + Telegram alert, never blocks) ───
     if not simulate:
+        _health_warnings = []
         try:
             from executor.health_status import check_upstream_health
             upstream = check_upstream_health(
@@ -215,18 +216,31 @@ def run(
             )
             for mod, info in upstream.items():
                 if info["status"] == "unknown":
+                    _health_warnings.append(f"{mod}: no health data found")
                     logger.warning("Upstream %s: no health data found", mod)
+                elif info["status"] == "failed":
+                    _health_warnings.append(f"{mod}: last run FAILED")
+                    logger.warning("Upstream %s last run FAILED", mod)
                 elif info["stale"]:
                     max_hrs = 192 if mod == "research" else 48  # 8 days vs 2 days
                     if info["age_hours"] > max_hrs:
-                        logger.warning(
-                            "Upstream %s data is %.1f hours (%.1f days) stale",
-                            mod, info["age_hours"], info["age_hours"] / 24,
-                        )
-                elif info["status"] == "failed":
-                    logger.warning("Upstream %s last run FAILED", mod)
+                        msg = f"{mod}: {info['age_hours']:.0f}h ({info['age_hours']/24:.1f}d) stale"
+                        _health_warnings.append(msg)
+                        logger.warning("Upstream %s", msg)
         except Exception as _ue:
             logger.debug("Upstream health check failed (non-blocking): %s", _ue)
+
+        if _health_warnings:
+            try:
+                from executor.notifier import send_daemon_status
+                send_daemon_status(
+                    "\u26a0\ufe0f *Upstream health warning*\n"
+                    f"Date: {run_date}\n"
+                    + "\n".join(f"- {w}" for w in _health_warnings)
+                    + "\n\nExecutor proceeding — check research/predictor."
+                )
+            except Exception:
+                pass
 
     conn = None if simulate else init_db(db_path)
 
@@ -288,6 +302,21 @@ def run(
     signals = get_actionable_signals(signals_raw)
     market_regime = signals["market_regime"]
     sector_ratings = signals["sector_ratings"]
+
+    # Alert if signals are stale (research didn't run recently)
+    if not simulate:
+        try:
+            signals_date_raw = signals_raw.get("date", run_date)
+            _sig_age = (date.fromisoformat(run_date) - date.fromisoformat(signals_date_raw)).days
+            if _sig_age > 2:
+                from executor.notifier import send_daemon_status
+                send_daemon_status(
+                    f"\u26a0\ufe0f *Stale signals*\n"
+                    f"Using signals from {signals_date_raw} ({_sig_age} days old)\n"
+                    f"Research may not have run this week."
+                )
+        except Exception:
+            pass
 
     # Load GBM predictions for rationale capture (reuse if already loaded in population path)
     if not simulate:
