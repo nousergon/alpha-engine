@@ -337,6 +337,27 @@ python tests/validate_signals.py path/to/signals.json
 3. `--dry-run` on EC2 (after market close) — verify with real IB data
 4. Deploy live on next trading day
 
+### Portfolio Reset
+
+Reset the portfolio to a clean $1M state (e.g., after tuning is complete and you want a fresh track record).
+
+```bash
+# Preview what will happen (no changes made)
+bash infrastructure/reset-portfolio.sh --dry-run
+
+# Execute the full reset (DESTRUCTIVE — archives all trade history first)
+bash infrastructure/reset-portfolio.sh --live
+```
+
+**Reset process:**
+1. Reset IB paper account balance at [IB Account Management](https://www.interactivebrokers.com) (manual — no API)
+2. Stop the trading instance
+3. Run `reset-portfolio.sh --live` — archives trade history to S3, writes clean db/csv
+4. Start the trading instance — first EOD reconcile creates the new inception row
+5. Dashboard automatically picks up the new inception date
+
+All historical data is preserved in `s3://alpha-engine-executor/trades/archive/{timestamp}/`.
+
 ---
 
 ## Auto-Optimization
