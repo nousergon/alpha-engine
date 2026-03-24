@@ -7,7 +7,7 @@ PORT="${1:-4002}"
 MAX_WAIT=120
 
 for i in $(seq 1 $MAX_WAIT); do
-    if nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
+    if (echo > /dev/tcp/127.0.0.1/"$PORT") 2>/dev/null; then
         echo "IB Gateway ready on port $PORT after ${i}s"
         exit 0
     fi
