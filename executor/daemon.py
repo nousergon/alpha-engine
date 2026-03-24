@@ -273,6 +273,7 @@ def run_daemon(dry_run: bool = False) -> None:
     )
 
     trades_executed = 0
+    executed_tickers: set = set()  # tracks tickers already traded today
 
     try:
         # ── Wait for market open (daemon may start before 9:30 AM ET) ────
@@ -348,7 +349,8 @@ def run_daemon(dry_run: bool = False) -> None:
                     source="daemon",
                 )
 
-            trades_executed += 1
+                trades_executed += 1
+                executed_tickers.add(ticker)
 
         if n_urgent > 0:
             order_book.save()
@@ -371,6 +373,7 @@ def run_daemon(dry_run: bool = False) -> None:
 
             # Reload order book in case morning batch updated it
             order_book = OrderBook.load()
+            order_book.merge_executed(executed_tickers)
 
             # ── Check exits ──────────────────────────────────────────
             for stop in order_book.active_stops():
@@ -398,7 +401,9 @@ def run_daemon(dry_run: bool = False) -> None:
                             ibkr, conn, order_book, exit_signal, price_state,
                             run_date, dry_run,
                         )
-                        trades_executed += 1
+                        if not dry_run:
+                            trades_executed += 1
+                            executed_tickers.add(exit_signal.get("ticker"))
                     except (ConnectionError, OSError, asyncio_exceptions) as e:
                         logger.warning("Connection lost during exit %s: %s — reconnecting", exit_signal.get("ticker"), e)
                         ibkr, monitor = _reconnect(ibkr, monitor, order_book, config, client_id)
@@ -419,7 +424,9 @@ def run_daemon(dry_run: bool = False) -> None:
                                 ibkr, conn, order_book, entry, price_state, reason,
                                 run_date, strategy_config, dry_run,
                             )
-                            trades_executed += 1
+                            if not dry_run:
+                                trades_executed += 1
+                                executed_tickers.add(ticker)
                         except (ConnectionError, OSError, asyncio_exceptions) as e:
                             logger.warning("Connection lost during entry %s: %s — reconnecting", ticker, e)
                             ibkr, monitor = _reconnect(ibkr, monitor, order_book, config, client_id)

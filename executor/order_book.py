@@ -161,3 +161,21 @@ class OrderBook:
     def set_date(self, run_date: str) -> None:
         """Set the book date (used by morning batch)."""
         self._data["date"] = run_date
+
+    def merge_executed(self, executed_tickers: set[str]) -> None:
+        """Remove entries for tickers already executed today.
+
+        Called by the daemon after reloading the order book from disk,
+        in case main.py re-ran and wrote fresh 'pending' entries for
+        tickers the daemon already traded.
+        """
+        if not executed_tickers:
+            return
+        before = len(self._data.get("approved_entries", []))
+        self._data["approved_entries"] = [
+            e for e in self._data.get("approved_entries", [])
+            if e["ticker"] not in executed_tickers
+        ]
+        removed = before - len(self._data["approved_entries"])
+        if removed:
+            logger.info("Merged executed state: removed %d already-traded entries", removed)
