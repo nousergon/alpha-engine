@@ -315,6 +315,30 @@ The system runs on two EC2 instances to separate always-on hosting from market-h
 
 ---
 
+## Local Testing
+
+Test executor changes locally before deploying to EC2. No IB Gateway connection required.
+
+```bash
+# Simulate mode: real signals from S3, synthetic IB positions, no orders placed
+python executor/main.py --simulate
+
+# Dry run on EC2: real IB prices + positions, no order book written
+python executor/main.py --dry-run
+
+# Validate signals.json for executor compatibility (local file or S3)
+python tests/validate_signals.py --s3 2026-03-24
+python tests/validate_signals.py path/to/signals.json
+```
+
+**Preprod workflow:**
+1. Make code changes
+2. `python executor/main.py --simulate` — verify no crashes, review planned orders
+3. `--dry-run` on EC2 (after market close) — verify with real IB data
+4. Deploy live on next trading day
+
+---
+
 ## Auto-Optimization
 
 The backtester writes three S3 config files that upstream modules read on cold-start, closing the feedback loop automatically:
