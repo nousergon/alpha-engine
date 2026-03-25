@@ -819,11 +819,23 @@ def run(
                     })
 
                 ob.save()
+                n_entries = len(ob.pending_entries())
+                n_urgent = len(ob.pending_urgent_exits())
+                n_stops = len(ob.active_stops())
                 logger.info(
                     "Order book written: %d entries, %d urgent exits, %d stops",
-                    len(ob.pending_entries()), len(ob.pending_urgent_exits()),
-                    len(ob.active_stops()),
+                    n_entries, n_urgent, n_stops,
                 )
+                if not dry_run:
+                    try:
+                        from executor.notifier import send_daemon_status
+                        send_daemon_status(
+                            f"\u2705 *Order book written*\n"
+                            f"Date: {run_date}\n"
+                            f"Entries: {n_entries} | Urgent exits: {n_urgent} | Stops: {n_stops}"
+                        )
+                    except Exception:
+                        pass
             except Exception as e:
                 logger.warning("Failed to write order book: %s", e)
 
