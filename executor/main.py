@@ -151,7 +151,8 @@ def _compute_support_level(price_history: list[dict], strategy_config: dict) -> 
     if not price_history or len(price_history) < lookback:
         return None
     recent = price_history[-lookback:]
-    return min(bar["low"] for bar in recent if bar.get("low"))
+    lows = [bar["low"] for bar in recent if bar.get("low")]
+    return min(lows) if lows else None
 
 
 def run(

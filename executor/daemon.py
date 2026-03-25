@@ -299,9 +299,21 @@ def run_daemon(dry_run: bool = False) -> None:
             )
 
             if not dry_run:
-                order_result = ibkr.place_market_order(ticker, "SELL", shares)
+                order_result = None
+                for _attempt in range(3):
+                    if _attempt > 0:
+                        _time.sleep([0, 2, 5][_attempt])
+                        logger.info("Retry %d/3: URGENT %s %s", _attempt + 1, action, ticker)
+                    order_result = ibkr.place_market_order(ticker, "SELL", shares)
+                    if order_result["status"] not in ("Rejected", "Timeout"):
+                        break
                 if order_result["status"] in ("Rejected", "Timeout"):
-                    logger.warning("URGENT %s %s order %s", action, ticker, order_result["status"])
+                    logger.error("URGENT %s %s FAILED after 3 attempts: %s", action, ticker, order_result["status"])
+                    send_daemon_status(
+                        f"\u26a0\ufe0f *URGENT {action} {ticker} FAILED*\n"
+                        f"Status: {order_result['status']} after 3 retries\n"
+                        f"Shares: {shares} | Reason: {reason}"
+                    )
                     continue
 
                 fill_price = order_result.get("fill_price") or ibkr.get_current_price(ticker) or 0
@@ -479,9 +491,17 @@ def _execute_exit(
     if dry_run:
         return
 
-    order_result = ibkr.place_market_order(ticker, sell_action, shares)
+    order_result = None
+    for _attempt in range(2):
+        if _attempt > 0:
+            _time.sleep(2)
+            logger.info("Retry %d/2: %s %s", _attempt + 1, action, ticker)
+        order_result = ibkr.place_market_order(ticker, sell_action, shares)
+        if order_result["status"] not in ("Rejected", "Timeout"):
+            break
     if order_result["status"] in ("Rejected", "Timeout"):
-        logger.warning("%s %s order %s", action, ticker, order_result["status"])
+        logger.error("%s %s FAILED after 2 attempts: %s", action, ticker, order_result["status"])
+        send_daemon_status(f"\u26a0\ufe0f *{action} {ticker} FAILED*: {order_result['status']}")
         return
 
     fill_price = order_result.get("fill_price") or current_price
@@ -554,19 +574,29 @@ def _execute_entry(
 
     # Try bracket order if ATR is available in the entry
     atr_value = entry.get("atr_value")
-    if atr_value and atr_value > 0 and strategy_config.get("bracket_stop_enabled", True):
-        from executor.bracket_orders import place_bracket_with_stop
-        bracket_mult = strategy_config.get("bracket_trail_atr_multiple", 2.0)
-        order_result = place_bracket_with_stop(
-            ibkr, ticker, shares,
-            atr_value=atr_value,
-            atr_multiple=bracket_mult,
-        )
-    else:
-        order_result = ibkr.place_market_order(ticker, "BUY", shares)
+    use_bracket = atr_value and atr_value > 0 and strategy_config.get("bracket_stop_enabled", True)
+    bracket_mult = strategy_config.get("bracket_trail_atr_multiple", 2.0) if use_bracket else None
+
+    order_result = None
+    for _attempt in range(2):
+        if _attempt > 0:
+            _time.sleep(2)
+            logger.info("Retry %d/2: ENTER %s", _attempt + 1, ticker)
+        if use_bracket:
+            from executor.bracket_orders import place_bracket_with_stop
+            order_result = place_bracket_with_stop(
+                ibkr, ticker, shares,
+                atr_value=atr_value,
+                atr_multiple=bracket_mult,
+            )
+        else:
+            order_result = ibkr.place_market_order(ticker, "BUY", shares)
+        if order_result["status"] not in ("Rejected", "Timeout"):
+            break
 
     if order_result["status"] in ("Rejected", "Timeout"):
-        logger.warning("ENTER %s order %s", ticker, order_result["status"])
+        logger.error("ENTER %s FAILED after 2 attempts: %s", ticker, order_result["status"])
+        send_daemon_status(f"\u26a0\ufe0f *ENTER {ticker} FAILED*: {order_result['status']}")
         return
 
     fill_price = order_result.get("fill_price") or current_price

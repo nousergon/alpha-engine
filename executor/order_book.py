@@ -52,9 +52,11 @@ class OrderBook:
         return cls(_default_book(), path)
 
     def save(self) -> None:
-        """Write order book to disk."""
+        """Write order book to disk (atomic via tmp + rename)."""
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(json.dumps(self._data, indent=2, default=str))
+        tmp_path = self._path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(self._data, indent=2, default=str))
+        tmp_path.rename(self._path)
 
     # ── Queries ──────────────────────────────────────────────────────────────
 
