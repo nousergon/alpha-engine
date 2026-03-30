@@ -1,6 +1,6 @@
 #!/bin/bash
 # Create EventBridge scheduled rules for:
-#   1. Start trading instance weekdays 6:15 AM PT
+#   1. Start trading instance weekdays 6:20 AM PT
 #   2. Stop trading instance weekdays 1:30 PM PT
 #   3. Launch backtester spot instance Saturdays 08:00 UTC (via SSM on micro)
 #
@@ -94,13 +94,13 @@ fi
 ROLE_ARN=$(aws iam get-role --role-name "$ROLE_NAME" --query 'Role.Arn' --output text --region "$REGION")
 echo "Role ARN: ${ROLE_ARN}"
 
-# ── 2. Start trading instance — weekdays 6:15 AM PT ─────────────────────────
+# ── 2. Start trading instance — weekdays 6:20 AM PT ─────────────────────────
 # EventBridge Scheduler uses IANA timezone names
 echo ""
 echo "Creating schedule: start-trading-instance..."
 aws scheduler create-schedule \
     --name "alpha-engine-start-trading" \
-    --schedule-expression "cron(15 6 ? * MON-FRI *)" \
+    --schedule-expression "cron(20 6 ? * MON-FRI *)" \
     --schedule-expression-timezone "America/Los_Angeles" \
     --flexible-time-window '{"Mode":"OFF"}' \
     --target "{
@@ -113,7 +113,7 @@ aws scheduler create-schedule \
     2>/dev/null || \
 aws scheduler update-schedule \
     --name "alpha-engine-start-trading" \
-    --schedule-expression "cron(15 6 ? * MON-FRI *)" \
+    --schedule-expression "cron(20 6 ? * MON-FRI *)" \
     --schedule-expression-timezone "America/Los_Angeles" \
     --flexible-time-window '{"Mode":"OFF"}' \
     --target "{
@@ -124,7 +124,7 @@ aws scheduler update-schedule \
     --state ENABLED \
     --region "$REGION"
 
-echo "  Start: weekdays 6:15 AM PT"
+echo "  Start: weekdays 6:20 AM PT"
 
 # ── 3. Stop trading instance — weekdays 1:30 PM PT ──────────────────────────
 echo "Creating schedule: stop-trading-instance..."
@@ -192,7 +192,7 @@ echo ""
 echo "=== EventBridge Setup Complete ==="
 echo ""
 echo "Schedules created:"
-echo "  alpha-engine-start-trading      weekdays 6:15 AM PT"
+echo "  alpha-engine-start-trading      weekdays 6:20 AM PT"
 echo "  alpha-engine-stop-trading       weekdays 1:30 PM PT"
 echo "  alpha-engine-backtester-weekly  Saturdays 08:00 UTC"
 echo ""

@@ -794,6 +794,15 @@ def run(
                         config["strategy"][sub_key].update(sub_val)
                     else:
                         config["strategy"][sub_key] = sub_val
+            elif key in _PARAM_MAP:
+                # Route flat param names through the same mapping as S3 params
+                # so backtester sweep keys (e.g. "min_score") land in the right
+                # nested config location (e.g. "min_score_to_enter").
+                path = _PARAM_MAP[key]
+                target = config
+                for p in path[:-1]:
+                    target = target.setdefault(p, {})
+                target[path[-1]] = val
             else:
                 config[key] = val
     # Merge S3-delivered params (backtester recommendations) if not in simulate mode
