@@ -50,18 +50,15 @@ def _spy_close(run_date: str) -> float | None:
 
 
 def _load_signals_from_s3(bucket: str, run_date: str, max_lookback: int = 5) -> tuple[dict, str | None]:
-    """Load signals.json from S3, falling back to prior trading days.
+    """Load signals.json from S3, falling back to prior days.
 
-    Research only runs on Mondays, so on Tue–Fri the exact run_date won't
-    have a signals file.  Walk back up to *max_lookback* calendar days
-    (skipping weekends) before giving up.
+    Research runs on Saturday and writes signals with the Saturday date,
+    so the lookback must include weekends.
     """
     s3 = boto3.client("s3")
     start = date.fromisoformat(run_date)
     for days_back in range(max_lookback + 1):
         candidate = start - timedelta(days=days_back)
-        if candidate.weekday() >= 5:  # skip Sat/Sun
-            continue
         dt = str(candidate)
         try:
             obj = s3.get_object(Bucket=bucket, Key=f"signals/{dt}/signals.json")
@@ -307,13 +304,19 @@ def run(run_date: str | None = None) -> None:
         if spy_prior_row and spy_prior_row[0]:
             spy_return = (spy_price / spy_prior_row[0] - 1) * 100
         else:
-            # Fallback: yfinance 2d download
-            try:
-                hist = yf.download("SPY", period="2d", progress=False, auto_adjust=True)
-                if len(hist) >= 2:
-                    spy_return = float((hist["Close"].values.flat[-1] / hist["Close"].values.flat[-2] - 1) * 100)
-            except Exception as e:
-                logger.warning(f"SPY return calc failed: {e}")
+            # Fallback: fetch SPY close for the actual prior eod_pnl date
+            # (avoids period="2d" which only gets 1 day regardless of gaps)
+            prior_date_row = conn.execute(
+                "SELECT date FROM eod_pnl ORDER BY date DESC LIMIT 1"
+            ).fetchone()
+            if prior_date_row:
+                prior_spy = _spy_close(prior_date_row[0])
+                if prior_spy:
+                    spy_return = (spy_price / prior_spy - 1) * 100
+                else:
+                    logger.warning("Could not fetch SPY close for prior date %s", prior_date_row[0])
+            else:
+                logger.warning("No prior eod_pnl row — cannot compute SPY return")
 
     alpha = (daily_return - spy_return) if (daily_return is not None and spy_return is not None) else None
 
