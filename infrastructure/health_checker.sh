@@ -29,10 +29,12 @@ BUCKET="alpha-engine-research"
 # eod_reconcile: runs daily ~1:20 PM PT (20:20 UTC), stale after 20h
 # research: runs weekly Monday, stale after 8 days (192h)
 # predictor_training: runs weekly Monday, stale after 8 days (192h)
+# price_fetcher: runs daily ~4:35 PM ET, stale after 20h
 declare -A MAX_HOURS=(
     [executor]=4
     [predictor_inference]=4
     [eod_reconcile]=20
+    [price_fetcher]=20
     [research]=192
     [predictor_training]=192
 )
