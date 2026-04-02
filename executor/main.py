@@ -117,8 +117,12 @@ def _load_executor_params_from_s3(bucket: str) -> dict | None:
         s3 = boto3.client("s3")
         obj = s3.get_object(Bucket=bucket, Key="config/executor_params.json")
         data = json.loads(obj["Body"].read())
-        # Only keep safe-to-override params
+        # Only keep safe-to-override params (numeric) + special non-numeric params
         safe = {k: v for k, v in data.items() if k in _PARAM_MAP}
+        # Phase 4 non-numeric params: disabled_triggers (list), p_up sizing (bool)
+        for special_key in ("disabled_triggers", "use_p_up_sizing", "p_up_sizing_blend"):
+            if special_key in data:
+                safe[special_key] = data[special_key]
         if safe:
             logger.info("Loaded executor params from S3: %s", safe)
             _executor_params_cache = safe
@@ -151,6 +155,19 @@ def _load_executor_params_from_s3(bucket: str) -> dict | None:
 def _merge_s3_params(config: dict, s3_params: dict) -> dict[str, Any]:
     """Merge flat S3 param names into nested config structure with validation."""
     for param, value in s3_params.items():
+        # Phase 4 non-numeric params: merge directly into top-level config
+        if param == "disabled_triggers" and isinstance(value, list):
+            config.setdefault("intraday", {}).setdefault("entry_triggers", {})["disabled_triggers"] = value
+            logger.info("S3 disabled_triggers: %s", value)
+            continue
+        if param == "use_p_up_sizing" and isinstance(value, bool):
+            config["use_p_up_sizing"] = value
+            logger.info("S3 use_p_up_sizing: %s", value)
+            continue
+        if param == "p_up_sizing_blend" and isinstance(value, (int, float)):
+            config["p_up_sizing_blend"] = float(value)
+            continue
+
         path = _PARAM_MAP.get(param)
         if not path:
             continue
@@ -380,6 +397,7 @@ def _plan_entries(
             drawdown_multiplier=dd_multiplier,
             atr_pct=atr_pct,
             prediction_confidence=pred_confidence,
+            p_up=pred_data.get("p_up"),
             signal_age_days=signal_age_days,
             days_to_earnings=earnings_by_ticker.get(ticker),
         )

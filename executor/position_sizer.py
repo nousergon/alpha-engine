@@ -35,6 +35,7 @@ def compute_position_size(
     drawdown_multiplier: float = 1.0,
     atr_pct: float | None = None,
     prediction_confidence: float | None = None,
+    p_up: float | None = None,
     signal_age_days: int | None = None,
     days_to_earnings: int | None = None,
 ) -> dict:
@@ -83,6 +84,12 @@ def compute_position_size(
         confidence_adj = conf_min + conf_range * prediction_confidence
     else:
         confidence_adj = 1.0
+
+    # p_up-weighted sizing (Phase 4d): blend p_up into confidence if IC is positive
+    if config.get("use_p_up_sizing") and p_up is not None:
+        blend = config.get("p_up_sizing_blend", 0.3)
+        p_up_adj = 0.7 + 0.6 * p_up  # map p_up [0,1] → [0.7, 1.3]
+        confidence_adj = confidence_adj * (1 - blend) + p_up_adj * blend
 
     # Signal staleness discount (Task 2.3)
     if config.get("staleness_discount_enabled", True) and signal_age_days is not None and signal_age_days > 0:
