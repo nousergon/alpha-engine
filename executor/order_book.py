@@ -74,6 +74,22 @@ class OrderBook:
             finally:
                 fcntl.flock(lock_f, fcntl.LOCK_UN)
 
+    def backup_to_s3(self, bucket: str, run_date: str) -> None:
+        """Backup full order book to S3 for audit trail and debugging."""
+        try:
+            import boto3
+            s3 = boto3.client("s3")
+            key = f"trades/order_book/{run_date}.json"
+            s3.put_object(
+                Bucket=bucket,
+                Key=key,
+                Body=json.dumps(self._data, indent=2, default=str),
+                ContentType="application/json",
+            )
+            logger.info("Order book backed up to s3://%s/%s", bucket, key)
+        except Exception as e:
+            logger.warning("Order book S3 backup failed (non-fatal): %s", e)
+
     # ── Queries ──────────────────────────────────────────────────────────────
 
     @property

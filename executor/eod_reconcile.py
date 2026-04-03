@@ -378,6 +378,18 @@ def run(run_date: str | None = None) -> None:
 
     backup_to_s3(db_path, run_date, trades_bucket)
 
+    # Backup daemon and executor logs to S3 (before EC2 shuts down at 1:30 PM)
+    for log_file, s3_key in [
+        ("/var/log/daemon.log", f"trades/logs/{run_date}/daemon.log"),
+        ("/var/log/executor.log", f"trades/logs/{run_date}/executor.log"),
+    ]:
+        try:
+            if os.path.exists(log_file):
+                s3.upload_file(log_file, trades_bucket, s3_key)
+                logger.info("Log backed up to s3://%s/%s", trades_bucket, s3_key)
+        except Exception as e:
+            logger.debug("Log backup failed for %s: %s", log_file, e)
+
     # Build position rationale narratives
     signals_bucket = config.get("signals_bucket", "alpha-engine-research")
     position_narratives = {}

@@ -793,6 +793,10 @@ def _write_stops_and_finalize(
 
     ob.save()
 
+    # Backup full order book to S3 for audit trail
+    if signals_bucket:
+        ob.backup_to_s3(signals_bucket, run_date)
+
     # Write public-safe summary for dashboard
     if signals_bucket:
         _write_order_book_summary(ob, blocked_entries, signals_bucket, run_date)
