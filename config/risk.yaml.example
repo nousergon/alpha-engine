@@ -3,6 +3,9 @@
 # config/risk.yaml is gitignored and should never be committed.
 # These are intentionally conservative defaults — tune to your own portfolio.
 
+# ── Short-sale prevention ────────────────────────────────────────────────────
+allow_shorts: false              # true = allow sells that create short positions (use with caution)
+
 # ── Position limits ──────────────────────────────────────────────────────────
 max_position_pct: 0.05           # 5% NAV per position (hard cap)
 max_sector_pct: 0.25             # 25% NAV per sector

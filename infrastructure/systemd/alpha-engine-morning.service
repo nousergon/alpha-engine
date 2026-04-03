@@ -11,6 +11,7 @@ EnvironmentFile=/home/ec2-user/.alpha-engine.env
 # Give IB Gateway 30s to authenticate via TOTP and become ready
 ExecStartPre=/home/ec2-user/alpha-engine/infrastructure/wait-for-ibgateway.sh
 ExecStart=/home/ec2-user/alpha-engine/.venv/bin/python executor/main.py
+ExecStartPost=/bin/bash /home/ec2-user/alpha-engine/infrastructure/emit-heartbeat.sh executor-morning
 StandardOutput=append:/var/log/executor.log
 StandardError=append:/var/log/executor.log
 Environment=PYTHONPATH=/home/ec2-user/alpha-engine

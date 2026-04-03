@@ -10,6 +10,7 @@ WorkingDirectory=/home/ec2-user/alpha-engine
 EnvironmentFile=/home/ec2-user/.alpha-engine.env
 ExecStartPre=/home/ec2-user/alpha-engine/infrastructure/wait-for-ibgateway.sh
 ExecStart=/home/ec2-user/alpha-engine/.venv/bin/python -m executor.daemon
+ExecStartPost=/bin/bash /home/ec2-user/alpha-engine/infrastructure/emit-heartbeat.sh executor-daemon-start
 Restart=on-failure
 RestartSec=30
 StandardOutput=append:/var/log/daemon.log

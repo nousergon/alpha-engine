@@ -150,6 +150,9 @@ def _reconnect(
                 raise
 
 
+_allow_shorts: bool = False  # Set from config in run_daemon(); default: never short
+
+
 def _validate_sell_shares(
     positions: dict,
     ticker: str,
@@ -161,7 +164,13 @@ def _validate_sell_shares(
 
     Returns adjusted share count, or None if the sell should be skipped
     (no position held — selling would go short).
+
+    When ``_allow_shorts`` is True (set via ``allow_shorts: true`` in
+    risk.yaml), the guard is bypassed and sells are allowed to create
+    short positions.
     """
+    if _allow_shorts:
+        return shares
     held = int(positions.get(ticker, {}).get("shares", 0))
     if held <= 0:
         logger.warning(
@@ -220,6 +229,11 @@ def run_daemon(dry_run: bool = False) -> None:
 
     config = load_config()
     strategy_config = load_strategy_config(config)
+
+    global _allow_shorts
+    _allow_shorts = config.get("allow_shorts", False)
+    if _allow_shorts:
+        logger.warning("allow_shorts=true — short-sell prevention is DISABLED")
 
     if not strategy_config.get("intraday_enabled", False):
         logger.info("Intraday daemon is disabled in config — exiting")
