@@ -703,7 +703,7 @@ def _write_order_book_summary(
             {"ticker": e["ticker"]} for e in ob.pending_entries()
         ],
         "entries_blocked": [
-            {"ticker": b["ticker"], "reason": b["reason"]}
+            {"ticker": b["ticker"], "reason": b.get("block_reason", b.get("reason", "unknown"))}
             for b in (blocked_entries or [])
         ],
         "exits": [
@@ -810,7 +810,7 @@ def _write_stops_and_finalize(
     if blocked_entries:
         blocked_lines = f"\nBlocked ({len(blocked_entries)}):\n"
         for b in blocked_entries:
-            blocked_lines += f"  {b['ticker']}: {b['reason']}\n"
+            blocked_lines += f"  {b['ticker']}: {b.get('block_reason', b.get('reason', 'unknown'))}\n"
 
     try:
         from executor.notifier import send_daemon_status
@@ -1189,7 +1189,7 @@ def run(
                         "entries_planned": n_entered,
                         "entries_blocked": n_blocked,
                         "blocked_reasons": [
-                            {"ticker": b.get("ticker"), "reason": b.get("reason")}
+                            {"ticker": b.get("ticker"), "reason": b.get("block_reason", b.get("reason"))}
                             for b in blocked_entries[:20]
                         ] if 'blocked_entries' in dir() else [],
                         "exits_planned": n_exit,
