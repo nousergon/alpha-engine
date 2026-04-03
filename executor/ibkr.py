@@ -260,6 +260,18 @@ class IBKRClient:
             return float(row[0])
         return self.get_portfolio_nav()
 
+    def cancel_all_orders(self):
+        """Cancel all open orders for this account."""
+        self.ensure_connected()
+        self.ib.reqGlobalCancel()
+        self.ib.sleep(2)  # Allow cancellations to propagate
+        logger.info("Global cancel sent — all open orders cancelled")
+
+    def get_open_orders(self) -> list:
+        """Return list of open orders."""
+        self.ensure_connected()
+        return self.ib.openOrders()
+
     def disconnect(self):
         self.ib.disconnect()
         logger.info("Disconnected from IB Gateway")

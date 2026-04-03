@@ -26,10 +26,8 @@ from executor.trade_logger import (
     init_db, log_eod, backup_to_s3, get_entry_trade, get_todays_trades,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+from executor.log_config import setup_logging
+setup_logging("eod")
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "risk.yaml")
@@ -429,6 +427,53 @@ def run(run_date: str | None = None) -> None:
             logger.info("Roundtrip stats: %s", roundtrip_stats)
     except Exception as e:
         logger.warning("Roundtrip stats query failed: %s", e)
+
+    # ── Execution quality monitoring ──────────────────────────────────────
+    execution_quality = None
+    try:
+        eq_rows = conn.execute("""
+            SELECT trigger_type, slippage_vs_signal, execution_latency_ms,
+                   signal_price, fill_price
+            FROM trades
+            WHERE date = ? AND fill_price IS NOT NULL AND action = 'ENTER'
+        """, (run_date,)).fetchall()
+        if eq_rows:
+            slippage_by_trigger: dict[str, list[float]] = {}
+            all_slippage = []
+            all_latency = []
+            for row in eq_rows:
+                trigger = row[0] or "unknown"
+                slip = row[1]
+                latency = row[2]
+                if slip is not None:
+                    slippage_by_trigger.setdefault(trigger, []).append(slip)
+                    all_slippage.append(slip)
+                if latency is not None:
+                    all_latency.append(latency)
+            execution_quality = {
+                "date": run_date,
+                "n_entries": len(eq_rows),
+                "avg_slippage_pct": round(sum(all_slippage) / len(all_slippage), 4) if all_slippage else None,
+                "avg_latency_ms": round(sum(all_latency) / len(all_latency), 0) if all_latency else None,
+                "slippage_by_trigger": {
+                    t: {"avg": round(sum(v) / len(v), 4), "n": len(v)}
+                    for t, v in slippage_by_trigger.items()
+                },
+            }
+            logger.info("Execution quality: %s", execution_quality)
+            # Write to S3
+            try:
+                s3 = boto3.client("s3")
+                s3.put_object(
+                    Bucket=trades_bucket,
+                    Key=f"trades/execution_quality/{run_date}.json",
+                    Body=json.dumps(execution_quality, indent=2).encode(),
+                    ContentType="application/json",
+                )
+            except Exception as _eq_s3:
+                logger.warning("Execution quality S3 write failed: %s", _eq_s3)
+    except Exception as e:
+        logger.warning("Execution quality query failed: %s", e)
 
     try:
         send_eod_email(

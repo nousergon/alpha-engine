@@ -108,6 +108,9 @@ CREATE TABLE IF NOT EXISTS eod_pnl (
 def init_db(db_path: str) -> sqlite3.Connection:
     """Create tables if they don't exist and run any pending migrations. Returns open connection."""
     conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(CREATE_TRADES_TABLE + CREATE_EOD_TABLE + CREATE_SHADOW_BOOK_TABLE)
     for migration in _TRADES_MIGRATIONS:
         try:

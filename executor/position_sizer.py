@@ -79,6 +79,7 @@ def compute_position_size(
 
     # Confidence-weighted sizing (Task 2.2)
     if config.get("confidence_sizing_enabled", True) and prediction_confidence is not None:
+        prediction_confidence = max(0.0, min(1.0, prediction_confidence))
         conf_min = config.get("confidence_sizing_min", 0.7)
         conf_range = config.get("confidence_sizing_range", 0.6)
         confidence_adj = conf_min + conf_range * prediction_confidence
@@ -87,6 +88,7 @@ def compute_position_size(
 
     # p_up-weighted sizing (Phase 4d): blend p_up into confidence if IC is positive
     if config.get("use_p_up_sizing") and p_up is not None:
+        p_up = max(0.0, min(1.0, p_up))
         blend = config.get("p_up_sizing_blend", 0.3)
         p_up_adj = 0.7 + 0.6 * p_up  # map p_up [0,1] → [0.7, 1.3]
         confidence_adj = confidence_adj * (1 - blend) + p_up_adj * blend

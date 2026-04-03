@@ -43,10 +43,8 @@ from executor.strategies.exit_manager import evaluate_exits, SECTOR_ETF_MAP
 from executor.price_cache import load_price_histories
 from executor.trade_logger import backup_to_s3, get_entry_dates, init_db, log_trade, log_shadow_book_block
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+from executor.log_config import setup_logging
+setup_logging("main")
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "risk.yaml")

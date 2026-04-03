@@ -66,6 +66,84 @@ def read_predictions(s3_bucket: str) -> dict[str, dict]:
         return {}
 
 
+# ── Prediction quality validation ─────────────────────────────────────────────
+
+def _validate_predictions(predictions: dict[str, dict]) -> dict:
+    """
+    Check for degenerate prediction patterns that indicate model failure.
+
+    Returns: {"valid": bool, "reasons": [str], "clamped": int}
+    """
+    if not predictions:
+        return {"valid": True, "reasons": [], "clamped": 0}
+
+    reasons = []
+    clamped = 0
+    n = len(predictions)
+
+    # 1. Direction clustering: >80% same direction → degenerate
+    direction_counts: dict[str, int] = {}
+    for pred in predictions.values():
+        d = pred.get("predicted_direction", "FLAT")
+        direction_counts[d] = direction_counts.get(d, 0) + 1
+    max_direction_count = max(direction_counts.values()) if direction_counts else 0
+    if n >= 5 and max_direction_count / n > 0.80:
+        dominant = max(direction_counts, key=direction_counts.get)
+        reasons.append(
+            f"Direction clustering: {max_direction_count}/{n} ({max_direction_count/n:.0%}) predict {dominant}"
+        )
+
+    # 2. Confidence clustering: stdev < 0.01 → degenerate
+    confidences = [
+        pred.get("prediction_confidence", 0.0)
+        for pred in predictions.values()
+        if pred.get("prediction_confidence") is not None
+    ]
+    if len(confidences) >= 5:
+        mean_conf = sum(confidences) / len(confidences)
+        variance = sum((c - mean_conf) ** 2 for c in confidences) / len(confidences)
+        stdev = variance ** 0.5
+        if stdev < 0.01:
+            reasons.append(
+                f"Confidence clustering: stdev={stdev:.4f} (all ~{mean_conf:.3f})"
+            )
+
+    # 3. Per-ticker sanity + bounds clamping
+    prob_warnings = 0
+    for ticker, pred in predictions.items():
+        p_up = pred.get("p_up")
+        p_down = pred.get("p_down")
+        p_flat = pred.get("p_flat")
+        conf = pred.get("prediction_confidence")
+
+        # Probability sum check
+        if p_up is not None and p_down is not None and p_flat is not None:
+            prob_sum = p_up + p_down + p_flat
+            if abs(prob_sum - 1.0) > 0.1:
+                prob_warnings += 1
+
+        # Bounds clamping
+        for key in ("p_up", "p_down", "p_flat", "prediction_confidence"):
+            val = pred.get(key)
+            if val is not None and not (0.0 <= val <= 1.0):
+                pred[key] = max(0.0, min(1.0, val))
+                clamped += 1
+
+    if prob_warnings > n * 0.2:
+        reasons.append(f"Probability sum: {prob_warnings}/{n} tickers have |sum - 1.0| > 0.1")
+
+    valid = len(reasons) == 0
+    if not valid:
+        logger.warning(
+            "Prediction quality circuit breaker triggered — falling back to research-only | %s",
+            "; ".join(reasons),
+        )
+    if clamped > 0:
+        logger.warning("Clamped %d out-of-bounds prediction values to [0, 1]", clamped)
+
+    return {"valid": valid, "reasons": reasons, "clamped": clamped}
+
+
 # ── Signal generation ─────────────────────────────────────────────────────────
 
 def generate_trading_signals(
@@ -104,6 +182,11 @@ def generate_trading_signals(
             "buy_candidates": [signal_dict, ...]
         }
     """
+    # Circuit breaker: validate prediction quality before use
+    validation = _validate_predictions(predictions)
+    if not validation["valid"]:
+        predictions = {}
+
     trading_cfg = config.get("trading", {})
     min_technical_score = trading_cfg.get("min_technical_score", 60)
     gbm_veto_confidence = trading_cfg.get("gbm_veto_confidence", 0.65)
@@ -230,6 +313,11 @@ def _compute_gbm_adjustment(
 
     if p_up is None or p_down is None:
         return 0.0
+
+    # Defense-in-depth: clamp to valid range
+    p_up = max(0.0, min(1.0, p_up))
+    p_down = max(0.0, min(1.0, p_down))
+    confidence = max(0.0, min(1.0, confidence))
 
     # (p_up - p_down) in [-1, +1]; scale to max ±max_enrichment pts
     direction_signal = (p_up - p_down) * max_enrichment * confidence

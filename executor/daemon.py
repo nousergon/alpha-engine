@@ -47,10 +47,8 @@ from executor.price_monitor import PriceMonitor
 from executor.strategies.config import load_strategy_config
 from executor.trade_logger import init_db, log_trade, get_unmatched_entry
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [daemon] %(message)s",
-)
+from executor.log_config import setup_logging
+setup_logging("daemon")
 logger = logging.getLogger(__name__)
 
 # Terminology:
@@ -79,6 +77,7 @@ except ImportError:
     asyncio_exceptions = ()
 
 _shutdown_requested = False
+_midday_backup_done = False
 
 
 def _handle_signal(signum, frame):
@@ -554,6 +553,18 @@ def run_daemon(dry_run: bool = False) -> None:
                     f"Trades today: {trades_executed}"
                 )
                 _last_heartbeat = _time.time()
+
+            # ── Mid-day backup (noon ET) ─────────────────────────────
+            global _midday_backup_done
+            _now_bk = datetime.now(_ET)
+            if not _midday_backup_done and _now_bk.hour == 12 and _now_bk.minute < 5:
+                try:
+                    from executor.trade_logger import backup_to_s3 as _midday_bk
+                    _midday_bk(db_path, _now_bk.strftime("%Y-%m-%d"), config["signals_bucket"])
+                    logger.info("Mid-day trades.db backup completed")
+                    _midday_backup_done = True
+                except Exception as _bk_err:
+                    logger.warning("Mid-day backup failed: %s", _bk_err)
 
             # ── Check exits ──────────────────────────────────────────
             for stop in order_book.active_stops():
