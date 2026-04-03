@@ -364,10 +364,12 @@ def run(run_date: str | None = None) -> None:
     # Export full history CSVs for dashboard consumption
     trades_df = pd.read_sql("SELECT * FROM trades ORDER BY date, created_at", conn)
     eod_df = pd.read_sql("SELECT * FROM eod_pnl ORDER BY date", conn)
+    shadow_df = pd.read_sql("SELECT * FROM executor_shadow_book ORDER BY date, created_at", conn)
     s3 = boto3.client("s3")
     for df, key in [
         (trades_df, "trades/trades_full.csv"),
         (eod_df, "trades/eod_pnl.csv"),
+        (shadow_df, "trades/shadow_book.csv"),
     ]:
         try:
             buf = df.to_csv(index=False).encode()
