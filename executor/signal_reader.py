@@ -35,14 +35,31 @@ def read_signals(s3_bucket: str, run_date: str | None = None) -> dict:
 
 def read_signals_with_fallback(s3_bucket: str, run_date: str | None = None, max_lookback: int = 5) -> dict:
     """
-    Try to read signals for run_date, falling back to previous days if not found.
+    Read the latest signals from S3.
 
-    Research runs on Saturday and writes signals with the Saturday date,
-    so the lookback must include weekends.
-    Tries up to max_lookback calendar days back before giving up.
+    Tries signals/latest.json first (written by Research alongside the dated file).
+    Falls back to date-scanning if the pointer doesn't exist.
 
-    Returns the signals dict. Raises RuntimeError if nothing found within the lookback window.
+    Returns the signals dict. Raises RuntimeError if nothing found.
     """
+    s3 = boto3.client("s3")
+
+    # Try the latest.json pointer first
+    try:
+        obj = s3.get_object(Bucket=s3_bucket, Key="signals/latest.json")
+        data = json.loads(obj["Body"].read())
+        logger.info(
+            f"Signals loaded from signals/latest.json | date={data.get('date')} "
+            f"| universe={len(data.get('universe', []))}"
+        )
+        return data
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "NoSuchKey":
+            logger.info("signals/latest.json not found — falling back to date scan")
+        else:
+            raise
+
+    # Fallback: scan backward by date
     start = date.fromisoformat(run_date) if run_date else date.today()
     tried: list[str] = []
 
