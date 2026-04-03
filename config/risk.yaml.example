@@ -19,7 +19,7 @@ bear_block_underweight: true     # no new entries in UW sectors in bear
 drawdown_circuit_breaker: 0.06   # halt new entries if portfolio drawdown exceeds this
 
 # ── Entry gates ──────────────────────────────────────────────────────────────
-min_score_to_enter: 70           # score threshold for new positions
+min_score_to_enter: 45           # TODO: remove once predictor veto is validated (was 70)
 min_conviction_to_enter:         # only these conviction levels allow new entries
   - rising
   - stable
@@ -86,7 +86,7 @@ signal_source: "research"
 
 # Trading signal generation (used when signal_source: "population")
 trading:
-  min_technical_score: 65        # minimum technical score to consider ENTER
+  min_technical_score: 40        # TODO: remove once predictor veto is validated (was 65)
   gbm_veto_confidence: 0.60     # GBM DOWN + this confidence → HOLD override
   gbm_enrichment_max: 8.0       # max ±pts GBM can shift technical score
   exit_score_threshold: 35       # below this technical score → EXIT
