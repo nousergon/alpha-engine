@@ -530,8 +530,16 @@ def run_daemon(dry_run: bool = False) -> None:
                 break
 
             try:
-                # Let ib_insync process events and update tickers
-                ibkr.ib.sleep(poll_interval)
+                # Let ib_insync process events in short bursts so SIGTERM
+                # is checked promptly (avoids 60s blocking sleep that caused
+                # SIGKILL and dirty IB disconnects / competing sessions).
+                _poll_remaining = poll_interval
+                while _poll_remaining > 0 and not _shutdown_requested:
+                    _chunk = min(_poll_remaining, 5)
+                    ibkr.ib.sleep(_chunk)
+                    _poll_remaining -= _chunk
+                if _shutdown_requested:
+                    break
             except (ConnectionError, OSError, asyncio_exceptions) as e:
                 logger.warning("IB Gateway connection lost during poll: %s — reconnecting", e)
                 ibkr, monitor = _reconnect(ibkr, monitor, order_book, config, client_id)
