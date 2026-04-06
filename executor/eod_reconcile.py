@@ -237,6 +237,17 @@ def run(run_date: str | None = None) -> None:
     db_path = config["db_path"]
     trades_bucket = config["trades_bucket"]
 
+    # Flow Doctor: structured error capture (optional, never blocks)
+    fd = None
+    try:
+        import flow_doctor
+        fd = flow_doctor.init(config_path=os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), "flow-doctor.yaml"))
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.warning("flow-doctor init failed: %s", e)
+
     if not config.get("email_sender") or not config.get("email_recipients"):
         logger.warning(
             "Email not configured (email_sender/email_recipients missing from risk.yaml) "
@@ -266,6 +277,10 @@ def run(run_date: str | None = None) -> None:
                     "EOD: IB Gateway connection failed after %d attempts: %s",
                     max_eod_attempts, e,
                 )
+                if fd:
+                    fd.report(e, severity="critical", context={
+                        "site": "eod_ibkr_connect", "run_date": run_date,
+                        "attempts": max_eod_attempts})
                 raise
             wait = 30 * attempt
             logger.warning(
@@ -497,6 +512,9 @@ def run(run_date: str | None = None) -> None:
         )
     except Exception as e:
         logger.error(f"EOD email failed: {e}")
+        if fd:
+            fd.report(e, severity="error", context={
+                "site": "eod_email", "run_date": run_date})
 
     # Write health status
     try:
@@ -540,6 +558,8 @@ def run(run_date: str | None = None) -> None:
     except Exception as _me:
         logger.warning("Data manifest write failed: %s", _me)
 
+    if fd:
+        fd.log_summary(logger)
     conn.close()
     logger.info("EOD reconciliation complete")
 
