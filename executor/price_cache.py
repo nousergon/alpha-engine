@@ -28,17 +28,67 @@ from executor.market_hours import is_trading_day
 logger = logging.getLogger(__name__)
 
 
+def _load_histories_from_arcticdb(
+    tickers: list[str],
+    signals_bucket: str,
+) -> dict[str, list[dict]] | None:
+    """Try to load price histories from ArcticDB universe library."""
+    try:
+        import os
+        import arcticdb as adb
+        region = os.environ.get("AWS_REGION", "us-east-1")
+        uri = f"s3s://s3.{region}.amazonaws.com:{signals_bucket}?path_prefix=arcticdb&aws_auth=true"
+        arctic = adb.Arctic(uri)
+        universe = arctic.get_library("universe")
+
+        histories: dict[str, list[dict]] = {}
+        for ticker in tickers:
+            try:
+                df = universe.read(ticker).data
+                if df.empty:
+                    continue
+                records = []
+                for dt, row in df.iterrows():
+                    records.append({
+                        "date": dt.strftime("%Y-%m-%d"),
+                        "open": float(row["Open"]) if "Open" in row.index else 0.0,
+                        "high": float(row["High"]) if "High" in row.index else 0.0,
+                        "low": float(row["Low"]) if "Low" in row.index else 0.0,
+                        "close": float(row["Close"]) if "Close" in row.index else 0.0,
+                    })
+                histories[ticker] = records
+            except Exception:
+                pass
+
+        if histories:
+            logger.info("[data_source=arcticdb] Price histories loaded for %d/%d tickers", len(histories), len(tickers))
+            return histories
+    except ImportError:
+        logger.debug("arcticdb not installed — using S3 slim cache")
+    except Exception as e:
+        logger.debug("[data_source=arcticdb] ArcticDB load failed: %s", e)
+    return None
+
+
 def load_price_histories(
     tickers: list[str],
     signals_bucket: str,
 ) -> dict[str, list[dict]]:
     """
-    Load OHLCV histories for a list of tickers from predictor slim cache on S3.
+    Load OHLCV histories for a list of tickers.
+
+    Priority: ArcticDB universe → S3 slim cache parquets.
 
     Returns:
         {ticker: [{date, open, high, low, close}, ...]} sorted ascending by date.
         Tickers without cached data are omitted.
     """
+    # Try ArcticDB first
+    arctic_result = _load_histories_from_arcticdb(tickers, signals_bucket)
+    if arctic_result is not None:
+        return arctic_result
+
+    # Legacy: S3 slim cache
     s3 = boto3.client("s3")
     histories: dict[str, list[dict]] = {}
 
@@ -71,7 +121,7 @@ def load_price_histories(
         histories[ticker] = records
         logger.debug(f"Loaded {len(records)} bars for {ticker} from slim cache")
 
-    logger.info(f"Price histories loaded for {len(histories)}/{len(tickers)} tickers from S3 slim cache")
+    logger.info("[data_source=legacy] Price histories loaded for %d/%d tickers from S3 slim cache", len(histories), len(tickers))
     return histories
 
 
