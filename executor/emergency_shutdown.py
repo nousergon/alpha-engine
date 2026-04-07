@@ -31,18 +31,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-CONFIG_PATH = "/home/ec2-user/alpha-engine/config/risk.yaml"
-_LOCAL_CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "risk.yaml")
-
-
-def _load_config() -> dict:
-    for path in (CONFIG_PATH, _LOCAL_CONFIG_PATH):
-        try:
-            with open(path) as f:
-                return yaml.safe_load(f)
-        except FileNotFoundError:
-            continue
-    raise FileNotFoundError(f"risk.yaml not found at {CONFIG_PATH} or {_LOCAL_CONFIG_PATH}")
+from executor.config_loader import CONFIG_PATH, load_config as _load_config
 
 
 def emergency_shutdown(execute: bool, stop_instance: bool) -> None:

@@ -33,7 +33,7 @@ from executor.log_config import setup_logging
 setup_logging("eod")
 logger = logging.getLogger(__name__)
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "risk.yaml")
+from executor.config_loader import CONFIG_PATH
 
 
 def _spy_close(run_date: str) -> float | None:
