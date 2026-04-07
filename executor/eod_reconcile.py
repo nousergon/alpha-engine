@@ -36,8 +36,27 @@ logger = logging.getLogger(__name__)
 from executor.config_loader import CONFIG_PATH
 
 
-def _spy_close(run_date: str) -> float | None:
-    """Fetch SPY closing price for run_date via polygon (yfinance fallback)."""
+def _spy_close(run_date: str, config: dict | None = None) -> float | None:
+    """Fetch SPY closing price for run_date.
+
+    Priority: S3 daily_closes (written by post-market data step) → polygon → yfinance.
+    """
+    # Try S3 daily_closes first (most reliable — written by PostMarketData step)
+    try:
+        import io
+        bucket = (config or {}).get("trades_bucket", "alpha-engine-research")
+        s3 = boto3.client("s3")
+        key = f"predictor/daily_closes/{run_date}.parquet"
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        df = pd.read_parquet(io.BytesIO(obj["Body"].read()))
+        if "SPY" in df.index and "Close" in df.columns:
+            close = float(df.loc["SPY", "Close"])
+            logger.info("SPY close from daily_closes/%s: $%.2f", run_date, close)
+            return close
+    except Exception as e:
+        logger.debug("daily_closes SPY lookup failed: %s", e)
+
+    # Fallback: polygon
     try:
         from polygon_client import polygon_client
         close = polygon_client().get_single_close("SPY", run_date)
@@ -45,7 +64,7 @@ def _spy_close(run_date: str) -> float | None:
             return close
     except Exception as e:
         logger.warning("Polygon SPY fetch failed, trying yfinance: %s", e)
-    # Fallback to yfinance
+    # Fallback: yfinance
     try:
         import yfinance as yf
         end_date = (date.fromisoformat(run_date) + timedelta(days=1)).isoformat()
@@ -318,7 +337,7 @@ def run(run_date: str | None = None) -> None:
         daily_return = ((nav - prior_nav) / prior_nav * 100)
 
     # SPY return for the day
-    spy_price = _spy_close(run_date)
+    spy_price = _spy_close(run_date, config)
     spy_return = None
     if spy_price:
         # Try cached prior SPY close from eod_pnl first
