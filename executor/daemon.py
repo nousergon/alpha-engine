@@ -682,6 +682,36 @@ def run_daemon(dry_run: bool = False) -> None:
         )
         logger.info("Daemon shutdown complete | trades=%d", trades_executed)
 
+        # Trigger EOD pipeline Step Function
+        if not dry_run:
+            _trigger_eod_pipeline(config, run_date)
+
+
+def _trigger_eod_pipeline(config: dict, run_date: str) -> None:
+    """Start the EOD Step Function pipeline after daemon shutdown."""
+    try:
+        import boto3 as _b3_sf
+        sfn = _b3_sf.client("stepfunctions", region_name="us-east-1")
+        state_machine_arn = "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-eod-pipeline"
+        micro_instance_id = "i-09b539c844515d549"
+        trading_instance_id = "i-018eb3307a21329bf"
+        sns_topic_arn = config.get("sns_topic_arn", "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts")
+        import json as _json_sf
+        sfn.start_execution(
+            stateMachineArn=state_machine_arn,
+            name=f"eod-{run_date}-{int(__import__('time').time())}",
+            input=_json_sf.dumps({
+                "ec2_instance_id": [micro_instance_id],
+                "trading_instance_id": [trading_instance_id],
+                "sns_topic_arn": sns_topic_arn,
+                "run_date": run_date,
+                "triggered_by": "daemon_shutdown",
+            }),
+        )
+        logger.info("EOD pipeline triggered: %s", state_machine_arn)
+    except Exception as exc:
+        logger.warning("Failed to trigger EOD pipeline (non-fatal): %s", exc)
+
 
 def _execute_exit(
     ibkr: IBKRClient,
