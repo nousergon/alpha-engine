@@ -402,7 +402,8 @@ def run(run_date: str | None = None) -> None:
     # ── Per-position daily return & alpha contribution ──────────────────────
     # Look up prior day's positions_snapshot to get yesterday's price per ticker
     prior_snapshot_row = conn.execute(
-        "SELECT positions_snapshot FROM eod_pnl WHERE positions_snapshot IS NOT NULL ORDER BY date DESC LIMIT 1"
+        "SELECT positions_snapshot FROM eod_pnl WHERE positions_snapshot IS NOT NULL AND date < ? ORDER BY date DESC LIMIT 1",
+        (run_date,),
     ).fetchone()
     prior_positions = {}
     if prior_snapshot_row and prior_snapshot_row[0]:
