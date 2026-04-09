@@ -16,6 +16,8 @@ import logging
 import os
 from datetime import datetime, timezone
 
+import flow_doctor
+
 
 class JSONFormatter(logging.Formatter):
     """Emit log records as single-line JSON objects."""
@@ -38,27 +40,21 @@ class JSONFormatter(logging.Formatter):
 
 def _attach_flow_doctor(name: str) -> None:
     """Attach flow-doctor handler to root logger (ERROR+ only)."""
-    try:
-        import flow_doctor
-
-        fd = flow_doctor.init(
-            flow_name=f"alpha-engine-executor-{name}",
-            repo="cipher813/alpha-engine",
-            owner="@cipher813",
-            store={"type": "sqlite", "path": "flow_doctor.db"},
-            diagnosis={"enabled": True, "model": "claude-haiku-4-5-20251001"},
-            notify=[{"type": "github", "repo": "cipher813/alpha-engine"}],
-            rate_limits={
-                "max_diagnosed_per_day": 5,
-                "max_issues_per_day": 3,
-                "dedup_cooldown_minutes": 120,
-            },
-        )
-        handler = flow_doctor.FlowDoctorHandler(fd, level=logging.ERROR)
-        logging.getLogger().addHandler(handler)
-    except Exception:
-        # flow-doctor is non-critical — never block executor startup
-        logging.getLogger(__name__).debug("flow-doctor not available, skipping")
+    fd = flow_doctor.init(
+        flow_name=f"alpha-engine-executor-{name}",
+        repo="cipher813/alpha-engine",
+        owner="@cipher813",
+        store={"type": "sqlite", "path": "flow_doctor.db"},
+        diagnosis={"enabled": True, "model": "claude-haiku-4-5-20251001"},
+        notify=[{"type": "github", "repo": "cipher813/alpha-engine"}],
+        rate_limits={
+            "max_diagnosed_per_day": 5,
+            "max_issues_per_day": 3,
+            "dedup_cooldown_minutes": 120,
+        },
+    )
+    handler = flow_doctor.FlowDoctorHandler(fd, level=logging.ERROR)
+    logging.getLogger().addHandler(handler)
 
 
 def setup_logging(name: str = "executor") -> None:
