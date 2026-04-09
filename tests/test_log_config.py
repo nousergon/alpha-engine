@@ -57,9 +57,7 @@ class TestFlowDoctorIntegration:
         mock_handler = MagicMock(spec=logging.Handler)
         mock_handler.level = logging.ERROR
         with patch.dict(os.environ, {"FLOW_DOCTOR_ENABLED": "1"}):
-            with patch.dict("sys.modules", {"flow_doctor": MagicMock()}) as _:
-                import sys
-                mock_module = sys.modules["flow_doctor"]
+            with patch("executor.log_config.flow_doctor") as mock_module:
                 mock_module.init.return_value = mock_fd
                 mock_module.FlowDoctorHandler.return_value = mock_handler
                 setup_logging("main")
@@ -68,23 +66,13 @@ class TestFlowDoctorIntegration:
                 assert call_kwargs["flow_name"] == "alpha-engine-executor-main"
                 assert call_kwargs["repo"] == "cipher813/alpha-engine"
 
-    def test_graceful_when_import_fails(self):
+    def test_init_failure_raises(self):
+        """flow-doctor is a hard dep — init failures should propagate."""
         with patch.dict(os.environ, {"FLOW_DOCTOR_ENABLED": "1"}):
-            with patch("builtins.__import__", side_effect=ImportError("no flow_doctor")):
-                # Should not raise — flow-doctor is non-critical
-                setup_logging("test")
-                root = logging.getLogger()
-                assert len(root.handlers) == 1
-
-    def test_graceful_when_init_fails(self):
-        with patch.dict(os.environ, {"FLOW_DOCTOR_ENABLED": "1"}):
-            with patch.dict("sys.modules", {"flow_doctor": MagicMock()}) as _:
-                import sys
-                mock_module = sys.modules["flow_doctor"]
+            with patch("executor.log_config.flow_doctor") as mock_module:
                 mock_module.init.side_effect = RuntimeError("config error")
-                setup_logging("test")
-                root = logging.getLogger()
-                assert len(root.handlers) == 1  # only StreamHandler, no flow-doctor
+                with pytest.raises(RuntimeError, match="config error"):
+                    setup_logging("test")
 
 
 class TestJSONFormatter:
