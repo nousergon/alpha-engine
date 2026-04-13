@@ -58,7 +58,7 @@ def test_compute_metrics_full_connected_session():
     assert m["connected_minutes"] == 390
     assert m["market_minutes"] == 390
     assert m["uptime_pct"] == 1.0
-    assert m["crashes"] == 0
+    assert m["service_restarts"] == 0
 
 
 def test_compute_metrics_half_session_missing():
@@ -72,7 +72,7 @@ def test_compute_metrics_half_session_missing():
     assert m["uptime_pct"] == round(195 / 390, 4)
     # No crashes recorded because no trailing tick exists to compare against;
     # mid-day silence is captured by the missing minutes, not the crash counter.
-    assert m["crashes"] == 0
+    assert m["service_restarts"] == 0
 
 
 def test_compute_metrics_mid_session_crash():
@@ -85,7 +85,7 @@ def test_compute_metrics_mid_session_crash():
 
     m = ut.compute_metrics(ticks, day)
     assert m["connected_minutes"] == len(before) + len(after)
-    assert m["crashes"] == 1
+    assert m["service_restarts"] == 1
 
 
 def test_compute_metrics_ib_disconnected_drops_connected_not_active():
@@ -108,7 +108,7 @@ def test_compute_metrics_empty_yields_zero():
     assert m["active_minutes"] == 0
     assert m["connected_minutes"] == 0
     assert m["uptime_pct"] == 0.0
-    assert m["crashes"] == 0
+    assert m["service_restarts"] == 0
 
 
 def test_collect_uptime_skips_non_trading_day():

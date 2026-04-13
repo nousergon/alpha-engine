@@ -162,8 +162,11 @@ def compute_backfill_metrics(
             total_seconds += (clipped_end - clipped_start).total_seconds()
 
     active_minutes = int(total_seconds // 60)
-    # Each interval after the first implies a restart/crash between them.
-    crashes = max(0, len(intervals) - 1)
+    # service_restarts: every interval after the first implies a transition
+    # from running → stopped → running between them. Mixes planned restarts
+    # (daily shutdown, maintenance) with unplanned ones (crash-and-recover),
+    # so not a clean "crashes" metric. Retained in JSON for analysis.
+    service_restarts = max(0, len(intervals) - 1)
 
     return {
         "date": day.isoformat(),
@@ -171,7 +174,7 @@ def compute_backfill_metrics(
         "connected_minutes": active_minutes,
         "market_minutes": _MARKET_MINUTES,
         "uptime_pct": round(active_minutes / _MARKET_MINUTES, 4) if _MARKET_MINUTES else 0.0,
-        "crashes": crashes,
+        "service_restarts": service_restarts,
         "tick_cadence_sec": 0,
         "source": "journalctl_intervals",
     }
