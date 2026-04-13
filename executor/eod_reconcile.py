@@ -641,6 +641,21 @@ def run(run_date: str | None = None) -> None:
     except Exception as _me:
         logger.warning("Data manifest write failed: %s", _me)
 
+    # ── Uptime metrics ─────────────────────────────────────────────────────
+    try:
+        from executor import uptime_tracker
+        metrics = uptime_tracker.run(bucket=trades_bucket)
+        logger.info(
+            "Uptime: active=%d/%d connected=%d crashes=%d uptime=%.1f%%",
+            metrics.get("active_minutes", 0),
+            metrics.get("market_minutes", 0),
+            metrics.get("connected_minutes", 0),
+            metrics.get("crashes", 0),
+            metrics.get("uptime_pct", 0) * 100,
+        )
+    except Exception as _ue:
+        logger.warning("Uptime tracker failed: %s", _ue)
+
     if fd:
         fd.log_summary(logger)
     conn.close()
