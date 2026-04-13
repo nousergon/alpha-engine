@@ -11,7 +11,7 @@ Writes uptime/{date}.json to S3:
       "connected_minutes": 295,     # daemon running AND IB Gateway connected
       "market_minutes": 390,        # 9:30-16:00 ET = 6.5h
       "uptime_pct": 0.756,          # connected_minutes / market_minutes
-      "crashes": 2,                 # gaps > 2.5x tick cadence during market hours
+      "service_restarts": 2,        # gaps > 2.5x tick cadence during market hours
       "tick_cadence_sec": 60,
       "source": "tick_log"
     }
@@ -101,12 +101,12 @@ def compute_metrics(
             minutes_connected.add(minute)
 
     gap_tol_sec = tick_cadence * _GAP_TOLERANCE_MULT
-    crashes = 0
+    service_restarts = 0
     if window:
         prev_ts = window[0][0]
         for ts, _ in window[1:]:
             if (ts - prev_ts).total_seconds() > gap_tol_sec:
-                crashes += 1
+                service_restarts += 1
             prev_ts = ts
 
     connected_minutes = len(minutes_connected)
@@ -116,7 +116,11 @@ def compute_metrics(
         "connected_minutes": connected_minutes,
         "market_minutes": _MARKET_MINUTES,
         "uptime_pct": round(connected_minutes / _MARKET_MINUTES, 4),
-        "crashes": crashes,
+        # service_restarts: count of daemon start↔stop transitions during
+        # market hours. Mixes planned maintenance restarts with crash-and-
+        # recover cycles; not a clean "crashes" signal. Retained in JSON
+        # for analysis but not surfaced on the homepage.
+        "service_restarts": service_restarts,
         "tick_cadence_sec": tick_cadence,
         "source": source,
     }

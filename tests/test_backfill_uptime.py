@@ -27,7 +27,7 @@ def test_full_session_covered_by_single_interval():
     assert m["connected_minutes"] == 390
     assert m["market_minutes"] == 390
     assert m["uptime_pct"] == 1.0
-    assert m["crashes"] == 0
+    assert m["service_restarts"] == 0
     assert m["source"] == "journalctl_intervals"
 
 
@@ -70,7 +70,7 @@ def test_crash_and_recovery_counts_as_restart():
     ]
     m = bf.compute_backfill_metrics(intervals, day)
     assert m["active_minutes"] == 150 + 210
-    assert m["crashes"] == 1
+    assert m["service_restarts"] == 1
 
 
 def test_empty_intervals_yields_zero():
@@ -78,7 +78,7 @@ def test_empty_intervals_yields_zero():
     assert m["active_minutes"] == 0
     assert m["connected_minutes"] == 0
     assert m["uptime_pct"] == 0.0
-    assert m["crashes"] == 0
+    assert m["service_restarts"] == 0
 
 
 def test_quiet_daemon_still_counts_as_active():
