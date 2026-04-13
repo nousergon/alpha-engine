@@ -383,6 +383,13 @@ def run_daemon(dry_run: bool = False) -> None:
     trades_executed = 0
     executed_tickers: set = set()  # tracks tickers already traded today
 
+    # Track whether we reached the live trading window so the finally block
+    # can decide whether it's safe to fire the EOD pipeline. Pre-market exits
+    # (shutdown signal, early crash, etc.) must NOT trigger EOD — market-close
+    # side-effects like stopping the trading EC2 instance would then run
+    # before the market ever opened. This flag is the single gate.
+    market_opened = False
+
     try:
         # ── Wait for market open (daemon may start before 9:30 AM ET) ────
         if not is_market_hours():
@@ -392,6 +399,11 @@ def run_daemon(dry_run: bool = False) -> None:
             if _shutdown_requested:
                 return
             logger.info("Market is open — proceeding")
+
+        # Guard: Phase 0 urgent exits + live IB order placement must only run
+        # once the market is actually open. Reaching this line means the
+        # wait-for-open loop above exited on is_market_hours() == True.
+        market_opened = True
 
         # ── Phase 0: Execute urgent exits/covers immediately (no trigger delay) ──
         # Fetch current positions once for short-sell prevention checks
@@ -675,9 +687,17 @@ def run_daemon(dry_run: bool = False) -> None:
         )
         logger.info("Daemon shutdown complete | trades=%d", trades_executed)
 
-        # Trigger EOD pipeline Step Function
-        if not dry_run:
+        # Trigger EOD pipeline Step Function — only if the daemon actually
+        # made it into the live trading window. Pre-market exits (shutdown
+        # signal, crash during setup, IB connection failure) must not fire
+        # EOD: it would stop the trading EC2 instance before the market
+        # opens and email a bogus EOD summary. 2026-04-13 regression.
+        if not dry_run and market_opened:
             _trigger_eod_pipeline(config, run_date)
+        elif not dry_run:
+            logger.warning(
+                "Skipping EOD pipeline trigger: daemon exited before market opened"
+            )
 
 
 def _trigger_eod_pipeline(config: dict, run_date: str) -> None:
