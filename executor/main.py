@@ -890,43 +890,70 @@ def run(
     from executor.log_config import get_flow_doctor
     fd = get_flow_doctor() if not simulate else None
 
-    # ── 0. Check upstream health (warn + Telegram alert, never blocks) ───
+    # ── 0. Check upstream health — hard-fail if anything upstream is broken ──
+    # Running on stale signals or a failed predictor produces a degraded
+    # portfolio that contradicts the system's design. Per the "hard-fail until
+    # stable" standard, any unknown/failed/stale upstream must abort executor
+    # BEFORE we read signals or touch the order book. The trading instance
+    # will remain idle for the day and be stopped at 13:30 PT as usual.
+    # Per-module staleness tolerance (hours):
+    #   research           — 192h (runs weekly Sat; grace covers Sat→next Fri)
+    #   predictor_inference — 26h (runs every weekday morning; catches a Mon
+    #                               miss without false-alarming on the weekend)
+    _UPSTREAM_MAX_AGE_H = {"research": 192, "predictor_inference": 26}
+
     if not simulate:
-        _health_warnings = []
+        _health_failures: list[str] = []
         try:
             from executor.health_status import check_upstream_health
+            # Pass the loosest module tolerance as the library default so
+            # check_upstream_health doesn't prematurely mark research stale;
+            # we re-check per-module against _UPSTREAM_MAX_AGE_H below.
             upstream = check_upstream_health(
                 signals_bucket,
-                ["research", "predictor_inference"],
-                max_age_hours=48,
+                list(_UPSTREAM_MAX_AGE_H),
+                max_age_hours=max(_UPSTREAM_MAX_AGE_H.values()),
             )
-            for mod, info in upstream.items():
-                if info["status"] == "unknown":
-                    _health_warnings.append(f"{mod}: no health data found")
-                    logger.warning("Upstream %s: no health data found", mod)
-                elif info["status"] == "failed":
-                    _health_warnings.append(f"{mod}: last run FAILED")
-                    logger.warning("Upstream %s last run FAILED", mod)
-                elif info["stale"]:
-                    max_hrs = 192 if mod == "research" else 48  # 8 days vs 2 days
-                    if info["age_hours"] > max_hrs:
-                        msg = f"{mod}: {info['age_hours']:.0f}h ({info['age_hours']/24:.1f}d) stale"
-                        _health_warnings.append(msg)
-                        logger.warning("Upstream %s", msg)
         except Exception as _ue:
-            logger.debug("Upstream health check failed (non-blocking): %s", _ue)
+            # A health-check read failure is itself a reason to hard-fail —
+            # we don't know the state of upstream, so we refuse to trade.
+            upstream = {}
+            _health_failures.append(f"health-check error: {_ue}")
 
-        if _health_warnings:
+        for mod, max_hrs in _UPSTREAM_MAX_AGE_H.items():
+            info = upstream.get(mod)
+            if info is None:
+                _health_failures.append(f"{mod}: no health data returned")
+                continue
+            if info["status"] == "unknown":
+                _health_failures.append(f"{mod}: no health data found")
+            elif info["status"] == "failed":
+                _health_failures.append(f"{mod}: last run FAILED")
+            elif info["age_hours"] is None or info["age_hours"] < 0:
+                _health_failures.append(f"{mod}: last_success missing")
+            elif info["age_hours"] > max_hrs:
+                _health_failures.append(
+                    f"{mod}: {info['age_hours']:.0f}h ({info['age_hours']/24:.1f}d) stale "
+                    f"(max {max_hrs}h)"
+                )
+
+        if _health_failures:
+            msg = (
+                "Upstream health FAILED — executor aborting:\n"
+                + "\n".join(f"  - {w}" for w in _health_failures)
+            )
+            logger.error(msg)
             try:
                 from executor.notifier import send_daemon_status
                 send_daemon_status(
-                    "\u26a0\ufe0f *Upstream health warning*\n"
+                    "\u274c *Upstream health FAILED*\n"
                     f"Date: {run_date}\n"
-                    + "\n".join(f"- {w}" for w in _health_warnings)
-                    + "\n\nExecutor proceeding — check research/predictor."
+                    + "\n".join(f"- {w}" for w in _health_failures)
+                    + "\n\nExecutor aborted — no order book written."
                 )
             except Exception:
-                logger.debug("Upstream health warning Telegram notification failed", exc_info=True)
+                logger.debug("Upstream failure Telegram notification failed", exc_info=True)
+            raise RuntimeError(msg)
 
     conn = None if simulate else init_db(db_path)
 
