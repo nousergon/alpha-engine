@@ -235,7 +235,14 @@ def run_daemon(dry_run: bool = False) -> None:
     config = load_config()
     strategy_config = load_strategy_config(config)
 
-    # Flow Doctor: retrieve the shared instance owned by log_config
+    # Preflight: AWS_REGION + S3 bucket reachable. The check_ib_paper_account
+    # primitive on the returned preflight instance is reused after IBKRClient
+    # connects below (replaces the inline live-account SAFETY HALT).
+    from executor.preflight import ExecutorPreflight
+    preflight = ExecutorPreflight(bucket=config["signals_bucket"], mode="daemon")
+    preflight.run()
+
+    # Flow Doctor: retrieve the shared instance set up at module import
     from alpha_engine_lib.logging import get_flow_doctor
     fd = get_flow_doctor()
 
@@ -324,19 +331,19 @@ def run_daemon(dry_run: bool = False) -> None:
                     client_id=client_id,
                     reconnect_attempts=config.get("ibkr_reconnect_attempts", 3),
                 )
-                # Paper account safety check
+                # Paper account safety check — delegate the "starts with D"
+                # rule to the shared preflight primitive so every module uses
+                # the same definition of "paper account."
                 try:
                     accounts = client.ib.managedAccounts()
-                    if accounts:
-                        acct = accounts[0]
-                        if not acct.startswith("D"):
-                            logger.critical(
-                                "SAFETY HALT: connected to live account %s — daemon refusing to trade.",
-                                acct,
-                            )
-                            client.disconnect()
-                            raise SystemExit(1)
-                        logger.info("Paper account verified: %s", acct)
+                    acct = accounts[0] if accounts else ""
+                    try:
+                        preflight.check_ib_paper_account(acct)
+                    except RuntimeError as exc:
+                        logger.critical("SAFETY HALT: %s — daemon refusing to trade.", exc)
+                        client.disconnect()
+                        raise SystemExit(1) from exc
+                    logger.info("Paper account verified: %s", acct)
                 except SystemExit:
                     raise
                 except Exception as e:

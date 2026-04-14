@@ -259,7 +259,13 @@ def run(run_date: str | None = None) -> None:
     db_path = config["db_path"]
     trades_bucket = config["trades_bucket"]
 
-    # Flow Doctor: retrieve the shared instance owned by log_config
+    # Preflight: AWS_REGION + S3 bucket reachable. Fail fast before the
+    # retry loop so a misconfigured env surfaces immediately instead of
+    # after 3x IBKR reconnect timeouts.
+    from executor.preflight import ExecutorPreflight
+    ExecutorPreflight(bucket=trades_bucket, mode="eod").run()
+
+    # Flow Doctor: retrieve the shared instance set up at module import
     from alpha_engine_lib.logging import get_flow_doctor
     fd = get_flow_doctor()
 

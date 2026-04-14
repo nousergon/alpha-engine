@@ -865,7 +865,14 @@ def run(
     signals_bucket = config["signals_bucket"]
     trades_bucket = config["trades_bucket"]
 
-    # ── Flow Doctor: retrieve the shared instance owned by log_config ───
+    # Preflight: AWS_REGION + S3 bucket reachable. Skip in simulate mode
+    # (backtester injects orders directly, no real S3 interaction).
+    # Raises RuntimeError on failure → propagates to non-zero exit.
+    if not simulate:
+        from executor.preflight import ExecutorPreflight
+        ExecutorPreflight(bucket=signals_bucket, mode="main").run()
+
+    # ── Flow Doctor: retrieve the shared instance set up at module import ───
     from alpha_engine_lib.logging import get_flow_doctor
     fd = get_flow_doctor() if not simulate else None
 
