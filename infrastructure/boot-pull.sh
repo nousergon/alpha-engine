@@ -15,12 +15,31 @@ log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
 
 log "=== boot-pull started ==="
 
+# ── Configure git auth for private alpha-engine-lib ──────────────────────────
+# requirements.txt in alpha-engine / alpha-engine-backtester pins
+# alpha-engine-lib from a private GitHub repo. pip install needs an HTTPS
+# auth path to clone it. Set the insteadOf rewrite idempotently on every
+# boot so a fresh EBS or a ~/.gitconfig reset doesn't silently break the
+# pip install step below.
+ENV_FILE="/home/ec2-user/.alpha-engine.env"
+if [ -f "$ENV_FILE" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+fi
+if [ -n "${ALPHA_ENGINE_LIB_TOKEN:-}" ]; then
+    git config --global url."https://x-access-token:${ALPHA_ENGINE_LIB_TOKEN}@github.com/cipher813/alpha-engine-lib".insteadOf "https://github.com/cipher813/alpha-engine-lib"
+    log "OK   git insteadOf rewrite configured for alpha-engine-lib"
+else
+    log "FAIL ALPHA_ENGINE_LIB_TOKEN not set in $ENV_FILE — pip install of alpha-engine-lib will fail"
+fi
+
 REPOS=(
     /home/ec2-user/alpha-engine-config
     /home/ec2-user/alpha-engine
     /home/ec2-user/alpha-engine-backtester
     /home/ec2-user/alpha-engine-dashboard
-    /home/ec2-user/flow-doctor
 )
 
 for repo in "${REPOS[@]}"; do
@@ -53,21 +72,17 @@ for repo in "${REPOS[@]}"; do
         log "WARN $repo — fetch/reset failed (network issue?)"
     fi
 
-    # Update pip deps if venv + requirements.txt exist
+    # Update pip deps if venv + requirements.txt exist.
+    # flow-doctor is now pulled in transitively via
+    # alpha-engine-lib[flow_doctor]; the previous bundled editable
+    # install (pip install -e /home/ec2-user/flow-doctor) has been
+    # removed so boot doesn't silently overwrite the lib-provided copy
+    # with a local dev branch.
     if [ -f ".venv/bin/pip" ] && [ -f "requirements.txt" ]; then
         if .venv/bin/pip install --quiet -r requirements.txt >> "$LOG" 2>&1; then
             log "OK   $repo — deps updated"
         else
             log "WARN $repo — pip install failed"
-        fi
-    fi
-
-    # Install flow-doctor from source if this repo has a venv and flow-doctor is cloned
-    if [ -f ".venv/bin/pip" ] && [ -d "/home/ec2-user/flow-doctor" ] && [ "$repo" != "/home/ec2-user/flow-doctor" ]; then
-        if .venv/bin/pip install --quiet -e /home/ec2-user/flow-doctor >> "$LOG" 2>&1; then
-            log "OK   $repo — flow-doctor installed"
-        else
-            log "WARN $repo — flow-doctor install failed (non-fatal)"
         fi
     fi
 done
