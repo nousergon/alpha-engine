@@ -50,8 +50,11 @@ from executor.price_monitor import PriceMonitor
 from executor.strategies.config import load_strategy_config
 from executor.trade_logger import init_db, log_trade, get_unmatched_entry
 
-from executor.log_config import setup_logging
-setup_logging("daemon")
+from alpha_engine_lib.logging import setup_logging
+# See executor/main.py for the rationale on IB Error 10197 suppression.
+_FLOW_DOCTOR_EXCLUDE_PATTERNS = [r"Error 10197"]
+_FLOW_DOCTOR_YAML = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "flow-doctor.yaml")
+setup_logging("daemon", flow_doctor_yaml=_FLOW_DOCTOR_YAML, exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS)
 logger = logging.getLogger(__name__)
 
 # Terminology:
@@ -232,8 +235,15 @@ def run_daemon(dry_run: bool = False) -> None:
     config = load_config()
     strategy_config = load_strategy_config(config)
 
-    # Flow Doctor: retrieve the shared instance owned by log_config
-    from executor.log_config import get_flow_doctor
+    # Preflight: AWS_REGION + S3 bucket reachable. The check_ib_paper_account
+    # primitive on the returned preflight instance is reused after IBKRClient
+    # connects below (replaces the inline live-account SAFETY HALT).
+    from executor.preflight import ExecutorPreflight
+    preflight = ExecutorPreflight(bucket=config["signals_bucket"], mode="daemon")
+    preflight.run()
+
+    # Flow Doctor: retrieve the shared instance set up at module import
+    from alpha_engine_lib.logging import get_flow_doctor
     fd = get_flow_doctor()
 
     global _allow_shorts
@@ -321,19 +331,19 @@ def run_daemon(dry_run: bool = False) -> None:
                     client_id=client_id,
                     reconnect_attempts=config.get("ibkr_reconnect_attempts", 3),
                 )
-                # Paper account safety check
+                # Paper account safety check — delegate the "starts with D"
+                # rule to the shared preflight primitive so every module uses
+                # the same definition of "paper account."
                 try:
                     accounts = client.ib.managedAccounts()
-                    if accounts:
-                        acct = accounts[0]
-                        if not acct.startswith("D"):
-                            logger.critical(
-                                "SAFETY HALT: connected to live account %s — daemon refusing to trade.",
-                                acct,
-                            )
-                            client.disconnect()
-                            raise SystemExit(1)
-                        logger.info("Paper account verified: %s", acct)
+                    acct = accounts[0] if accounts else ""
+                    try:
+                        preflight.check_ib_paper_account(acct)
+                    except RuntimeError as exc:
+                        logger.critical("SAFETY HALT: %s — daemon refusing to trade.", exc)
+                        client.disconnect()
+                        raise SystemExit(1) from exc
+                    logger.info("Paper account verified: %s", acct)
                 except SystemExit:
                     raise
                 except Exception as e:
