@@ -33,6 +33,28 @@ if [ ! -d ".venv" ]; then
     echo "Creating virtualenv..."
     python3.11 -m venv .venv
 fi
+
+# ── 2a. Configure git URL rewrite for private alpha-engine-lib ──────────────
+# requirements.txt pins alpha-engine-lib from a private GitHub repo.
+# pip needs an HTTPS auth path to clone it. ~/.netrc already covers
+# github.com with a PAT, but we set an explicit insteadOf rewrite with
+# ALPHA_ENGINE_LIB_TOKEN (from $ENV_FILE) so:
+#   (a) the PAT scope requirement is explicit (Contents: read on
+#       alpha-engine-lib must be granted — fail here rather than mid-pip),
+#   (b) the netrc PAT and the lib PAT can differ without surprise.
+if [ -f "$ENV_FILE" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+fi
+if [ -z "${ALPHA_ENGINE_LIB_TOKEN:-}" ]; then
+    echo "ERROR: ALPHA_ENGINE_LIB_TOKEN not set in $ENV_FILE — required to pip install private alpha-engine-lib" >&2
+    echo "       Add ALPHA_ENGINE_LIB_TOKEN=<pat> to $ENV_FILE (Contents: read on alpha-engine-lib)" >&2
+    exit 1
+fi
+git config --global url."https://x-access-token:${ALPHA_ENGINE_LIB_TOKEN}@github.com/cipher813/alpha-engine-lib".insteadOf "https://github.com/cipher813/alpha-engine-lib"
+
 echo "Installing dependencies..."
 .venv/bin/pip install --quiet --upgrade pip
 .venv/bin/pip install --quiet -r requirements.txt
