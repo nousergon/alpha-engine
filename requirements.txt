@@ -5,6 +5,13 @@ yfinance~=0.2.54
 numpy<2
 pandas~=2.2
 pyarrow~=14.0
+# arcticdb: reads atr_14_pct from the universe library at morning planner time.
+# Single source of truth for ATR across the executor — pullback trigger scaling,
+# position sizing, and trailing stops all consume the feature-store value so
+# executor and predictor agree on the ATR definition. See executor/price_cache.py
+# load_atr_14_pct. Version range kept loose to avoid pinning pain with the
+# predictor/backtester venvs which share the same S3-backed store.
+arcticdb~=6.12
 anthropic~=0.40
 exchange-calendars~=4.5
 requests~=2.32

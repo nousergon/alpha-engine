@@ -43,7 +43,7 @@ from executor.risk_guard import check_order, compute_drawdown_multiplier
 from executor.signal_reader import get_actionable_signals, read_signals_with_fallback
 from executor.strategies.config import load_strategy_config
 from executor.strategies.exit_manager import evaluate_exits, SECTOR_ETF_MAP
-from executor.price_cache import load_daily_vwap, load_price_histories
+from executor.price_cache import load_atr_14_pct, load_daily_vwap, load_price_histories
 from executor.trade_logger import backup_to_s3, get_entry_dates, init_db, log_trade, log_shadow_book_block
 
 from alpha_engine_lib.logging import setup_logging
@@ -298,6 +298,7 @@ def _plan_entries(
     peak_nav: float,
     current_positions: dict,
     price_histories: dict | None,
+    atr_map: dict,
     dd_multiplier: float,
     signal_age_days: int,
     earnings_by_ticker: dict,
@@ -367,15 +368,12 @@ def _plan_entries(
             blocked.append({**_shadow_base, "block_reason": "no price available"})
             continue
 
-        # Compute ATR % for ATR-based sizing
-        atr_pct = None
-        if config.get("atr_sizing_enabled", True) and price_histories:
-            ticker_history = price_histories.get(ticker, [])
-            if ticker_history:
-                from executor.strategies.exit_manager import _compute_atr
-                atr_val = _compute_atr(ticker_history, period=14)
-                if atr_val and current_price > 0:
-                    atr_pct = atr_val / current_price
+        # Read ATR % from the feature-store map (load_atr_14_pct in main()).
+        # Previously computed inline via _compute_atr(ticker_history); switched
+        # to the feature-store value 2026-04-16 so executor and predictor use
+        # the same ATR definition. atr_map is guaranteed populated for every
+        # enter_signal ticker by load_atr_14_pct's hard-fail contract.
+        atr_pct = atr_map.get(ticker) if config.get("atr_sizing_enabled", True) else None
 
         # Get prediction confidence for confidence-weighted sizing
         pred_confidence = pred_data.get("prediction_confidence")
@@ -482,10 +480,26 @@ def _plan_entries(
                 "thesis_summary": sig.get("thesis_summary"),
             })
         elif not dry_run:
-            # Write approved entry to order book — daemon executes via technical triggers
-            from executor.strategies.exit_manager import _compute_atr
+            # Write approved entry to order book — daemon executes via technical triggers.
+            # ATR sourced from feature-store atr_map (load_atr_14_pct) — single source
+            # of truth across executor. atr_dollar = atr_pct × current_price so the
+            # trailing-stop calculation downstream (bracket_orders.py) keeps its dollar
+            # semantics. Pullback threshold scales by atr_pct so high-vol and low-vol
+            # names each get a trigger calibrated to their own realized volatility.
             ticker_hist = (price_histories or {}).get(ticker, [])
-            atr_dollar = _compute_atr(ticker_hist, period=14) if ticker_hist else None
+            ticker_atr_pct = atr_map.get(ticker)
+            # atr_map is populated for every enter_signal ticker by load_atr_14_pct's
+            # hard-fail contract — if ticker is missing here the morning planner
+            # would have aborted earlier. Treat the key-miss as an internal assertion.
+            if ticker_atr_pct is None:
+                raise RuntimeError(
+                    f"atr_map missing {ticker} at order-book write — load_atr_14_pct "
+                    "contract violated. Abort rather than ship an entry with a bogus "
+                    "zero ATR."
+                )
+            atr_dollar = ticker_atr_pct * current_price
+            pullback_atr_mult = strategy_config.get("intraday_pullback_atr_multiple", 1.0)
+            scaled_pullback_pct = ticker_atr_pct * pullback_atr_mult
 
             pred = predictions_by_ticker.get(ticker, {})
             ob.add_entry({
@@ -495,9 +509,17 @@ def _plan_entries(
                 "current_price": current_price,
                 "dollar_size": sizing["dollar_size"],
                 "position_pct": sizing["position_pct"],
-                "atr_value": atr_dollar or 0,
+                "atr_value": atr_dollar,
+                "atr_pct": ticker_atr_pct,
                 "triggers": {
-                    "pullback_pct": strategy_config.get("intraday_pullback_pct", 0.02),
+                    # Per-ticker ATR-scaled pullback. Formerly a flat 0.02 (2%)
+                    # that was too tight for low-vol names like KO (ATR ~0.8%,
+                    # pullback never fires) and too loose for high-vol like RKLB
+                    # (ATR ~5%, pullback fires on noise). Now each name gets a
+                    # threshold = pullback_atr_multiple × its own ATR(14).
+                    "pullback_pct": scaled_pullback_pct,
+                    "pullback_atr_multiple": pullback_atr_mult,
+                    "atr_pct": ticker_atr_pct,
                     "vwap_discount": strategy_config.get("intraday_vwap_discount_pct", 0.005),
                     "vwap": vwap_map.get(ticker),
                     "support_level": _compute_support_level(ticker_hist, strategy_config),
@@ -731,6 +753,7 @@ def _write_stops_and_finalize(
     ibkr,
     ob: OrderBook,
     price_histories: dict | None,
+    atr_map: dict,
     strategy_config: dict,
     conn,
     run_date: str,
@@ -738,7 +761,11 @@ def _write_stops_and_finalize(
     signals_bucket: str | None = None,
 ) -> None:
     """Write stop records for held positions, detect shorts, save order book, notify."""
-    from executor.strategies.exit_manager import _compute_atr
+    # ATR previously computed inline via _compute_atr(ticker_hist). Since
+    # 2026-04-16 the executor reads atr_14_pct from the feature-store map
+    # (load_atr_14_pct in main()) — same definition the predictor and sizing
+    # path use. atr_dollar derives from entry_price × atr_pct so trailing stops
+    # stay in dollar-denominated semantics (bracket_orders consumes dollars).
 
     # Add stop records for all current positions
     current_pos = ibkr.get_positions()
@@ -750,13 +777,20 @@ def _write_stops_and_finalize(
         urgent_exit_tickers = {u["ticker"] for u in ob.pending_urgent_exits()}
         if t in urgent_exit_tickers:
             continue
-        ticker_hist = (price_histories or {}).get(t, [])
-        atr_val = _compute_atr(ticker_hist, period=14) if ticker_hist else None
         entry_price = pos.get("avg_cost", 0)
         atr_mult = strategy_config.get("intraday_trailing_stop_atr_multiple", 2.0)
-        if not atr_val or atr_val <= 0:
-            logger.warning("No ATR for %s — skipping stop (no price history)", t)
+        ticker_atr_pct = atr_map.get(t)
+        if not ticker_atr_pct or ticker_atr_pct <= 0 or entry_price <= 0:
+            # load_atr_14_pct's hard-fail covers signal tickers + held positions
+            # at the top of main(); if we still hit a missing value here it's
+            # either a position that wasn't in the held-set at ATR load time
+            # (race condition) or entry_price <=0 from IBKR — skip this stop.
+            logger.warning(
+                "No ATR or invalid entry_price for %s — skipping stop (atr_pct=%s, entry_price=%s)",
+                t, ticker_atr_pct, entry_price,
+            )
             continue
+        atr_val = ticker_atr_pct * entry_price
         stop_price = round(entry_price - atr_val * atr_mult, 2)
         ob.add_stop({
             "ticker": t,
@@ -1067,6 +1101,26 @@ def run(
         # Load previous day's VWAP from daily_closes for intraday entry triggers
         vwap_map = load_daily_vwap(signals_bucket, run_date)
 
+        # Single source of truth for ATR across the executor. Replaces per-call-site
+        # _compute_atr(ticker_hist) invocations (position sizing, pullback-trigger
+        # scaling, trailing stops) with the predictor's feature-store atr_14_pct,
+        # so executor and predictor agree on the ATR definition. Hard-fails on
+        # missing ticker or stale data — feedback_hard_fail_until_stable.
+        # Scope: signal tickers (ENTER) + held positions (for trailing stops).
+        #
+        # ETF tickers are intentionally excluded — they're used for sector-relative
+        # exit veto via price_histories, not for ATR-based execution.
+        atr_tickers = [s["ticker"] for s in signals.get("enter", [])]
+        atr_tickers += list(current_positions.keys())
+        atr_tickers = sorted(set(atr_tickers))
+        if atr_tickers:
+            atr_map = load_atr_14_pct(
+                tickers=atr_tickers,
+                signals_bucket=signals_bucket,
+            )
+        else:
+            atr_map = {}
+
         # Separate sector ETF histories for exit manager
         sector_etf_histories = {
             t: price_histories[t] for t in SECTOR_ETF_MAP.values()
@@ -1186,6 +1240,7 @@ def run(
             peak_nav=peak_nav,
             current_positions=current_positions,
             price_histories=price_histories,
+            atr_map=atr_map,
             dd_multiplier=dd_multiplier,
             signal_age_days=signal_age_days,
             earnings_by_ticker=earnings_by_ticker,
@@ -1225,7 +1280,7 @@ def run(
         # ── 6. Write stop records and save order book for daemon ────────────────
         if not simulate and not dry_run:
             try:
-                _write_stops_and_finalize(ibkr, ob, price_histories, strategy_config, conn, run_date, blocked_entries, signals_bucket)
+                _write_stops_and_finalize(ibkr, ob, price_histories, atr_map, strategy_config, conn, run_date, blocked_entries, signals_bucket)
             except Exception as e:
                 logger.warning("Failed to write order book: %s", e)
 
