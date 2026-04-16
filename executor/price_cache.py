@@ -16,9 +16,20 @@ S3 layout:
 
 from __future__ import annotations
 
+# arcticdb MUST be imported before pandas on macOS to prime its bundled
+# aws-c-common allocator before pyarrow (pulled in by pandas) loads its
+# own copy. The two copies otherwise collide and arcticdb's S3Storage
+# constructor segfaults with `aws_fatal_assert: allocator != ((void*)0)`
+# on the first get_library() call. Linux runtimes (Lambda, EC2 Amazon
+# Linux) are unaffected — dynamic linker resolves differently. arcticdb
+# is a hard dep of the executor as of 2026-04-16 via requirements.txt;
+# no fallback path, no optional import — feedback_no_silent_fails.
+import arcticdb as _arcticdb  # noqa: F401  (kept for its side effect on import ordering)
+
 import io
 import logging
-from datetime import date, timedelta
+import os
+from datetime import date, datetime, timedelta, timezone
 
 import boto3
 import pandas as pd
@@ -26,6 +37,13 @@ import pandas as pd
 from executor.market_hours import is_trading_day
 
 logger = logging.getLogger(__name__)
+
+
+# Max staleness (in trading days) of the ATR feature before we hard-fail.
+# 1 = yesterday's close is acceptable; anything older is treated as a
+# pipeline-broken state and aborts the morning planner. Aligns with the
+# predictor's own DailyData dependency expectation.
+_ATR_MAX_STALENESS_TRADING_DAYS = 1
 
 
 def _load_histories_from_arcticdb(
@@ -123,6 +141,146 @@ def load_price_histories(
 
     logger.info("[data_source=legacy] Price histories loaded for %d/%d tickers from S3 slim cache", len(histories), len(tickers))
     return histories
+
+
+def load_atr_14_pct(
+    tickers: list[str],
+    signals_bucket: str,
+    max_staleness_trading_days: int = _ATR_MAX_STALENESS_TRADING_DAYS,
+    reference_date: date | None = None,
+) -> dict[str, float]:
+    """
+    Read the most recent `atr_14_pct` value per ticker from the ArcticDB
+    universe library. Single source of truth for ATR across the executor —
+    pullback trigger scaling, position sizing, and trailing stops all
+    consume from this map to eliminate intra-executor ATR-definition drift
+    (previously each call site computed its own ATR via _compute_atr from
+    raw OHLC, which could subtly diverge from the predictor's feature
+    store definition of atr_14_pct).
+
+    Values are stored in ArcticDB as decimals (e.g. 0.0238 = 2.38%),
+    consistent with how the pullback trigger config's pullback_pct is
+    interpreted, so no unit conversion is needed downstream.
+
+    Hard-fails per feedback_hard_fail_until_stable:
+      - arcticdb import failure (missing dep) → ImportError raised
+      - ArcticDB connection/library access failure → original exception
+        propagated (no silent fallback)
+      - Any requested ticker missing `atr_14_pct` column → RuntimeError
+      - Any requested ticker whose most-recent row is older than
+        `max_staleness_trading_days` → RuntimeError
+      - Any ticker with a non-finite or non-positive atr_14_pct → RuntimeError
+
+    Args:
+        tickers: Tickers to look up. Must all be present in universe library.
+        signals_bucket: S3 bucket hosting the ArcticDB store (same as
+                        research/predictor).
+        max_staleness_trading_days: Reject data older than this many trading
+                                    days from reference_date.
+        reference_date: Date to measure staleness against. Defaults to today
+                        (UTC). Pass an explicit date in tests.
+
+    Returns:
+        {ticker: atr_14_pct} for every requested ticker. Raises if any
+        fails validation.
+    """
+    if not tickers:
+        return {}
+
+    # Use the module-level binding that was imported first at the top of
+    # this file. Hard-fail on missing dep per no-silent-fail — arcticdb is
+    # a required dep in requirements.txt since 2026-04-16.
+    adb = _arcticdb
+
+    region = os.environ.get("AWS_REGION", "us-east-1")
+    uri = (
+        f"s3s://s3.{region}.amazonaws.com:{signals_bucket}"
+        f"?path_prefix=arcticdb&aws_auth=true"
+    )
+    arctic = adb.Arctic(uri)
+    universe = arctic.get_library("universe")
+
+    ref = reference_date or datetime.now(timezone.utc).date()
+    staleness_cutoff = _n_trading_days_back(ref, max_staleness_trading_days)
+
+    atr_map: dict[str, float] = {}
+    missing_feature: list[str] = []
+    missing_symbol: list[str] = []
+    stale: list[tuple[str, str]] = []
+    invalid: list[tuple[str, float]] = []
+
+    for ticker in tickers:
+        try:
+            df = universe.read(ticker).data
+        except Exception as e:
+            missing_symbol.append(f"{ticker} ({e.__class__.__name__})")
+            continue
+
+        if "atr_14_pct" not in df.columns:
+            missing_feature.append(ticker)
+            continue
+
+        if df.empty:
+            missing_symbol.append(f"{ticker} (empty frame)")
+            continue
+
+        last_dt = df.index[-1]
+        last_date = last_dt.date() if hasattr(last_dt, "date") else pd.Timestamp(last_dt).date()
+        if last_date < staleness_cutoff:
+            stale.append((ticker, str(last_date)))
+            continue
+
+        val = float(df["atr_14_pct"].iloc[-1])
+        if not (val == val and val > 0):  # NaN-safe positivity check
+            invalid.append((ticker, val))
+            continue
+
+        atr_map[ticker] = val
+
+    problems = []
+    if missing_symbol:
+        problems.append(f"missing_symbol={missing_symbol}")
+    if missing_feature:
+        problems.append(f"missing_feature={missing_feature}")
+    if stale:
+        problems.append(
+            f"stale (older than {max_staleness_trading_days} trading day"
+            f"{'s' if max_staleness_trading_days != 1 else ''} before "
+            f"{ref}, cutoff={staleness_cutoff})={stale}"
+        )
+    if invalid:
+        problems.append(f"non-finite-or-non-positive={invalid}")
+
+    if problems:
+        raise RuntimeError(
+            "load_atr_14_pct failed validation — executor morning planner cannot "
+            "proceed without a trustworthy ATR for every signal ticker. "
+            f"Requested {len(tickers)} tickers, resolved {len(atr_map)}. "
+            "Problems: " + "; ".join(problems)
+        )
+
+    logger.info(
+        "[data_source=arcticdb] Loaded atr_14_pct for %d/%d tickers (cutoff=%s)",
+        len(atr_map), len(tickers), staleness_cutoff,
+    )
+    return atr_map
+
+
+def _n_trading_days_back(ref: date, n: int) -> date:
+    """Walk back `n` trading days from `ref` (inclusive of today if it's
+    a trading day). Weekend/holiday skipping uses the same calendar the
+    rest of the executor consults."""
+    current = ref
+    remaining = n
+    # Start on a trading day
+    while not is_trading_day(current):
+        current -= timedelta(days=1)
+    while remaining > 0:
+        current -= timedelta(days=1)
+        while not is_trading_day(current):
+            current -= timedelta(days=1)
+        remaining -= 1
+    return current
 
 
 def load_daily_vwap(
