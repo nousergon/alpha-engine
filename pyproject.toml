@@ -17,3 +17,10 @@ dependencies = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["executor*"]
+
+[tool.pytest.ini_options]
+# Scope pytest to tests/ only. Without this, default discovery walks the whole
+# tree and pulls in executor/connection_test.py (a CLI script matching *_test.py)
+# plus any stray nested repo copies, causing sys.path collisions and spurious
+# ImportErrors for modules that exist only in the current tree.
+testpaths = ["tests"]
