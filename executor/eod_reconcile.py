@@ -465,6 +465,55 @@ def run(run_date: str | None = None) -> None:
         pos["alpha_contribution_pct"] = weight * (pos["daily_return_pct"] - pos_spy)
         pos["alpha_contribution_usd"] = pos["alpha_contribution_pct"] / 100 * nav if nav else 0
 
+    # ── NAV change reconciliation ───────────────────────────────────────────
+    # Every dollar of NAV change must be attributable to a source: position
+    # MTM, interest, dividends, or (flagged) unattributed. Anything in the
+    # unattributed bucket indicates a pricing/snapshot mismatch, fee, FX,
+    # corporate action, or similar — surface it loudly instead of burying it
+    # in cash return.
+    nav_reconciliation: dict = {}
+    if prior_nav is not None:
+        total_nav_change = nav - prior_nav
+        total_day_usd = sum(p.get("daily_return_usd", 0) for p in positions.values())
+
+        # Interest: day-over-day delta in IB's AccruedCash
+        prior_accrued_row = conn.execute(
+            "SELECT accrued_interest FROM eod_pnl WHERE accrued_interest IS NOT NULL AND date < ? ORDER BY date DESC LIMIT 1",
+            (run_date,),
+        ).fetchone()
+        today_accrued = account.get("accrued_interest")
+        if today_accrued is not None and prior_accrued_row and prior_accrued_row[0] is not None:
+            interest_usd = float(today_accrued) - float(prior_accrued_row[0])
+        else:
+            interest_usd = 0.0
+
+        # Dividends: filled in by Phase 2 (per-ticker attribution). For now,
+        # any dividend cash flow lands in `unattributed` and is flagged.
+        dividend_usd = sum(p.get("dividend_usd", 0.0) for p in positions.values())
+
+        unattributed_usd = total_nav_change - total_day_usd - interest_usd - dividend_usd
+        nav_reconciliation = {
+            "nav_change_usd": total_nav_change,
+            "position_pnl_usd": total_day_usd,
+            "interest_usd": interest_usd,
+            "dividend_usd": dividend_usd,
+            "unattributed_usd": unattributed_usd,
+        }
+        logger.info(
+            "NAV recon: Δ=$%.0f | positions=$%.0f | interest=$%.0f | "
+            "dividends=$%.0f | unattributed=$%.0f",
+            total_nav_change, total_day_usd, interest_usd,
+            dividend_usd, unattributed_usd,
+        )
+        # Warn if unattributed is material (>0.05% of NAV). Phase 3 tightens this.
+        if nav and abs(unattributed_usd) > max(100.0, 0.0005 * nav):
+            logger.warning(
+                "NAV reconciliation gap: $%.0f unattributed (%.3f%% of NAV). "
+                "Likely causes: stale prior-day prices, untracked corporate action, "
+                "fees, or FX.",
+                unattributed_usd, (unattributed_usd / nav) * 100,
+            )
+
     # ── Sector attribution ──────────────────────────────────────────────────
     # Daily contribution = today's per-position P&L as % of NAV (not cumulative
     # unrealized, which has no relationship to the day's return).
@@ -616,6 +665,7 @@ def run(run_date: str | None = None) -> None:
             roundtrip_stats=roundtrip_stats,
             trades_bucket=trades_bucket,
             account_snapshot=account,
+            nav_reconciliation=nav_reconciliation,
         )
     except Exception as e:
         logger.error(f"EOD email failed: {e}")

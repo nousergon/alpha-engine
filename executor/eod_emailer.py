@@ -93,6 +93,7 @@ def build_eod_email(
     data_warnings: list[str] | None = None,
     roundtrip_stats: dict | None = None,
     account_snapshot: dict | None = None,
+    nav_reconciliation: dict | None = None,
 ) -> tuple[str, str, str]:
     """
     Build the EOD email subject + (html_body, plain_body).
@@ -170,18 +171,28 @@ def build_eod_email(
         total_day_usd = sum(pos.get("daily_return_usd", 0) for pos in positions.values())
         total_alpha_usd = sum(pos.get("alpha_contribution_usd", 0) for pos in positions.values())
 
-        # Cash row: use IB's ground truth cash, fall back to NAV - positions.
-        # Cash daily return = total daily P&L minus sum of position P&L (the residual).
-        # This captures actual interest, dividends, and any other non-position changes.
+        # NAV change components (computed by eod_reconcile). Cash earns interest
+        # only — we do NOT stuff the NAV-vs-position residual into cash, since
+        # that absorbs bookkeeping noise and inflates apparent alpha.
+        recon = nav_reconciliation or {}
         cash = ib_cash if ib_cash is not None else (nav - total_mv if nav else 0)
-        # Total portfolio daily P&L from NAV change
         total_nav_change = nav * (daily_return / 100) if daily_return is not None else 0
-        cash_daily_usd = total_nav_change - total_day_usd
-        cash_daily_return_pct = (cash_daily_usd / cash * 100) if cash and cash > 0 else 0
-        cash_alpha_usd = cash_daily_usd - (cash * (spy_return or 0) / 100) if cash else 0
+        interest_usd = recon.get("interest_usd", 0.0) or 0.0
+        dividend_usd = recon.get("dividend_usd", 0.0) or 0.0
+        # Unattributed = NAV change - position P&L - interest - dividends.
+        # Nonzero values usually indicate pricing/snapshot mismatches, corporate
+        # actions, fees, or FX — surfaced separately so they stay visible.
+        unattributed_usd = recon.get(
+            "unattributed_usd",
+            total_nav_change - total_day_usd - interest_usd - dividend_usd,
+        )
 
-        # Grand totals including cash
-        grand_day_usd = total_day_usd + cash_daily_usd
+        # Cash α = interest earned, minus the opportunity cost of not holding
+        # SPY on that cash sleeve. Dividends are attributed to source positions,
+        # so they flow through position α. Unattributed noise is excluded.
+        cash_alpha_usd = interest_usd - (cash * (spy_return or 0) / 100) if cash else 0
+
+        grand_day_usd = total_day_usd + interest_usd + dividend_usd + unattributed_usd
         grand_alpha_usd = total_alpha_usd + cash_alpha_usd
         grand_alpha_pct = grand_alpha_usd / nav * 100 if nav else 0
 
@@ -208,22 +219,40 @@ def build_eod_email(
                 f"  {dr_str:>7}  ${daily_usd:>+8,.0f}  ${alpha_usd:>+8,.0f}  {alpha_pct_of_total:>+6.1f}%"
             )
 
-        # Cash row
+        # Cash row — balance + α from interest vs SPY, no fabricated daily return
         if abs(cash) > 1:
             cash_pct = cash / nav * 100 if nav else 0
             cash_alpha_pct_of_total = (cash_alpha_usd / grand_alpha_usd * 100) if grand_alpha_usd else 0
             html_parts.append(
                 f'<tr style="color:#888"><td><i>Cash</i></td><td></td>'
                 f'<td>${cash:,.0f}</td><td>{cash_pct:.1f}%</td>'
-                f'<td>{_pct(cash_daily_return_pct)}</td><td>{_dollar(cash_daily_usd)}</td>'
+                f'<td>—</td><td>—</td>'
                 f'<td>{_dollar(cash_alpha_usd)}</td><td>{_pct(cash_alpha_pct_of_total)}</td></tr>'
             )
             plain_parts.append(
                 f"  {'Cash':<6} {'':>5}  ${cash:>9,.0f}  {cash_pct:>5.1f}%"
-                f"  {_plain_pct(cash_daily_return_pct):>7}  ${cash_daily_usd:>+8,.0f}  ${cash_alpha_usd:>+8,.0f}  {cash_alpha_pct_of_total:>+6.1f}%"
+                f"  {'—':>7}  {'—':>9}  ${cash_alpha_usd:>+8,.0f}  {cash_alpha_pct_of_total:>+6.1f}%"
             )
 
-        # Totals row — should tie to Daily Summary
+        # Interest / Dividends / Unattributed rows — only show if non-trivial
+        def _extra_row(label: str, usd: float, style: str = "color:#888;font-style:italic"):
+            if abs(usd) < 1:
+                return
+            html_parts.append(
+                f'<tr style="{style}"><td>{label}</td><td></td><td></td><td></td>'
+                f'<td>—</td><td>{_dollar(usd)}</td><td>—</td><td>—</td></tr>'
+            )
+            plain_parts.append(f"  {label:<14} ${usd:>+8,.0f}")
+
+        _extra_row("Interest", interest_usd)
+        _extra_row("Dividends", dividend_usd)
+        _extra_row(
+            "Unattributed",
+            unattributed_usd,
+            style="color:#c00;font-style:italic",  # red — this should be small
+        )
+
+        # Totals row — ties to Daily Summary (NAV-based)
         html_parts.append(
             f'<tr style="font-weight:bold;border-top:2px solid #333">'
             f'<td>Total</td><td></td>'
@@ -377,6 +406,7 @@ def send_eod_email(
     roundtrip_stats: dict | None = None,
     trades_bucket: str = "",
     account_snapshot: dict | None = None,
+    nav_reconciliation: dict | None = None,
 ) -> None:
     subject, html_body, plain_body = build_eod_email(
         run_date, nav, daily_return, spy_return, alpha, positions, conn,
@@ -385,6 +415,7 @@ def send_eod_email(
         data_warnings=data_warnings,
         roundtrip_stats=roundtrip_stats,
         account_snapshot=account_snapshot,
+        nav_reconciliation=nav_reconciliation,
     )
 
     # Archive email HTML to S3
