@@ -162,3 +162,71 @@ class TestBuildEodEmail:
             conn=mock_db,
         )
         assert "—" in subject or "None" not in subject
+
+    def test_cash_row_does_not_absorb_nav_residual(self, mock_db):
+        """Regression: cash should NOT show a fabricated daily return.
+
+        Prior bug: cash_daily_usd = total_nav_change - total_day_usd absorbed
+        pricing/snapshot noise. On 2026-04-17, this produced a +2.27% daily
+        return on the cash sleeve and +$7,148 of bogus cash alpha (133% of
+        total alpha). Cash row must show '—' for daily return and only earn
+        α from actual interest.
+        """
+        positions = {
+            "AAPL": {
+                "shares": 10, "market_value": 1500,
+                "daily_return_pct": 0.01, "daily_return_usd": 0.15,
+                "alpha_contribution_usd": 0.05,
+            },
+        }
+        # NAV moved by $8000 but positions only contributed $0.15
+        # and reconciliation says only $50 is interest.
+        recon = {
+            "nav_change_usd": 8000.0,
+            "position_pnl_usd": 0.15,
+            "interest_usd": 50.0,
+            "dividend_usd": 0.0,
+            "unattributed_usd": 7949.85,
+        }
+        account = {"total_cash": 350000.0, "accrued_interest": 550.0}
+        _, html, plain = build_eod_email(
+            run_date="2026-04-08",
+            nav=1_031_666.0,
+            daily_return=0.76,
+            spy_return=0.25,
+            alpha=0.51,
+            positions=positions,
+            conn=mock_db,
+            account_snapshot=account,
+            nav_reconciliation=recon,
+        )
+        # Cash row must not claim a 2.27% daily return
+        assert "2.27%" not in html
+        # Unattributed gap must be surfaced (not hidden)
+        assert "Unattributed" in html
+        assert "7,950" in html or "7,949" in html
+        # Interest row should appear
+        assert "Interest" in html
+
+    def test_reconciliation_absent_falls_back_cleanly(self, mock_db):
+        """If nav_reconciliation isn't passed, cash alpha is ~0 (interest=0)."""
+        positions = {
+            "AAPL": {
+                "shares": 10, "market_value": 1500,
+                "daily_return_pct": 0.1, "daily_return_usd": 1.5,
+                "alpha_contribution_usd": 0.5,
+            },
+        }
+        _, html, _ = build_eod_email(
+            run_date="2026-04-08",
+            nav=100_000.0,
+            daily_return=0.1,
+            spy_return=0.05,
+            alpha=0.05,
+            positions=positions,
+            conn=mock_db,
+            account_snapshot={"total_cash": 98_500.0},
+        )
+        # No explicit reconciliation → no Interest/Dividends rows
+        assert "Interest</td>" not in html
+        assert "Dividends</td>" not in html

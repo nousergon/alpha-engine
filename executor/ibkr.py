@@ -85,6 +85,33 @@ class IBKRClient:
             "realized_pnl": _float("RealizedPnL"),
         }
 
+    def get_accrued_dividends_by_symbol(self) -> dict[str, float]:
+        """Return per-symbol accrued dividends from IB Gateway.
+
+        Iterates accountValues() and collects entries where tag suggests
+        dividend accrual and modelCode carries the symbol. IB Gateway
+        formats vary across versions/accounts; paper accounts often
+        populate nothing. Returns {} in that case — callers should treat
+        missing data as zero dividends, not as failure.
+
+        Emits INFO log with count so we can observe behavior live vs paper.
+        """
+        self.ensure_connected()
+        dividend_tags = {"AccruedDividend", "DividendAccruals"}
+        result: dict[str, float] = {}
+        for av in self.ib.accountValues():
+            if av.tag in dividend_tags and av.modelCode:
+                try:
+                    val = float(av.value)
+                except (TypeError, ValueError):
+                    continue
+                if val == 0:
+                    continue
+                # modelCode may be "AAPL" or similar symbol-like key
+                result[av.modelCode] = result.get(av.modelCode, 0.0) + val
+        logger.info("Accrued dividends by symbol: %d entries", len(result))
+        return result
+
     def get_positions(self) -> dict[str, dict]:
         """
         Return current portfolio positions.

@@ -248,6 +248,63 @@ def _synthesize_rationales(contexts: list[dict]) -> dict[str, str]:
     return narratives
 
 
+def _resolve_prior_price(
+    prior_pos: dict | None,
+    pos: dict,
+    current_price: float,
+) -> float:
+    """Pick the right prior-day price for daily return computation.
+
+    Phase 3+ snapshots store an explicit `closing_price` from daily_closes,
+    which is the same source today's reconcile uses for current_price —
+    eliminating the IB-MV-vs-daily-closes mismatch that was dumping noise
+    into the cash residual. Falls back to MV/shares for legacy snapshots
+    and to avg_cost for positions opened today.
+    """
+    if prior_pos:
+        cp = prior_pos.get("closing_price")
+        if cp is not None:
+            return float(cp)
+        prior_mv = prior_pos.get("market_value", 0)
+        prior_shares = prior_pos.get("shares", 0)
+        if prior_shares:
+            return prior_mv / prior_shares
+    # No prior snapshot — position opened today, use avg_cost
+    return pos.get("avg_cost", current_price)
+
+
+def _apply_dividend_delta(
+    pos: dict,
+    prior_pos: dict | None,
+    prior_price: float,
+    shares: int,
+) -> None:
+    """Attribute today's dividend accrual to the position.
+
+    Only positive accrual deltas (ex-dividend earnings) are added to
+    daily_return_usd — these represent new economic value earned today.
+
+    Negative deltas (accrual → cash reclassification on payout day) are
+    recorded in pos['dividend_paid_usd'] but NOT subtracted from position
+    P&L. The dividend was already earned on ex-dividend day; the payout
+    is a bookkeeping transfer that raises cash without changing portfolio
+    value. The reconciliation bucket uses dividend_paid_usd to explain
+    the cash inflow on the payout day.
+    """
+    today_div = float(pos.get("accrued_dividend", 0.0) or 0.0)
+    prior_div = float((prior_pos or {}).get("accrued_dividend", 0.0) or 0.0)
+    div_delta = today_div - prior_div
+    if div_delta > 0:
+        pos["dividend_usd"] = div_delta
+        pos["daily_return_usd"] = pos.get("daily_return_usd", 0.0) + div_delta
+        prior_mv = prior_price * shares if prior_price else 0
+        if prior_mv > 0:
+            pos["daily_return_pct"] = (pos["daily_return_usd"] / prior_mv) * 100
+    elif div_delta < 0:
+        # Accrual dropped — payout to cash. Don't double-count as position loss.
+        pos["dividend_paid_usd"] = -div_delta
+
+
 def run(run_date: str | None = None) -> None:
     run_date = run_date or str(date.today())
     _health_start = _time.time()
@@ -291,6 +348,12 @@ def run(run_date: str | None = None) -> None:
             account = ibkr.get_account_snapshot()
             nav = account["net_liquidation"]
             positions = ibkr.get_positions()
+            # Per-symbol accrued dividends — often {} for paper accounts.
+            # Stored in positions_snapshot to compute day-over-day deltas.
+            dividends_by_symbol = ibkr.get_accrued_dividends_by_symbol()
+            for _tkr, _accrued in dividends_by_symbol.items():
+                if _tkr in positions:
+                    positions[_tkr]["accrued_dividend"] = _accrued
             ibkr.disconnect()
             break
         except Exception as e:
@@ -389,20 +452,6 @@ def run(run_date: str | None = None) -> None:
         else f"NAV=${nav:,.2f} | prior_nav={prior_nav}"
     )
 
-    log_eod(conn, {
-        "date": run_date,
-        "portfolio_nav": nav,
-        "daily_return_pct": daily_return,
-        "spy_return_pct": spy_return,
-        "daily_alpha_pct": alpha,
-        "positions_snapshot": positions,
-        "spy_close": spy_price,
-        "total_cash": account.get("total_cash"),
-        "accrued_interest": account.get("accrued_interest"),
-        "unrealized_pnl": account.get("unrealized_pnl"),
-        "realized_pnl": account.get("realized_pnl"),
-    })
-
     # ── Load closing prices from daily_closes for accurate per-position returns ──
     closing_prices: dict[str, float] = {}
     try:
@@ -441,16 +490,13 @@ def run(run_date: str | None = None) -> None:
             current_price = closing_prices[ticker]
             pos["market_value"] = current_price * shares
             mv = pos["market_value"]
+        # Persist the canonical close so tomorrow's reconcile reads the same
+        # source for prior_price (not derived from possibly-stale IB MV).
+        pos["closing_price"] = current_price
 
         # Daily return: today's price vs yesterday's price (or entry price if new today)
         prior_pos = prior_positions.get(ticker)
-        if prior_pos:
-            prior_mv = prior_pos.get("market_value", 0)
-            prior_shares = prior_pos.get("shares", 0)
-            prior_price = prior_mv / prior_shares if prior_shares else 0
-        else:
-            # New position — use avg_cost (entry price) as the baseline
-            prior_price = pos.get("avg_cost", current_price)
+        prior_price = _resolve_prior_price(prior_pos, pos, current_price)
 
         if prior_price and prior_price > 0:
             pos["daily_return_pct"] = (current_price / prior_price - 1) * 100
@@ -459,11 +505,95 @@ def run(run_date: str | None = None) -> None:
             pos["daily_return_pct"] = 0.0
             pos["daily_return_usd"] = 0.0
 
+        # Dividend attribution: today's accrued dividend for this ticker vs
+        # yesterday's snapshot. Delta is the day's dividend income (or its
+        # reversal when paid to cash). Flows into position α instead of
+        # leaking into the cash residual.
+        _apply_dividend_delta(pos, prior_pos, prior_price, shares)
+
         # Alpha contribution: (weight * position_return) - (weight * SPY_return)
         weight = mv / nav if nav else 0
         pos_spy = spy_return if spy_return is not None else 0
         pos["alpha_contribution_pct"] = weight * (pos["daily_return_pct"] - pos_spy)
         pos["alpha_contribution_usd"] = pos["alpha_contribution_pct"] / 100 * nav if nav else 0
+
+    # data_warnings is appended to here (NAV gap) and by _build_position_contexts
+    data_warnings: list[str] = []
+
+    # ── NAV change reconciliation ───────────────────────────────────────────
+    # Every dollar of NAV change must be attributable to a source: position
+    # MTM, interest, dividends, or (flagged) unattributed. Anything in the
+    # unattributed bucket indicates a pricing/snapshot mismatch, fee, FX,
+    # corporate action, or similar — surface it loudly instead of burying it
+    # in cash return.
+    nav_reconciliation: dict = {}
+    if prior_nav is not None:
+        total_nav_change = nav - prior_nav
+        total_day_usd = sum(p.get("daily_return_usd", 0) for p in positions.values())
+
+        # Interest: day-over-day delta in IB's AccruedCash
+        prior_accrued_row = conn.execute(
+            "SELECT accrued_interest FROM eod_pnl WHERE accrued_interest IS NOT NULL AND date < ? ORDER BY date DESC LIMIT 1",
+            (run_date,),
+        ).fetchone()
+        today_accrued = account.get("accrued_interest")
+        if today_accrued is not None and prior_accrued_row and prior_accrued_row[0] is not None:
+            interest_usd = float(today_accrued) - float(prior_accrued_row[0])
+        else:
+            interest_usd = 0.0
+
+        # Dividends earned today (accrual increase) are already added into
+        # each position's daily_return_usd, so they flow through total_day_usd.
+        # Payout-day cash inflow is exactly offset by accrual drop in IB's
+        # NetLiquidation, so NAV doesn't move from the payout itself — no
+        # reconciliation term needed. dividend_usd here is informational
+        # only, summing positive accrual deltas for the email.
+        dividend_usd = sum(p.get("dividend_usd", 0.0) for p in positions.values())
+
+        unattributed_usd = total_nav_change - total_day_usd - interest_usd
+        nav_reconciliation = {
+            "nav_change_usd": total_nav_change,
+            "position_pnl_usd": total_day_usd,
+            "interest_usd": interest_usd,
+            "dividend_usd": dividend_usd,
+            "unattributed_usd": unattributed_usd,
+        }
+        logger.info(
+            "NAV recon: Δ=$%.0f | positions=$%.0f | interest=$%.0f | "
+            "dividends=$%.0f | unattributed=$%.0f",
+            total_nav_change, total_day_usd, interest_usd,
+            dividend_usd, unattributed_usd,
+        )
+        # Warn if unattributed is material (> max($100, 0.05% NAV)). Surface
+        # the gap in data_warnings so it appears in the EOD email, not only
+        # in server logs.
+        if nav and abs(unattributed_usd) > max(100.0, 0.0005 * nav):
+            msg = (
+                f"NAV reconciliation gap: ${unattributed_usd:+,.0f} unattributed "
+                f"({unattributed_usd / nav * 100:+.3f}% of NAV). Likely causes: "
+                "stale prior-day prices, untracked corporate action, fees, or FX."
+            )
+            logger.warning(msg)
+            data_warnings.append(msg)
+
+    # Persist EOD snapshot AFTER positions are enriched with closing prices,
+    # accrued dividends, and per-position returns. Yesterday's reconcile now
+    # reads this snapshot via closing_price (same source as today's
+    # daily_closes), closing the source-mismatch gap that was causing NAV
+    # residuals to land in cash.
+    log_eod(conn, {
+        "date": run_date,
+        "portfolio_nav": nav,
+        "daily_return_pct": daily_return,
+        "spy_return_pct": spy_return,
+        "daily_alpha_pct": alpha,
+        "positions_snapshot": positions,
+        "spy_close": spy_price,
+        "total_cash": account.get("total_cash"),
+        "accrued_interest": account.get("accrued_interest"),
+        "unrealized_pnl": account.get("unrealized_pnl"),
+        "realized_pnl": account.get("realized_pnl"),
+    })
 
     # ── Sector attribution ──────────────────────────────────────────────────
     # Daily contribution = today's per-position P&L as % of NAV (not cumulative
@@ -517,12 +647,12 @@ def run(run_date: str | None = None) -> None:
     # Build position rationale narratives
     signals_bucket = config.get("signals_bucket", "alpha-engine-research")
     position_narratives = {}
-    data_warnings: list[str] = []
     try:
         if positions:
-            contexts, data_warnings = _build_position_contexts(positions, conn, signals_bucket, run_date)
+            contexts, ctx_warnings = _build_position_contexts(positions, conn, signals_bucket, run_date)
             position_narratives = _synthesize_rationales(contexts)
             logger.info(f"Position narratives generated for {len(position_narratives)} tickers")
+            data_warnings.extend(ctx_warnings)
     except Exception as e:
         logger.warning(f"Position rationale generation failed: {e}")
 
@@ -616,6 +746,7 @@ def run(run_date: str | None = None) -> None:
             roundtrip_stats=roundtrip_stats,
             trades_bucket=trades_bucket,
             account_snapshot=account,
+            nav_reconciliation=nav_reconciliation,
         )
     except Exception as e:
         logger.error(f"EOD email failed: {e}")
