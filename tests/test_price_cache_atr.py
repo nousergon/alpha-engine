@@ -176,3 +176,104 @@ class TestNTradingDaysBack:
             return d.weekday() < 5
         with patch.object(price_cache, "is_trading_day", side_effect=_is_td):
             assert _n_trading_days_back(monday, 1) == date(2026, 4, 10)  # Friday
+
+
+def _df_vwap(values: list[float], last_date: date, col: str = "VWAP") -> pd.DataFrame:
+    """Synthesize a universe-style frame with a VWAP column."""
+    n = len(values)
+    index = pd.bdate_range(end=pd.Timestamp(last_date), periods=n)
+    return pd.DataFrame({col: values}, index=index)
+
+
+class TestLoadDailyVwap:
+    """Phase 2: load_daily_vwap reads from ArcticDB — no parquet fallback."""
+
+    def test_empty_tickers_short_circuits(self):
+        with patch.object(price_cache._arcticdb, "Arctic") as mock_arctic:
+            result = price_cache.load_daily_vwap([], "test-bucket", run_date="2026-04-17")
+            assert result == {}
+            mock_arctic.assert_not_called()
+
+    def test_returns_latest_vwap_for_each_ticker(self):
+        ref = date(2026, 4, 17)  # Friday
+        rows = {
+            "AAPL": _df_vwap([172.0, 173.5, 175.0], last_date=ref),
+            "MSFT": _df_vwap([410.0, 412.5, 415.0], last_date=ref),
+        }
+        with patch.object(price_cache, "is_trading_day", return_value=True):
+            with patch.object(
+                price_cache._arcticdb, "Arctic",
+                return_value=_mock_arctic_lib(rows),
+            ):
+                result = price_cache.load_daily_vwap(
+                    ["AAPL", "MSFT"], "test-bucket", run_date="2026-04-17",
+                )
+        assert result == {"AAPL": 175.0, "MSFT": 415.0}
+
+    def test_hard_fails_on_arcticdb_read_error(self):
+        """Library read error (symbol missing, connection down, etc.) → raise.
+
+        The symbol-missing case is an infrastructure error, not a data gap —
+        the universe should contain every ENTER-signal ticker.
+        """
+        ref = date(2026, 4, 17)
+        rows = {"AAPL": _df_vwap([172.0], last_date=ref)}
+        with patch.object(price_cache, "is_trading_day", return_value=True):
+            with patch.object(
+                price_cache._arcticdb, "Arctic",
+                return_value=_mock_arctic_lib(rows),
+            ):
+                with pytest.raises(RuntimeError, match="ArcticDB read failed"):
+                    price_cache.load_daily_vwap(
+                        ["AAPL", "NOPE"], "test-bucket", run_date="2026-04-17",
+                    )
+
+    def test_tolerates_missing_vwap_column(self):
+        """Ticker exists in universe but has no VWAP column → omit from map,
+        don't raise. VWAP was added to the schema 2026-04-17; historical
+        frames legitimately lack it. The daemon handles a missing VWAP entry
+        by skipping that trigger, so partial coverage is a documented gap."""
+        ref = date(2026, 4, 17)
+        rows = {
+            "AAPL": _df_vwap([172.0], last_date=ref),  # has VWAP
+            "OLD":  _df_vwap([99.0], last_date=ref, col="Close"),  # no VWAP col
+        }
+        with patch.object(price_cache, "is_trading_day", return_value=True):
+            with patch.object(
+                price_cache._arcticdb, "Arctic",
+                return_value=_mock_arctic_lib(rows),
+            ):
+                result = price_cache.load_daily_vwap(
+                    ["AAPL", "OLD"], "test-bucket", run_date="2026-04-17",
+                )
+        assert result == {"AAPL": 172.0}
+        assert "OLD" not in result
+
+    def test_walks_back_through_lookback_window(self):
+        """If run_date has no row, pick the next most recent trading day in window."""
+        # Only has data 2 days back
+        ref = date(2026, 4, 15)  # Wednesday
+        rows = {"AAPL": _df_vwap([170.0], last_date=ref)}
+        with patch.object(price_cache, "is_trading_day", return_value=True):
+            with patch.object(
+                price_cache._arcticdb, "Arctic",
+                return_value=_mock_arctic_lib(rows),
+            ):
+                result = price_cache.load_daily_vwap(
+                    ["AAPL"], "test-bucket", run_date="2026-04-17",  # Friday
+                )
+        assert result == {"AAPL": 170.0}
+
+    def test_tolerates_empty_window(self):
+        """No VWAP in any candidate day → omit from map with INFO log, not raise."""
+        # Data exists but all before the window
+        rows = {"AAPL": _df_vwap([170.0], last_date=date(2026, 1, 5))}
+        with patch.object(price_cache, "is_trading_day", return_value=True):
+            with patch.object(
+                price_cache._arcticdb, "Arctic",
+                return_value=_mock_arctic_lib(rows),
+            ):
+                result = price_cache.load_daily_vwap(
+                    ["AAPL"], "test-bucket", run_date="2026-04-17",
+                )
+        assert result == {}

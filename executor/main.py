@@ -1098,8 +1098,11 @@ def run(
             else:
                 price_histories = {}
 
-        # Load previous day's VWAP from daily_closes for intraday entry triggers
-        vwap_map = load_daily_vwap(signals_bucket, run_date)
+        # Previous-day VWAP per ENTER-signal ticker for intraday entry triggers.
+        # Sourced from the ArcticDB universe library; hard-fails on any miss
+        # so daemon triggers always see a trusted VWAP.
+        vwap_tickers = sorted({s["ticker"] for s in signals.get("enter", [])})
+        vwap_map = load_daily_vwap(vwap_tickers, signals_bucket, run_date) if vwap_tickers else {}
 
         # Single source of truth for ATR across the executor. Replaces per-call-site
         # _compute_atr(ticker_hist) invocations (position sizing, pullback-trigger

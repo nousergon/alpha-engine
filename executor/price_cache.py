@@ -284,50 +284,101 @@ def _n_trading_days_back(ref: date, n: int) -> date:
 
 
 def load_daily_vwap(
+    tickers: list[str],
     signals_bucket: str,
     run_date: str | None = None,
     max_lookback: int = 5,
 ) -> dict[str, float]:
-    """
-    Load VWAP values from the most recent daily_closes parquet on S3.
+    """Load prior-day VWAP per ticker from the ArcticDB universe library.
 
-    Scans backward from run_date (skipping weekends/holidays) to find
-    the most recent daily_closes file with VWAP data.
-
-    Returns:
-        {ticker: vwap} for tickers with a valid VWAP value.
-        Empty dict if no file found or no VWAP column.
+    For each requested ticker, walks back from run_date (skipping
+    weekends/holidays) and returns the most recent VWAP value within
+    `max_lookback` trading days. Hard-fails if the universe library is
+    unreachable or has no VWAP column. Tickers whose entire lookback
+    window has no VWAP are raised as a single failure (no silent empty
+    dict) — VWAP is a daemon entry-trigger input and must be trusted.
     """
-    s3 = boto3.client("s3")
+    if not tickers:
+        return {}
+
+    universe = _open_universe_library(signals_bucket)
     start = date.fromisoformat(run_date) if run_date else date.today()
 
+    # Build the list of candidate trading dates once — all tickers scan
+    # the same window. Normalize to date for filtering.
+    candidates: list[date] = []
     for days_back in range(max_lookback + 1):
         candidate = start - timedelta(days=days_back)
         if candidate.weekday() > 4:
             continue
         if not is_trading_day(candidate):
             continue
+        candidates.append(candidate)
+    if not candidates:
+        raise RuntimeError(
+            f"No trading-day candidates within {max_lookback} days of {start}"
+        )
 
-        key = f"predictor/daily_closes/{candidate.isoformat()}.parquet"
+    # Contract:
+    #   HARD FAIL on library/read errors — infrastructure problem.
+    #   PARTIAL COVERAGE (INFO log) when a ticker's frame has no VWAP column
+    #       or no valid VWAP in the lookback window. VWAP was added to the
+    #       universe schema 2026-04-17; historical ticker frames + yfinance-
+    #       sourced rows legitimately lack it. The daemon's VWAP-discount
+    #       trigger explicitly skips tickers with no VWAP (entry_triggers.py:
+    #       `if vwap and vwap > 0`), so a documented data gap is tolerable
+    #       while other triggers (pullback, support, time expiry) carry load.
+    read_errors: list[str] = []
+    no_vwap_column: list[str] = []
+    no_valid_vwap_in_window: list[str] = []
+    vwap_map: dict[str, float] = {}
+
+    for ticker in tickers:
         try:
-            obj = s3.get_object(Bucket=signals_bucket, Key=key)
-            df = pd.read_parquet(io.BytesIO(obj["Body"].read()))
-        except Exception:
+            df = universe.read(ticker).data
+        except Exception as e:
+            read_errors.append(f"{ticker} ({e.__class__.__name__})")
             continue
-
-        if "VWAP" not in df.columns:
-            logger.info("daily_closes/%s has no VWAP column — skipping", candidate)
+        if df.empty or "VWAP" not in df.columns:
+            no_vwap_column.append(ticker)
             continue
-
-        vwap_map: dict[str, float] = {}
-        for ticker, row in df.iterrows():
-            v = row.get("VWAP")
+        # Find the most recent row whose index matches one of the candidate
+        # trading days (normalized). First hit wins.
+        idx = df.index.normalize() if hasattr(df.index, "normalize") else df.index
+        for cand in candidates:
+            match = df[idx == pd.Timestamp(cand)]
+            if match.empty:
+                continue
+            v = match["VWAP"].iloc[-1]
             if pd.notna(v) and v > 0:
-                vwap_map[str(ticker)] = float(v)
+                vwap_map[ticker] = float(v)
+                break
+        if ticker not in vwap_map:
+            no_valid_vwap_in_window.append(ticker)
 
-        if vwap_map:
-            logger.info("Loaded VWAP for %d tickers from daily_closes/%s", len(vwap_map), candidate)
-            return vwap_map
+    if read_errors:
+        raise RuntimeError(
+            f"load_daily_vwap ArcticDB read failed for {len(read_errors)} "
+            f"ticker(s): {read_errors}. Daemon cannot plan triggers without "
+            "a trusted universe library."
+        )
 
-    logger.warning("No daily_closes with VWAP found in last %d days", max_lookback)
-    return {}
+    logger.info(
+        "[data_source=arcticdb] VWAP resolved for %d/%d tickers "
+        "(window ≤ %s, no_column=%d, no_valid=%d)",
+        len(vwap_map), len(tickers), start,
+        len(no_vwap_column), len(no_valid_vwap_in_window),
+    )
+    if no_vwap_column:
+        logger.info(
+            "VWAP column absent for %d ticker(s) — daemon skips VWAP "
+            "trigger for these: %s",
+            len(no_vwap_column), sorted(no_vwap_column),
+        )
+    if no_valid_vwap_in_window:
+        logger.info(
+            "No valid VWAP in %d-day window for %d ticker(s): %s",
+            max_lookback, len(no_valid_vwap_in_window),
+            sorted(no_valid_vwap_in_window),
+        )
+    return vwap_map
