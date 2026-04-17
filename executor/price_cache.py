@@ -46,18 +46,29 @@ logger = logging.getLogger(__name__)
 _ATR_MAX_STALENESS_TRADING_DAYS = 1
 
 
+def _open_universe_library(signals_bucket: str):
+    """Open the ArcticDB `universe` library for reads.
+
+    Single connection helper used by every read path in the executor.
+    Hard-fails on connection/library errors per feedback_no_silent_fails.
+    """
+    adb = _arcticdb  # already imported at module top for macOS allocator prime
+    region = os.environ.get("AWS_REGION", "us-east-1")
+    uri = (
+        f"s3s://s3.{region}.amazonaws.com:{signals_bucket}"
+        f"?path_prefix=arcticdb&aws_auth=true"
+    )
+    arctic = adb.Arctic(uri)
+    return arctic.get_library("universe")
+
+
 def _load_histories_from_arcticdb(
     tickers: list[str],
     signals_bucket: str,
 ) -> dict[str, list[dict]] | None:
     """Try to load price histories from ArcticDB universe library."""
     try:
-        import os
-        import arcticdb as adb
-        region = os.environ.get("AWS_REGION", "us-east-1")
-        uri = f"s3s://s3.{region}.amazonaws.com:{signals_bucket}?path_prefix=arcticdb&aws_auth=true"
-        arctic = adb.Arctic(uri)
-        universe = arctic.get_library("universe")
+        universe = _open_universe_library(signals_bucket)
 
         histories: dict[str, list[dict]] = {}
         for ticker in tickers:
@@ -187,18 +198,7 @@ def load_atr_14_pct(
     if not tickers:
         return {}
 
-    # Use the module-level binding that was imported first at the top of
-    # this file. Hard-fail on missing dep per no-silent-fail — arcticdb is
-    # a required dep in requirements.txt since 2026-04-16.
-    adb = _arcticdb
-
-    region = os.environ.get("AWS_REGION", "us-east-1")
-    uri = (
-        f"s3s://s3.{region}.amazonaws.com:{signals_bucket}"
-        f"?path_prefix=arcticdb&aws_auth=true"
-    )
-    arctic = adb.Arctic(uri)
-    universe = arctic.get_library("universe")
+    universe = _open_universe_library(signals_bucket)
 
     ref = reference_date or datetime.now(timezone.utc).date()
     staleness_cutoff = _n_trading_days_back(ref, max_staleness_trading_days)

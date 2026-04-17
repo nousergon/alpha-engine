@@ -39,44 +39,34 @@ logger = logging.getLogger(__name__)
 from executor.config_loader import CONFIG_PATH
 
 
-def _spy_close(run_date: str, config: dict | None = None) -> float | None:
-    """Fetch SPY closing price for run_date.
+def _spy_close(run_date: str, config: dict | None = None) -> float:
+    """Fetch SPY close for run_date from ArcticDB universe library.
 
-    Priority: S3 daily_closes (written by post-market data step) → polygon → yfinance.
+    ArcticDB is the single source of truth — no parquet, polygon, or
+    yfinance fallback. Hard-fails if SPY is missing, stale, or has no
+    close for run_date, because EOD alpha is meaningless without a
+    reliable SPY reference.
     """
-    # Try S3 daily_closes first (most reliable — written by PostMarketData step)
+    from executor.price_cache import _open_universe_library
+    bucket = (config or {}).get("trades_bucket", "alpha-engine-research")
+    universe = _open_universe_library(bucket)
     try:
-        import io
-        bucket = (config or {}).get("trades_bucket", "alpha-engine-research")
-        s3 = boto3.client("s3")
-        key = f"predictor/daily_closes/{run_date}.parquet"
-        obj = s3.get_object(Bucket=bucket, Key=key)
-        df = pd.read_parquet(io.BytesIO(obj["Body"].read()))
-        if "SPY" in df.index and "Close" in df.columns:
-            close = float(df.loc["SPY", "Close"])
-            logger.info("SPY close from daily_closes/%s: $%.2f", run_date, close)
-            return close
+        df = universe.read("SPY").data
     except Exception as e:
-        logger.debug("daily_closes SPY lookup failed: %s", e)
-
-    # Fallback: polygon
-    try:
-        from polygon_client import polygon_client
-        close = polygon_client().get_single_close("SPY", run_date)
-        if close is not None:
-            return close
-    except Exception as e:
-        logger.warning("Polygon SPY fetch failed, trying yfinance: %s", e)
-    # Fallback: yfinance
-    try:
-        import yfinance as yf
-        end_date = (date.fromisoformat(run_date) + timedelta(days=1)).isoformat()
-        hist = yf.download("SPY", start=run_date, end=end_date, progress=False, auto_adjust=True)
-        if not hist.empty:
-            return float(hist["Close"].values.flat[0])
-    except Exception as e:
-        logger.warning("Could not fetch SPY price: %s", e)
-    return None
+        raise RuntimeError(f"ArcticDB read failed for SPY: {e}") from e
+    if df.empty or "Close" not in df.columns:
+        raise RuntimeError("ArcticDB SPY frame empty or missing Close column")
+    target = pd.Timestamp(run_date).normalize()
+    idx = df.index.normalize() if hasattr(df.index, "normalize") else df.index
+    matches = df[idx == target]
+    if matches.empty:
+        raise RuntimeError(
+            f"ArcticDB has no SPY close for {run_date} (latest: "
+            f"{pd.Timestamp(df.index[-1]).date()})"
+        )
+    close = float(matches["Close"].iloc[-1])
+    logger.info("[data_source=arcticdb] SPY close for %s: $%.2f", run_date, close)
+    return close
 
 
 def _load_signals_from_s3(bucket: str, run_date: str, max_lookback: int = 5) -> tuple[dict, str | None]:
@@ -452,20 +442,39 @@ def run(run_date: str | None = None) -> None:
         else f"NAV=${nav:,.2f} | prior_nav={prior_nav}"
     )
 
-    # ── Load closing prices from daily_closes for accurate per-position returns ──
+    # ── Load closing prices from ArcticDB universe library ─────────────────
+    # Hard-fails on any miss: EOD reconcile must reconcile against an
+    # authoritative price source, not IB Gateway's delayed intraday data.
+    from executor.price_cache import _open_universe_library
+    universe_lib = _open_universe_library(trades_bucket)
+    target_ts = pd.Timestamp(run_date).normalize()
     closing_prices: dict[str, float] = {}
-    try:
-        import io as _io_dc
-        dc_key = f"predictor/daily_closes/{run_date}.parquet"
-        dc_obj = boto3.client("s3").get_object(Bucket=trades_bucket, Key=dc_key)
-        dc_df = pd.read_parquet(_io_dc.BytesIO(dc_obj["Body"].read()))
-        for ticker_idx, row in dc_df.iterrows():
-            if "Close" in row and pd.notna(row["Close"]):
-                closing_prices[str(ticker_idx)] = float(row["Close"])
-        if closing_prices:
-            logger.info("Loaded %d closing prices from daily_closes/%s", len(closing_prices), run_date)
-    except Exception as _dc_exc:
-        logger.debug("daily_closes not available for %s — using IB Gateway prices: %s", run_date, _dc_exc)
+    missing: list[str] = []
+    for ticker in positions.keys():
+        try:
+            df = universe_lib.read(ticker).data
+        except Exception as e:
+            missing.append(f"{ticker} ({e.__class__.__name__})")
+            continue
+        if df.empty or "Close" not in df.columns:
+            missing.append(f"{ticker} (no Close column)")
+            continue
+        idx = df.index.normalize() if hasattr(df.index, "normalize") else df.index
+        match = df[idx == target_ts]
+        if match.empty:
+            missing.append(f"{ticker} (no row for {run_date})")
+            continue
+        closing_prices[ticker] = float(match["Close"].iloc[-1])
+    if missing:
+        raise RuntimeError(
+            f"ArcticDB closing-price lookup failed for {len(missing)} "
+            f"held ticker(s) on {run_date}: {missing}. EOD reconcile cannot "
+            "proceed without authoritative closes."
+        )
+    logger.info(
+        "[data_source=arcticdb] Loaded closing prices for %d/%d held tickers on %s",
+        len(closing_prices), len(positions), run_date,
+    )
 
     # ── Per-position daily return & alpha contribution ──────────────────────
     # Look up prior day's positions_snapshot to get yesterday's price per ticker
