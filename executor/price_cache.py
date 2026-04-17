@@ -1,17 +1,13 @@
 """
-Load OHLCV price histories from the predictor's S3 caches.
+Load OHLCV price histories, ATR, and VWAP from the ArcticDB universe
+library. ArcticDB is the sole source of truth — S3 parquet staging
+artifacts (price_cache_slim, daily_closes) are no longer read directly
+by the executor (2026-04-17).
 
-Uses the slim cache (2y per-ticker parquets, refreshed weekly Sunday)
-as the primary source. No new yfinance fetches required.
-
-S3 layout:
-    s3://alpha-engine-research/predictor/price_cache_slim/{TICKER}.parquet
-    Columns: Open, High, Low, Close, Volume (capitalized)
-    Index: DatetimeIndex (timezone-naive)
-
-    s3://alpha-engine-research/predictor/daily_closes/{date}.parquet
-    Columns: date, Open, High, Low, Close, Adj_Close, Volume, VWAP
-    Index: ticker (str)
+ArcticDB layout:
+    s3://{signals_bucket}/arcticdb/ — library "universe"
+    Each symbol is a ticker with a DatetimeIndex frame of
+    {Open, High, Low, Close, Volume, VWAP, atr_14_pct, ...}.
 """
 
 from __future__ import annotations
@@ -26,12 +22,10 @@ from __future__ import annotations
 # no fallback path, no optional import — feedback_no_silent_fails.
 import arcticdb as _arcticdb  # noqa: F401  (kept for its side effect on import ordering)
 
-import io
 import logging
 import os
 from datetime import date, datetime, timedelta, timezone
 
-import boto3
 import pandas as pd
 
 from executor.market_hours import is_trading_day
@@ -62,95 +56,63 @@ def _open_universe_library(signals_bucket: str):
     return arctic.get_library("universe")
 
 
-def _load_histories_from_arcticdb(
-    tickers: list[str],
-    signals_bucket: str,
-) -> dict[str, list[dict]] | None:
-    """Try to load price histories from ArcticDB universe library."""
-    try:
-        universe = _open_universe_library(signals_bucket)
-
-        histories: dict[str, list[dict]] = {}
-        for ticker in tickers:
-            try:
-                df = universe.read(ticker).data
-                if df.empty:
-                    continue
-                records = []
-                for dt, row in df.iterrows():
-                    records.append({
-                        "date": dt.strftime("%Y-%m-%d"),
-                        "open": float(row["Open"]) if "Open" in row.index else 0.0,
-                        "high": float(row["High"]) if "High" in row.index else 0.0,
-                        "low": float(row["Low"]) if "Low" in row.index else 0.0,
-                        "close": float(row["Close"]) if "Close" in row.index else 0.0,
-                    })
-                histories[ticker] = records
-            except Exception:
-                pass
-
-        if histories:
-            logger.info("[data_source=arcticdb] Price histories loaded for %d/%d tickers", len(histories), len(tickers))
-            return histories
-    except ImportError:
-        logger.debug("arcticdb not installed — using S3 slim cache")
-    except Exception as e:
-        logger.debug("[data_source=arcticdb] ArcticDB load failed: %s", e)
-    return None
-
-
 def load_price_histories(
     tickers: list[str],
     signals_bucket: str,
 ) -> dict[str, list[dict]]:
-    """
-    Load OHLCV histories for a list of tickers.
+    """Load OHLCV histories for a list of tickers from ArcticDB universe.
 
-    Priority: ArcticDB universe → S3 slim cache parquets.
+    ArcticDB is the sole source of truth — the S3 slim-cache parquet
+    fallback was removed 2026-04-17. Library/read errors hard-fail
+    (infrastructure broken). Individual tickers that return an empty
+    frame are omitted from the result with an INFO log — downstream
+    consumers (exit_manager, sector-relative veto) already handle
+    missing tickers.
 
     Returns:
-        {ticker: [{date, open, high, low, close}, ...]} sorted ascending by date.
-        Tickers without cached data are omitted.
+        {ticker: [{date, open, high, low, close}, ...]} sorted ascending.
     """
-    # Try ArcticDB first
-    arctic_result = _load_histories_from_arcticdb(tickers, signals_bucket)
-    if arctic_result is not None:
-        return arctic_result
+    if not tickers:
+        return {}
 
-    # Legacy: S3 slim cache
-    s3 = boto3.client("s3")
+    universe = _open_universe_library(signals_bucket)
     histories: dict[str, list[dict]] = {}
+    read_errors: list[str] = []
+    empty: list[str] = []
 
     for ticker in tickers:
-        key = f"predictor/price_cache_slim/{ticker}.parquet"
         try:
-            obj = s3.get_object(Bucket=signals_bucket, Key=key)
-            df = pd.read_parquet(io.BytesIO(obj["Body"].read()))
+            df = universe.read(ticker).data
         except Exception as e:
-            logger.debug(f"No slim cache for {ticker}: {e}")
+            read_errors.append(f"{ticker} ({e.__class__.__name__})")
             continue
-
         if df.empty:
+            empty.append(ticker)
             continue
-
-        # Normalize column names to lowercase for exit_manager compatibility
-        df.columns = [c.lower() for c in df.columns]
-
-        # Index is DatetimeIndex — convert to date strings
-        records = []
+        records: list[dict] = []
         for dt, row in df.iterrows():
             records.append({
                 "date": dt.strftime("%Y-%m-%d"),
-                "open": float(row["open"]),
-                "high": float(row["high"]),
-                "low": float(row["low"]),
-                "close": float(row["close"]),
+                "open": float(row["Open"]) if "Open" in row.index else 0.0,
+                "high": float(row["High"]) if "High" in row.index else 0.0,
+                "low": float(row["Low"]) if "Low" in row.index else 0.0,
+                "close": float(row["Close"]) if "Close" in row.index else 0.0,
             })
-
         histories[ticker] = records
-        logger.debug(f"Loaded {len(records)} bars for {ticker} from slim cache")
 
-    logger.info("[data_source=legacy] Price histories loaded for %d/%d tickers from S3 slim cache", len(histories), len(tickers))
+    if read_errors:
+        raise RuntimeError(
+            f"load_price_histories ArcticDB read failed for {len(read_errors)} "
+            f"ticker(s): {read_errors}. Universe library must be reachable."
+        )
+
+    logger.info(
+        "[data_source=arcticdb] Price histories loaded for %d/%d tickers "
+        "(empty=%d)",
+        len(histories), len(tickers), len(empty),
+    )
+    if empty:
+        logger.info("Empty frame for %d ticker(s): %s", len(empty), sorted(empty))
     return histories
 
 
