@@ -248,6 +248,38 @@ def _synthesize_rationales(contexts: list[dict]) -> dict[str, str]:
     return narratives
 
 
+def _apply_dividend_delta(
+    pos: dict,
+    prior_pos: dict | None,
+    prior_price: float,
+    shares: int,
+) -> None:
+    """Attribute today's dividend accrual to the position.
+
+    Only positive accrual deltas (ex-dividend earnings) are added to
+    daily_return_usd — these represent new economic value earned today.
+
+    Negative deltas (accrual → cash reclassification on payout day) are
+    recorded in pos['dividend_paid_usd'] but NOT subtracted from position
+    P&L. The dividend was already earned on ex-dividend day; the payout
+    is a bookkeeping transfer that raises cash without changing portfolio
+    value. The reconciliation bucket uses dividend_paid_usd to explain
+    the cash inflow on the payout day.
+    """
+    today_div = float(pos.get("accrued_dividend", 0.0) or 0.0)
+    prior_div = float((prior_pos or {}).get("accrued_dividend", 0.0) or 0.0)
+    div_delta = today_div - prior_div
+    if div_delta > 0:
+        pos["dividend_usd"] = div_delta
+        pos["daily_return_usd"] = pos.get("daily_return_usd", 0.0) + div_delta
+        prior_mv = prior_price * shares if prior_price else 0
+        if prior_mv > 0:
+            pos["daily_return_pct"] = (pos["daily_return_usd"] / prior_mv) * 100
+    elif div_delta < 0:
+        # Accrual dropped — payout to cash. Don't double-count as position loss.
+        pos["dividend_paid_usd"] = -div_delta
+
+
 def run(run_date: str | None = None) -> None:
     run_date = run_date or str(date.today())
     _health_start = _time.time()
@@ -291,6 +323,12 @@ def run(run_date: str | None = None) -> None:
             account = ibkr.get_account_snapshot()
             nav = account["net_liquidation"]
             positions = ibkr.get_positions()
+            # Per-symbol accrued dividends — often {} for paper accounts.
+            # Stored in positions_snapshot to compute day-over-day deltas.
+            dividends_by_symbol = ibkr.get_accrued_dividends_by_symbol()
+            for _tkr, _accrued in dividends_by_symbol.items():
+                if _tkr in positions:
+                    positions[_tkr]["accrued_dividend"] = _accrued
             ibkr.disconnect()
             break
         except Exception as e:
@@ -459,6 +497,12 @@ def run(run_date: str | None = None) -> None:
             pos["daily_return_pct"] = 0.0
             pos["daily_return_usd"] = 0.0
 
+        # Dividend attribution: today's accrued dividend for this ticker vs
+        # yesterday's snapshot. Delta is the day's dividend income (or its
+        # reversal when paid to cash). Flows into position α instead of
+        # leaking into the cash residual.
+        _apply_dividend_delta(pos, prior_pos, prior_price, shares)
+
         # Alpha contribution: (weight * position_return) - (weight * SPY_return)
         weight = mv / nav if nav else 0
         pos_spy = spy_return if spy_return is not None else 0
@@ -487,11 +531,15 @@ def run(run_date: str | None = None) -> None:
         else:
             interest_usd = 0.0
 
-        # Dividends: filled in by Phase 2 (per-ticker attribution). For now,
-        # any dividend cash flow lands in `unattributed` and is flagged.
+        # Dividends earned today (accrual increase) are already added into
+        # each position's daily_return_usd, so they flow through total_day_usd.
+        # Payout-day cash inflow is exactly offset by accrual drop in IB's
+        # NetLiquidation, so NAV doesn't move from the payout itself — no
+        # reconciliation term needed. dividend_usd here is informational
+        # only, summing positive accrual deltas for the email.
         dividend_usd = sum(p.get("dividend_usd", 0.0) for p in positions.values())
 
-        unattributed_usd = total_nav_change - total_day_usd - interest_usd - dividend_usd
+        unattributed_usd = total_nav_change - total_day_usd - interest_usd
         nav_reconciliation = {
             "nav_change_usd": total_nav_change,
             "position_pnl_usd": total_day_usd,
