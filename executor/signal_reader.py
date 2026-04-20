@@ -149,6 +149,77 @@ def _warn_if_stale(signals_date: str | None, run_date: str | None) -> None:
         )
 
 
+class UnscoredBuyCandidatesError(RuntimeError):
+    """Raised when signals.json has buy_candidates that are missing from
+    predictions.json — the GBM veto gate is structurally unreachable for
+    those tickers, so sizing positions would route around a risk control.
+
+    Self-healing should happen upstream (weekday Step Function's coverage-gap
+    Choice state re-invokes predictor with --tickers). This error is the
+    read-time defense-in-depth backstop: if the gap reaches the executor, we
+    refuse to trade rather than bypass the veto.
+    """
+    def __init__(self, missing: list[str], n_buy: int, n_preds: int):
+        self.missing = missing
+        self.n_buy = n_buy
+        self.n_preds = n_preds
+        super().__init__(
+            f"Coverage gap: {len(missing)} of {n_buy} buy_candidate(s) "
+            f"not present in predictions.json (which has {n_preds} tickers). "
+            f"Missing: {', '.join(missing)}. "
+            "Refusing to size positions — GBM veto gate is unreachable for "
+            "these tickers. Re-run predictor with --tickers to close the gap."
+        )
+
+
+def _emit_unscored_count_metric(count: int) -> None:
+    """Emit CloudWatch metric AlphaEngine/Predictor/unscored_buy_candidates_count.
+
+    Best-effort; never raises. The hard-fail (UnscoredBuyCandidatesError) is
+    the functional guard — this metric + CloudWatch alarm is the long-term
+    guard against the self-healing mechanism silently regressing.
+    """
+    try:
+        cw = boto3.client("cloudwatch")
+        cw.put_metric_data(
+            Namespace="AlphaEngine/Predictor",
+            MetricData=[{
+                "MetricName": "unscored_buy_candidates_count",
+                "Value": float(count),
+                "Unit": "Count",
+            }],
+        )
+    except Exception as exc:  # noqa: BLE001 — observability, must never block trading path
+        logger.warning("CloudWatch metric emission failed: %s", exc)
+
+
+def assert_predictions_cover_buy_candidates(
+    signals: dict,
+    predictions_by_ticker: dict,
+) -> None:
+    """Verify every buy_candidate has a prediction row. Raise on gap.
+
+    Always emits the `unscored_buy_candidates_count` CloudWatch metric (even
+    with value 0) so alarm baselines are continuous.
+    """
+    buy = signals.get("buy_candidates") or []
+    buy_tickers = {
+        (e.get("ticker") or "").upper()
+        for e in buy if isinstance(e, dict) and e.get("ticker")
+    }
+    pred_tickers = {
+        (t or "").upper() for t in (predictions_by_ticker or {}).keys()
+    }
+    missing = sorted(buy_tickers - pred_tickers)
+    _emit_unscored_count_metric(len(missing))
+    if missing:
+        raise UnscoredBuyCandidatesError(
+            missing=missing,
+            n_buy=len(buy_tickers),
+            n_preds=len(pred_tickers),
+        )
+
+
 def get_actionable_signals(signals: dict) -> dict:
     """
     Filter signals to actionable entries by signal type.
