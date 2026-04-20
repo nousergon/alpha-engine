@@ -276,6 +276,17 @@ def _read_signals(
     else:
         predictions_by_ticker = {}
 
+    # Coverage guard: every buy_candidate must have a prediction row, otherwise
+    # the GBM veto gate is structurally unreachable for that ticker and we'd
+    # be sizing positions around a risk control. Skip in simulate mode (no
+    # live trading, predictions intentionally empty). The weekday Step Function
+    # coverage-gap Choice state is the self-healing mechanism; this guard is
+    # read-time defense-in-depth. Always emits CloudWatch metric (value 0 on
+    # success) so the alarm baseline is continuous.
+    if not simulate:
+        from executor.signal_reader import assert_predictions_cover_buy_candidates
+        assert_predictions_cover_buy_candidates(signals_raw, predictions_by_ticker)
+
     logger.info(
         f"Signals | regime={signals['market_regime']} "
         f"| ENTER={len(signals['enter'])} EXIT={len(signals['exit'])} "
