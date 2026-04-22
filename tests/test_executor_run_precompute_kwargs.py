@@ -71,6 +71,19 @@ def test_run_has_vwap_map_kwarg():
     assert sig.parameters["vwap_map"].default is None
 
 
+def test_run_has_coverage_map_kwarg():
+    """Mirrors atr_map/vwap_map — required to skip load_feature_coverage's
+    per-call ArcticDB read in backtest mode. Removing this kwarg would
+    reintroduce the 2026-04-22 13:27 PT timeout where the simulate loop
+    hit ``universe.read(ticker)`` once per enter_ticker per combo for
+    the coverage-aware sizer."""
+    sig = inspect.signature(executor_main.run)
+    assert "coverage_map" in sig.parameters, (
+        "executor.main.run must accept coverage_map kwarg."
+    )
+    assert sig.parameters["coverage_map"].default is None
+
+
 # ── Gating contract ─────────────────────────────────────────────────────────
 
 
@@ -119,6 +132,28 @@ def test_vwap_map_injection_skips_arctic_read():
     )
 
 
+def test_coverage_map_injection_skips_arctic_read():
+    """The ``load_feature_coverage`` call must be nested inside a
+    ``coverage_map is None`` branch — otherwise the backtester's
+    precomputed map is ignored and every simulate call re-reads
+    ArcticDB (the 2026-04-22 13:27 PT timeout root cause)."""
+    src = _source()
+    assert "if coverage_map is None:" in src, (
+        "Missing `if coverage_map is None:` gate around "
+        "load_feature_coverage."
+    )
+
+    lines = src.splitlines()
+    gate_idx = next(
+        i for i, ln in enumerate(lines) if "if coverage_map is None:" in ln
+    )
+    block = "\n".join(lines[gate_idx:gate_idx + 12])
+    assert "load_feature_coverage(" in block, (
+        "load_feature_coverage call must live inside the "
+        "`coverage_map is None` branch."
+    )
+
+
 def test_atr_load_not_called_outside_gate():
     """There must be exactly ONE load_atr_14_pct call site in
     executor/main.py (the gated one). A second unguarded call would
@@ -155,6 +190,48 @@ def test_vwap_load_not_called_outside_gate():
         f"Expected exactly 1 load_daily_vwap call site; "
         f"found {len(call_lines)}."
     )
+
+
+def test_coverage_load_call_sites_all_gated():
+    """``load_feature_coverage`` has two legitimate call sites in main.py:
+      1. ``_read_signals`` — admission gate, already gated by
+         ``if not simulate:`` so backtest skips it.
+      2. The sizing-derate block in ``run`` — must be gated by
+         ``if coverage_map is None:`` so the backtester kwarg injection
+         can skip it.
+
+    A third unguarded call would restore the pre-2026-04-22 13:27 PT
+    timeout. The count-of-2 check is brittle against legit refactors —
+    we instead assert each individual call has a guarded parent
+    context by walking backward for the nearest ``if`` / ``def`` line.
+    """
+    src = _source()
+    lines = src.splitlines()
+    call_lines = [
+        i for i, ln in enumerate(lines)
+        if "load_feature_coverage(" in ln
+        and not ln.strip().startswith("#")
+        and not ln.strip().startswith('"""')
+        and "import" not in ln
+        and "from executor" not in ln
+    ]
+    assert len(call_lines) >= 1, "load_feature_coverage call site missing."
+
+    # Each call must have a nearby `if not simulate` or
+    # `if coverage_map is None` guard above it in the same function.
+    for i in call_lines:
+        # Walk back up to 30 lines looking for a gate.
+        window = "\n".join(lines[max(0, i - 30):i + 1])
+        gated = (
+            "if not simulate" in window
+            or "if coverage_map is None:" in window
+        )
+        assert gated, (
+            f"load_feature_coverage call at line {i+1} is not inside any "
+            f"`if not simulate` or `if coverage_map is None:` guard — "
+            f"will bypass the backtester kwarg injection and restore the "
+            f"2026-04-22 per-call ArcticDB regression."
+        )
 
 
 # ── Precedence test: injected value survives ────────────────────────────────

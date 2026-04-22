@@ -919,8 +919,9 @@ def run(
     signals_override: dict = None,  # injected signals dict (skips S3 read)
     price_histories: dict = None,   # injected by backtester for exit manager
     config_override: dict = None,   # injected by backtester param sweep
-    atr_map: dict | None = None,    # injected by backtester to skip per-call ArcticDB read
-    vwap_map: dict | None = None,   # injected by backtester to skip per-call ArcticDB read
+    atr_map: dict | None = None,      # injected by backtester to skip per-call ArcticDB read
+    vwap_map: dict | None = None,     # injected by backtester to skip per-call ArcticDB read
+    coverage_map: dict | None = None, # injected by backtester to skip per-call ArcticDB read
 ) -> list[dict] | None:
     """
     Returns list of order dicts when simulate=True, else None.
@@ -1189,14 +1190,23 @@ def run(
         # the hard floor; everything reaching here should have coverage
         # ≥ min_coverage_for_admission. Scoped to enter_tickers only —
         # held positions aren't sized via this path.
+        #
+        # ``coverage_map`` kwarg mirrors the atr_map / vwap_map injection
+        # pattern (PR #91) — backtester precomputes once per simulate
+        # pipeline, skipping per-call ``universe.read(ticker)`` round-
+        # trips that timed out the 2026-04-22 Saturday SF dry-run after
+        # the coverage-aware-sizing PR merged. Live trading passes
+        # coverage_map=None and takes the load_feature_coverage path
+        # unchanged.
         enter_tickers = [s["ticker"] for s in signals.get("enter", [])]
-        if enter_tickers and config.get("coverage_sizing_enabled", True):
-            coverage_map = load_feature_coverage(
-                tickers=enter_tickers,
-                signals_bucket=signals_bucket,
-            )
-        else:
-            coverage_map = {}
+        if coverage_map is None:
+            if enter_tickers and config.get("coverage_sizing_enabled", True):
+                coverage_map = load_feature_coverage(
+                    tickers=enter_tickers,
+                    signals_bucket=signals_bucket,
+                )
+            else:
+                coverage_map = {}
 
         # Single source of truth for ATR across the executor. Replaces per-call-site
         # _compute_atr(ticker_hist) invocations (position sizing, pullback-trigger
