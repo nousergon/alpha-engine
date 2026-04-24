@@ -560,6 +560,13 @@ def _plan_entries(
             ob.add_entry({
                 "ticker": ticker,
                 "signal": "ENTER",
+                # signal_date links each pending entry back to the signals.json
+                # file it originated from. Threaded to log_trade() at fill time
+                # as `signal_trading_day` so backtester ↔ live parity can match
+                # by signal cohort (DATE_CONVENTIONS.md). `run_date` here is
+                # the date returned by _read_signals — already the signal's
+                # trading_day per research's stamping convention.
+                "signal_date": run_date,
                 "shares": sizing["shares"],
                 "current_price": current_price,
                 "dollar_size": sizing["dollar_size"],

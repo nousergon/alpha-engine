@@ -1020,6 +1020,12 @@ def _execute_entry(
         "trigger_type": trigger_reason,
         "spy_price_at_order": _spy_now,
         "slippage_vs_signal": _slippage,
+        # Date-convention dual-tracking. trading_day is the last completed
+        # NYSE session at fill time (populated by log_trade fallback if
+        # omitted); signal_trading_day links back to the signals.json that
+        # originated this entry — threaded through OrderBook from main.py's
+        # _read_signals(). See alpha-engine-docs/private/DATE_CONVENTIONS.md.
+        "signal_trading_day": entry.get("signal_date"),
     })
 
     # Mark entry as executed in order book
