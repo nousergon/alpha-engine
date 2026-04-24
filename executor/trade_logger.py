@@ -64,6 +64,16 @@ _TRADES_MIGRATIONS = [
     "ALTER TABLE trades ADD COLUMN realized_alpha_pct REAL",
     "ALTER TABLE trades ADD COLUMN days_held INTEGER",
     "ALTER TABLE trades ADD COLUMN slippage_vs_signal REAL",
+    # ── Date-convention dual-tracking (2026-04-24) ──
+    # See alpha-engine-docs/private/DATE_CONVENTIONS.md. Every trade-related
+    # artifact pairs calendar_date (existing `date`/`created_at` audit columns)
+    # with a trading_day (NYSE last-completed-session attribution) and, where
+    # applicable, the signal_trading_day that originated the trade. Both new
+    # columns are nullable so backfill on existing rows is a separate one-shot
+    # script (scripts/backfill_trading_day.py) and old log_trade() callers
+    # without the new context keep working as NULLs.
+    "ALTER TABLE trades ADD COLUMN trading_day TEXT",
+    "ALTER TABLE trades ADD COLUMN signal_trading_day TEXT",
 ]
 
 _EOD_MIGRATIONS = [
@@ -149,6 +159,22 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
     All other keys are optional.
     """
     trade_id = str(uuid.uuid4())
+    # If trading_day not provided by the caller, derive it from the
+    # date-convention helper so legacy call sites that haven't been migrated
+    # yet still get a populated trading_day rather than NULL. See
+    # alpha-engine-docs/private/DATE_CONVENTIONS.md for the rule
+    # (trading_day = last_closed_trading_day(now), strictly backward-looking).
+    # signal_trading_day stays NULL by default — only entry trades originating
+    # from a known signals.json populate it.
+    trading_day = trade.get("trading_day")
+    if trading_day is None:
+        try:
+            from alpha_engine_lib.dates import now_dual
+            trading_day = now_dual().trading_day
+        except Exception:
+            # Lib not yet bumped on this deploy — leave NULL. Backfill script
+            # closes the gap. Don't hard-fail on a missing optional dep.
+            trading_day = None
     conn.execute(
         """
         INSERT INTO trades (
@@ -162,8 +188,8 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
             entry_trade_id, signal_price, trigger_price, trigger_type,
             spy_price_at_order, realized_pnl, realized_return_pct,
             spy_return_during_hold, realized_alpha_pct, days_held,
-            slippage_vs_signal, created_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            slippage_vs_signal, trading_day, signal_trading_day, created_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             trade_id,
@@ -203,6 +229,8 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
             trade.get("realized_alpha_pct"),
             trade.get("days_held"),
             trade.get("slippage_vs_signal"),
+            trading_day,
+            trade.get("signal_trading_day"),
             datetime.now(timezone.utc).isoformat(),
         ),
     )
