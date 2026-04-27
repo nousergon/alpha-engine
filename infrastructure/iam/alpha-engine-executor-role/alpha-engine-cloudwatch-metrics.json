@@ -1,0 +1,16 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "PutAlphaEngineMetrics",
+            "Effect": "Allow",
+            "Action": "cloudwatch:PutMetricData",
+            "Resource": "*",
+            "Condition": {
+                "StringLike": {
+                    "cloudwatch:namespace": "AlphaEngine/*"
+                }
+            }
+        }
+    ]
+}
