@@ -406,265 +406,69 @@ def _plan_entries(
     dry_run: bool,
     simulate: bool,
 ) -> tuple[int, list[dict], list[dict]]:
-    """Process ENTER signals through momentum gate, sizing, risk guard.
+    """Live-shell wrapper around ``executor.deciders.decide_entries``.
 
-    Returns (n_entered, orders_if_simulating, blocked_entries).
-    blocked_entries is a list of {"ticker": str, "reason": str} for transparency.
+    Resolves ``prices_now`` from the IB / sim client, calls the pure
+    decider, and dispatches results:
+      * simulate: ``ibkr.place_market_order`` per accepted entry to
+        accumulate sim_client position state across dates.
+      * live (not simulate, not dry_run): ``ob.add_entry`` per
+        ``entries_with_meta`` to write the daemon's order book.
+      * dry_run: log only, no side effects.
+
+    Returns the (n_entered, orders, blocked) tuple for back-compat with
+    callers that pre-date the deciders extraction.
     """
-    orders = []
-    n_entered = 0
-    blocked: list[dict] = []
+    from executor.deciders import decide_entries
 
+    # Resolve prices_now from IB/sim client up-front so the decider is
+    # broker-agnostic. For each enter signal we need the price; we
+    # also tolerate missing prices (the decider treats them as
+    # "no price available — skip").
+    prices_now: dict[str, float] = {}
     for sig in enter_signals:
-        ticker = sig["ticker"]
-        sector = sig.get("sector", "Technology")
-        sector_info = sector_ratings.get(sector, {})
-        sector_rating_str = sector_info.get("rating", "market_weight")
-
-        # Common context for shadow book logging
-        _shadow_base = {
-            "ticker": ticker,
-            "date": run_date,
-            "sector": sector,
-            "sector_rating": sector_rating_str,
-            "research_score": sig.get("score"),
-            "conviction": sig.get("conviction"),
-            "market_regime": market_regime,
-            "portfolio_nav": portfolio_nav,
-        }
-
-        if ticker in current_positions:
-            logger.info(f"SKIP ENTER {ticker} — already in portfolio")
-            blocked.append({**_shadow_base, "block_reason": "already in portfolio"})
+        t = sig.get("ticker")
+        if not t:
             continue
+        p = ibkr.get_current_price(t)
+        if p is not None:
+            prices_now[t] = p
 
-        # Momentum confirmation gate
-        if config.get("momentum_gate_enabled", True) and price_histories:
-            ticker_history = price_histories.get(ticker)
-            if ticker_history is not None and len(ticker_history) >= 21:
-                close = ticker_history["close"]
-                momentum_20d = (float(close.iloc[-1]) / float(close.iloc[-21]) - 1) * 100
-                mom_threshold = config.get("momentum_gate_threshold", -5.0)
-                if momentum_20d < mom_threshold:
-                    reason = f"momentum gate: 20d={momentum_20d:.1f}% < {mom_threshold}%"
-                    logger.info(f"SKIP ENTER {ticker} — {reason}")
-                    blocked.append({**_shadow_base, "block_reason": reason})
-                    continue
+    plan = decide_entries(
+        enter_signals=enter_signals,
+        signals_raw=signals_raw,
+        predictions_by_ticker=predictions_by_ticker,
+        config=config,
+        strategy_config=strategy_config,
+        market_regime=market_regime,
+        sector_ratings=sector_ratings,
+        portfolio_nav=portfolio_nav,
+        peak_nav=peak_nav,
+        current_positions=current_positions,
+        prices_now=prices_now,
+        price_histories=price_histories,
+        atr_map=atr_map,
+        vwap_map=vwap_map,
+        coverage_map=coverage_map,
+        dd_multiplier=dd_multiplier,
+        signal_age_days=signal_age_days,
+        earnings_by_ticker=earnings_by_ticker,
+        run_date=run_date,
+    )
 
-        # Earnings proximity warning
-        earnings_warning_days = config.get("earnings_proximity_warning_days", 2)
-        pred_data = predictions_by_ticker.get(ticker, {})
-        next_earnings_days = earnings_by_ticker.get(ticker) or pred_data.get("next_earnings_days") or sig.get("next_earnings_days")
-        if next_earnings_days is not None and next_earnings_days <= earnings_warning_days:
-            logger.warning(
-                f"EARNINGS WARNING: {ticker} reports in {next_earnings_days} day(s) — "
-                f"entering before earnings carries elevated event risk"
-            )
+    # Dispatch decisions to side-effecting layer.
+    if simulate:
+        # Accumulate sim_client position state for next-iteration
+        # already-held check. See plan.orders comment in deciders.py.
+        for o in plan.orders:
+            if o["action"] == "ENTER":
+                ibkr.place_market_order(o["ticker"], "BUY", o["shares"])
+    elif not dry_run:
+        # Live: persist each entry-with-meta to the daemon's order book.
+        for entry in plan.entries_with_meta:
+            ob.add_entry(entry)
 
-        current_price = ibkr.get_current_price(ticker)
-        if not current_price:
-            logger.warning(f"SKIP ENTER {ticker} — no price available")
-            blocked.append({**_shadow_base, "block_reason": "no price available"})
-            continue
-
-        # Read ATR % from the feature-store map (load_atr_14_pct in main()).
-        # Previously computed inline via _compute_atr(ticker_history); switched
-        # to the feature-store value 2026-04-16 so executor and predictor use
-        # the same ATR definition. atr_map is guaranteed populated for every
-        # enter_signal ticker by load_atr_14_pct's hard-fail contract.
-        atr_pct = atr_map.get(ticker) if config.get("atr_sizing_enabled", True) else None
-
-        # Get prediction confidence for confidence-weighted sizing
-        pred_confidence = pred_data.get("prediction_confidence")
-
-        sizing = compute_position_size(
-            ticker=ticker,
-            portfolio_nav=portfolio_nav,
-            enter_signals=enter_signals,
-            signal=sig,
-            sector_rating=sector_rating_str,
-            current_price=current_price,
-            config=config,
-            drawdown_multiplier=dd_multiplier,
-            atr_pct=atr_pct,
-            prediction_confidence=pred_confidence,
-            p_up=pred_data.get("p_up"),
-            signal_age_days=signal_age_days,
-            days_to_earnings=earnings_by_ticker.get(ticker),
-            feature_coverage=coverage_map.get(ticker),
-        )
-
-        if sizing["shares"] == 0:
-            logger.info(
-                f"SKIP ENTER {ticker} — shares round to 0 "
-                f"(weight={sizing['position_pct']:.3f}, dollar=${sizing['dollar_size']:.0f}, "
-                f"price=${current_price:.2f})"
-            )
-            blocked.append({
-                **_shadow_base, "block_reason": f"shares round to 0 (${sizing['dollar_size']:.0f} / ${current_price:.2f})",
-                "current_price": current_price, "intended_position_pct": sizing["position_pct"],
-                "intended_dollars": sizing["dollar_size"],
-                "predicted_direction": pred_data.get("predicted_direction"),
-                "prediction_confidence": pred_data.get("prediction_confidence"),
-            })
-            continue
-
-        # GBM veto check
-        pred_data = predictions_by_ticker.get(ticker, {})
-        if pred_data.get("gbm_veto"):
-            reason = f"GBM veto: α={pred_data.get('predicted_alpha', 0):.2%}, rank={pred_data.get('combined_rank')}"
-            logger.info(f"VETO {ticker} — {reason}")
-            blocked.append({
-                **_shadow_base, "block_reason": reason,
-                "current_price": current_price,
-                "intended_position_pct": sizing["position_pct"],
-                "intended_shares": sizing["shares"],
-                "intended_dollars": sizing["dollar_size"],
-                "predicted_direction": pred_data.get("predicted_direction"),
-                "prediction_confidence": pred_data.get("prediction_confidence"),
-            })
-            continue
-
-        # Inject sector_rating into signal for risk guard
-        sig_with_sector = {**sig, "sector_rating": sector_rating_str}
-
-        approved, reason = check_order(
-            ticker=ticker,
-            action="ENTER",
-            dollar_size=sizing["dollar_size"],
-            portfolio_nav=portfolio_nav,
-            peak_nav=peak_nav,
-            current_positions=current_positions,
-            sector=sector,
-            market_regime=market_regime,
-            signal=sig_with_sector,
-            config=config,
-            price_histories=price_histories,
-        )
-
-        if not approved:
-            logger.info(f"BLOCKED {ticker} — {reason}")
-            blocked.append({
-                **_shadow_base, "block_reason": reason,
-                "current_price": current_price,
-                "intended_position_pct": sizing["position_pct"],
-                "intended_shares": sizing["shares"],
-                "intended_dollars": sizing["dollar_size"],
-                "predicted_direction": pred_data.get("predicted_direction"),
-                "prediction_confidence": pred_data.get("prediction_confidence"),
-            })
-            continue
-
-        logger.info(
-            f"{'[DRY RUN] ' if dry_run else ''}ORDER ENTER {ticker} "
-            f"{sizing['shares']} shares @ ~${current_price:.2f} "
-            f"(${sizing['dollar_size']:.0f}, {sizing['position_pct']*100:.1f}% NAV)"
-        )
-
-        n_entered += 1
-        if simulate:
-            # Accumulate position state on the simulated client so the
-            # held-position guard above (line ~392 "SKIP ENTER ... already
-            # in portfolio") fires correctly on subsequent simulate dates.
-            # Without this, sim_client._positions stays empty across every
-            # signal date and the backtester re-ENTERs already-held tickers
-            # — the parity over-shoot pattern observed 2026-04-25 (bt=86 vs
-            # live=55, the extra bt orders were all currently-held names).
-            ibkr.place_market_order(ticker, "BUY", sizing["shares"])
-            orders.append({
-                "date": run_date,
-                "ticker": ticker,
-                "action": "ENTER",
-                "shares": sizing["shares"],
-                "price_at_order": current_price,
-                "portfolio_nav_at_order": portfolio_nav,
-                "position_pct": sizing["position_pct"],
-                "research_score": sig.get("score"),
-                "research_conviction": sig.get("conviction"),
-                "research_rating": sig.get("rating"),
-                "sector_rating": sector_rating_str,
-                "market_regime": market_regime,
-                "price_target_upside": sig.get("price_target_upside"),
-                "thesis_summary": sig.get("thesis_summary"),
-            })
-        elif not dry_run:
-            # Write approved entry to order book — daemon executes via technical triggers.
-            # ATR sourced from feature-store atr_map (load_atr_14_pct) — single source
-            # of truth across executor. atr_dollar = atr_pct × current_price so the
-            # trailing-stop calculation downstream (bracket_orders.py) keeps its dollar
-            # semantics. Pullback threshold scales by atr_pct so high-vol and low-vol
-            # names each get a trigger calibrated to their own realized volatility.
-            ticker_hist = (price_histories or {}).get(ticker)
-            ticker_atr_pct = atr_map.get(ticker)
-            # atr_map is populated for every enter_signal ticker by load_atr_14_pct's
-            # hard-fail contract — if ticker is missing here the morning planner
-            # would have aborted earlier. Treat the key-miss as an internal assertion.
-            if ticker_atr_pct is None:
-                raise RuntimeError(
-                    f"atr_map missing {ticker} at order-book write — load_atr_14_pct "
-                    "contract violated. Abort rather than ship an entry with a bogus "
-                    "zero ATR."
-                )
-            atr_dollar = ticker_atr_pct * current_price
-            pullback_atr_mult = strategy_config.get("intraday_pullback_atr_multiple", 1.0)
-            scaled_pullback_pct = ticker_atr_pct * pullback_atr_mult
-
-            pred = predictions_by_ticker.get(ticker, {})
-            ob.add_entry({
-                "ticker": ticker,
-                "signal": "ENTER",
-                # signal_date links each pending entry back to the signals.json
-                # file it originated from. Threaded to log_trade() at fill time
-                # as `signal_trading_day` so backtester ↔ live parity can match
-                # by signal cohort (DATE_CONVENTIONS.md). `run_date` here is
-                # the date returned by _read_signals — already the signal's
-                # trading_day per research's stamping convention.
-                "signal_date": run_date,
-                "shares": sizing["shares"],
-                "current_price": current_price,
-                "dollar_size": sizing["dollar_size"],
-                "position_pct": sizing["position_pct"],
-                "atr_value": atr_dollar,
-                "atr_pct": ticker_atr_pct,
-                "triggers": {
-                    # Per-ticker ATR-scaled pullback. Formerly a flat 0.02 (2%)
-                    # that was too tight for low-vol names like KO (ATR ~0.8%,
-                    # pullback never fires) and too loose for high-vol like RKLB
-                    # (ATR ~5%, pullback fires on noise). Now each name gets a
-                    # threshold = pullback_atr_multiple × its own ATR(14).
-                    "pullback_pct": scaled_pullback_pct,
-                    "pullback_atr_multiple": pullback_atr_mult,
-                    "atr_pct": ticker_atr_pct,
-                    "vwap_discount": strategy_config.get("intraday_vwap_discount_pct", 0.005),
-                    "vwap": vwap_map.get(ticker),
-                    "support_level": _compute_support_level(ticker_hist, strategy_config),
-                },
-                "research_score": sig.get("score"),
-                "research_conviction": sig.get("conviction"),
-                "research_rating": sig.get("rating"),
-                "sector_rating": sector_rating_str,
-                "market_regime": market_regime,
-                "price_target_upside": sig.get("price_target_upside"),
-                "thesis_summary": sig.get("thesis_summary"),
-                "predicted_direction": pred.get("predicted_direction"),
-                "prediction_confidence": pred.get("prediction_confidence"),
-                "predicted_alpha": pred.get("predicted_alpha"),
-                "sizing_factors": {
-                    "sector_adj": sizing.get("sector_adj"),
-                    "conviction_adj": sizing.get("conviction_adj"),
-                    "upside_adj": sizing.get("upside_adj"),
-                    "dd_multiplier": sizing.get("dd_multiplier"),
-                    "atr_adj": sizing.get("atr_adj"),
-                    "confidence_adj": sizing.get("confidence_adj"),
-                    "staleness_adj": sizing.get("staleness_adj"),
-                    "earnings_adj": sizing.get("earnings_adj"),
-                },
-            })
-
-    if len(enter_signals) > 0 and n_entered == 0:
-        logger.warning("All %d ENTER signals blocked by risk guard", len(enter_signals))
-
-    return n_entered, orders, blocked
+    return plan.n_entered, plan.orders, plan.blocked
 
 
 def _plan_exits_and_reduces(
@@ -681,149 +485,63 @@ def _plan_exits_and_reduces(
     dry_run: bool,
     simulate: bool,
 ) -> list[dict]:
-    """Process EXIT and REDUCE signals, write urgent exits to order book.
+    """Live-shell wrapper around ``executor.deciders.decide_exits_and_reduces``.
 
-    Returns orders list (populated only when simulating).
+    Resolves prices_now from IB / sim client, calls the pure decider,
+    and dispatches results to side-effecting layer:
+      * simulate: ``ibkr.place_market_order(SELL)`` per accepted exit/reduce
+      * live: ``ob.add_urgent_exit`` per ``urgent_exits_with_meta``
+      * dry_run: log only
+
+    Returns the orders list (populated in simulate mode for accumulator).
     """
-    orders = []
+    from executor.deciders import decide_exits_and_reduces
 
-    # ── EXIT signals (Research + Strategy) ───────────────────────
-    all_exit_tickers = set()
-    all_exits = []
-    for sig in signals["exit"]:
-        t = sig["ticker"]
-        if t not in all_exit_tickers:
-            all_exit_tickers.add(t)
-            all_exits.append(sig)
-    for strat_sig in strategy_exits:
-        if strat_sig["action"] == "EXIT" and strat_sig["ticker"] not in all_exit_tickers:
-            all_exit_tickers.add(strat_sig["ticker"])
-            all_exits.append(strat_sig)
+    # Tickers we may need a price for (held positions referenced by
+    # exit / reduce signals). Resolve via ibkr; missing prices fall
+    # back to avg_cost inside the decider.
+    candidate_tickers: set[str] = set()
+    for sig in signals.get("exit", []) + signals.get("reduce", []):
+        t = sig.get("ticker")
+        if t:
+            candidate_tickers.add(t)
+    for sig in strategy_exits:
+        t = sig.get("ticker")
+        if t:
+            candidate_tickers.add(t)
 
-    for sig in all_exits:
-        ticker = sig["ticker"]
-        if ticker not in current_positions:
-            logger.info(f"SKIP EXIT {ticker} — not in portfolio")
+    prices_now: dict[str, float] = {}
+    for t in candidate_tickers:
+        if t not in current_positions:
             continue
+        p = ibkr.get_current_price(t)
+        if p is not None:
+            prices_now[t] = p
 
-        shares_held = int(current_positions[ticker]["shares"])
-        reason_tag = f" ({sig.get('reason', 'research')})" if sig.get("reason") else ""
-        logger.info(f"{'[DRY RUN] ' if dry_run else ''}ORDER EXIT {ticker} {shares_held} shares{reason_tag}")
+    plan = decide_exits_and_reduces(
+        signals=signals,
+        strategy_exits=strategy_exits,
+        current_positions=current_positions,
+        prices_now=prices_now,
+        predictions_by_ticker=predictions_by_ticker,
+        config=config,
+        market_regime=market_regime,
+        portfolio_nav=portfolio_nav,
+        run_date=run_date,
+    )
 
-        if simulate:
-            current_price = ibkr.get_current_price(ticker)
-            if current_price is None:
-                current_price = current_positions[ticker].get("avg_cost", 0)
-            # Match ENTER simulate path — propagate state to sim_client so
-            # downstream sim dates see the EXITed position as gone.
-            ibkr.place_market_order(ticker, "SELL", shares_held)
-            orders.append({
-                "date": run_date,
-                "ticker": ticker,
-                "action": "EXIT",
-                "shares": shares_held,
-                "price_at_order": current_price,
-                "portfolio_nav_at_order": portfolio_nav,
-                "position_pct": 0.0,
-                "research_score": sig.get("score"),
-                "research_conviction": sig.get("conviction"),
-                "research_rating": sig.get("rating"),
-                "sector_rating": current_positions[ticker].get("sector", ""),
-                "market_regime": market_regime,
-                "exit_reason": sig.get("reason"),
-            })
-        elif not dry_run:
-            pred = predictions_by_ticker.get(ticker, {})
-            ob.add_urgent_exit({
-                "ticker": ticker,
-                "signal": "EXIT",
-                "shares": shares_held,
-                "reason": sig.get("reason", "research_signal"),
-                "detail": sig.get("detail", ""),
-                "research_score": sig.get("score"),
-                "research_conviction": sig.get("conviction"),
-                "research_rating": sig.get("rating"),
-                "sector_rating": current_positions[ticker].get("sector", ""),
-                "market_regime": market_regime,
-                "predicted_direction": pred.get("predicted_direction"),
-                "prediction_confidence": pred.get("prediction_confidence"),
-                "predicted_alpha": pred.get("predicted_alpha"),
-            })
+    if simulate:
+        # Apply orders to sim_client so position state carries to next sim date.
+        for o in plan.orders:
+            if o["action"] == "EXIT":
+                ibkr.place_market_order(o["ticker"], "SELL", o["shares"])
+            elif o["action"] == "REDUCE":
+                ibkr.place_market_order(o["ticker"], "SELL", o["shares"])
+    elif not dry_run:
+        for entry in plan.urgent_exits_with_meta:
+            ob.add_urgent_exit(entry)
 
-    # ── REDUCE signals (Research + Strategy) ─────────────────────
-    all_reduce_tickers = set()
-    all_reduces = []
-    for sig in signals["reduce"]:
-        t = sig["ticker"]
-        if t not in all_reduce_tickers:
-            all_reduce_tickers.add(t)
-            all_reduces.append(sig)
-    for strat_sig in strategy_exits:
-        if strat_sig["action"] == "REDUCE" and strat_sig["ticker"] not in all_reduce_tickers:
-            if strat_sig["ticker"] not in all_exit_tickers:
-                all_reduce_tickers.add(strat_sig["ticker"])
-                all_reduces.append(strat_sig)
-
-    for sig in all_reduces:
-        ticker = sig["ticker"]
-        if ticker not in current_positions:
-            continue
-
-        shares_held = int(current_positions[ticker]["shares"])
-        reduce_frac = config.get("reduce_fraction", 0.50)
-        shares_to_sell = int(shares_held * reduce_frac)
-        if shares_to_sell == 0:
-            logger.info(f"SKIP REDUCE {ticker} — position too small to reduce")
-            continue
-
-        reason_tag = f" ({sig.get('reason', 'research')})" if sig.get("reason") else ""
-        logger.info(
-            f"{'[DRY RUN] ' if dry_run else ''}ORDER REDUCE {ticker} "
-            f"{shares_to_sell} shares ({reduce_frac:.0%} reduction){reason_tag}"
-        )
-
-        if simulate:
-            current_price = ibkr.get_current_price(ticker)
-            if current_price is None:
-                current_price = current_positions[ticker].get("avg_cost", 0)
-            remaining_value = (shares_held - shares_to_sell) * (current_price or 0)
-            # Match ENTER/EXIT simulate paths — partial sell on sim_client
-            # so the position's reduced shares carry to the next sim date.
-            ibkr.place_market_order(ticker, "SELL", shares_to_sell)
-            orders.append({
-                "date": run_date,
-                "ticker": ticker,
-                "action": "REDUCE",
-                "shares": shares_to_sell,
-                "price_at_order": current_price,
-                "portfolio_nav_at_order": portfolio_nav,
-                "position_pct": remaining_value / portfolio_nav if portfolio_nav else 0,
-                "research_score": sig.get("score"),
-                "research_conviction": sig.get("conviction"),
-                "research_rating": sig.get("rating"),
-                "sector_rating": current_positions[ticker].get("sector", ""),
-                "market_regime": market_regime,
-                "exit_reason": sig.get("reason"),
-            })
-        elif not dry_run:
-            pred = predictions_by_ticker.get(ticker, {})
-            ob.add_urgent_exit({
-                "ticker": ticker,
-                "signal": "REDUCE",
-                "shares": shares_to_sell,
-                "reason": sig.get("reason", "research_signal"),
-                "detail": sig.get("detail", ""),
-                "research_score": sig.get("score"),
-                "research_conviction": sig.get("conviction"),
-                "research_rating": sig.get("rating"),
-                "sector_rating": current_positions[ticker].get("sector", ""),
-                "market_regime": market_regime,
-                "predicted_direction": pred.get("predicted_direction"),
-                "prediction_confidence": pred.get("prediction_confidence"),
-                "predicted_alpha": pred.get("predicted_alpha"),
-            })
-
-    return orders
+    return plan.orders
 
 
 def _write_order_book_summary(
