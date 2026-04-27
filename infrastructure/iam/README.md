@@ -26,6 +26,11 @@ is the inline policy name on that role.
   (`ae-trading`) and any executor processes assuming it. 9 inline policies
   as of 2026-04-27. Trust policy + role creation are NOT managed here
   (out of scope for the flat-file approach).
+- **`github-actions-iam-drift-check`** — assumed by GitHub Actions via
+  OIDC for the daily IAM-drift-check workflow. Single inline policy
+  granting `iam:ListRolePolicies` + `iam:GetRolePolicy` scoped to the
+  roles this directory manages. Trust policy: `repo:cipher813/alpha-engine`
+  (main + pull_request).
 
 ## Out of scope (not codified here)
 
@@ -59,15 +64,31 @@ wiping policies whose JSON file was deleted in a stale checkout).
 
 ## Drift detection
 
-There is no automated drift detector in this repo today. To check whether
-any role's inline policies have drifted from this directory:
+`check-drift.py` diffs the codified state against AWS for every role
+directory under `infrastructure/iam/`. It checks both:
+
+- **Set drift**: every `.json` file matches an inline policy on the role,
+  and vice versa.
+- **Content drift**: per-policy document equality after JSON normalization.
 
 ```bash
-aws iam list-role-policies --role-name alpha-engine-executor-role
+# Local
+./infrastructure/iam/check-drift.py
+./infrastructure/iam/check-drift.py --role alpha-engine-executor-role
 ```
 
-The set of returned policy names should match the set of `.json` files in
-`alpha-engine-executor-role/`.
+Exit code 0 = clean, 1 = drift detected, 2 = AWS CLI error or invalid
+source JSON.
+
+In CI, `.github/workflows/iam-drift-check.yml` runs the same script:
+
+- On every PR that touches `infrastructure/iam/**` (catches code changes
+  that forgot to apply, or applies that forgot to commit)
+- Daily at 09:30 UTC (catches out-of-band manual IAM edits)
+- Manually via `workflow_dispatch`
+
+Auth uses OIDC via the `github-actions-iam-drift-check` role (read-only:
+`iam:ListRolePolicies` + `iam:GetRolePolicy` on the codified roles only).
 
 ## When you add a new inline policy
 
