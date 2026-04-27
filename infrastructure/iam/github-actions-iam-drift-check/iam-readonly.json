@@ -1,0 +1,17 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "ReadCodifiedRoles",
+            "Effect": "Allow",
+            "Action": [
+                "iam:ListRolePolicies",
+                "iam:GetRolePolicy"
+            ],
+            "Resource": [
+                "arn:aws:iam::711398986525:role/alpha-engine-executor-role",
+                "arn:aws:iam::711398986525:role/github-actions-iam-drift-check"
+            ]
+        }
+    ]
+}
