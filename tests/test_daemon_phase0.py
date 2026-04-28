@@ -247,3 +247,77 @@ class TestCleanupConnections:
         monitor = MagicMock()
         _cleanup_connections(monitor, None)
         monitor.unsubscribe_all.assert_called_once()
+
+
+# ── _trigger_eod_pipeline ────────────────────────────────────────────────────
+# Daemon shutdown is the canonical trigger for the alpha-engine-eod-pipeline
+# Step Function. PR #94 (2026-04-22) removed this trigger and kept the
+# systemd timer; PR #117 (2026-04-28) retired the systemd timer; this test
+# locks the trigger code in place so a future "let's clean this up" doesn't
+# re-introduce the SF-orphaned regression that lasted from 4/22 to 4/28.
+
+
+class TestTriggerEodPipeline:
+    def test_calls_step_functions_start_execution(self):
+        from executor.daemon import _trigger_eod_pipeline
+
+        with patch("boto3.client") as mock_boto:
+            sfn = MagicMock()
+            mock_boto.return_value = sfn
+            _trigger_eod_pipeline(
+                {"sns_topic_arn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts"},
+                "2026-04-29",
+            )
+            sfn.start_execution.assert_called_once()
+            kwargs = sfn.start_execution.call_args.kwargs
+            assert "alpha-engine-eod-pipeline" in kwargs["stateMachineArn"]
+            assert kwargs["name"].startswith("eod-2026-04-29-")
+
+    def test_input_payload_shape(self):
+        """Input must include trading_instance_id (array — SF SSM step expects
+        it) + sns_topic_arn (HandleFailure publish target)."""
+        import json
+
+        from executor.daemon import _trigger_eod_pipeline
+
+        with patch("boto3.client") as mock_boto:
+            sfn = MagicMock()
+            mock_boto.return_value = sfn
+            _trigger_eod_pipeline(
+                {"sns_topic_arn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts"},
+                "2026-04-29",
+            )
+            payload = json.loads(sfn.start_execution.call_args.kwargs["input"])
+            assert isinstance(payload["trading_instance_id"], list)
+            assert payload["trading_instance_id"][0].startswith("i-")
+            assert payload["sns_topic_arn"].startswith("arn:aws:sns:")
+            assert payload["run_date"] == "2026-04-29"
+            assert payload["triggered_by"] == "daemon_shutdown"
+
+    def test_failure_is_non_fatal(self):
+        """Daemon's finally block must not crash if SF start fails. The
+        trigger logs a WARN and returns; SF-side failures surface via SNS
+        HandleFailure and flow-doctor when the SF eventually fires."""
+        from executor.daemon import _trigger_eod_pipeline
+
+        with patch("boto3.client") as mock_boto:
+            sfn = MagicMock()
+            sfn.start_execution.side_effect = RuntimeError("transient IAM hiccup")
+            mock_boto.return_value = sfn
+            # Must NOT raise — the daemon shutdown path can't tolerate an
+            # exception out of this trigger.
+            _trigger_eod_pipeline({}, "2026-04-29")
+
+    def test_uses_default_sns_topic_when_config_missing(self):
+        """`_trigger_eod_pipeline({}, ...)` must still produce a valid
+        input — the default SNS topic ARN is hardcoded as fallback."""
+        import json
+
+        from executor.daemon import _trigger_eod_pipeline
+
+        with patch("boto3.client") as mock_boto:
+            sfn = MagicMock()
+            mock_boto.return_value = sfn
+            _trigger_eod_pipeline({}, "2026-04-29")
+            payload = json.loads(sfn.start_execution.call_args.kwargs["input"])
+            assert "alpha-engine-alerts" in payload["sns_topic_arn"]
