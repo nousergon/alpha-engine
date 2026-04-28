@@ -29,6 +29,7 @@ from executor.trade_logger import (
     init_db, log_eod, backup_to_s3, get_entry_trade, get_todays_trades,
 )
 
+from alpha_engine_lib.dates import now_dual
 from alpha_engine_lib.logging import setup_logging
 # See executor/main.py for the rationale on IB Error 10197 / 10349 suppression.
 _FLOW_DOCTOR_EXCLUDE_PATTERNS = [r"Error 10197", r"Error 10349"]
@@ -336,9 +337,29 @@ def _apply_dividend_delta(
 
 
 def run(run_date: str | None = None) -> None:
-    run_date = run_date or str(date.today())
+    today_trading_day = now_dual().trading_day
+    if run_date is None:
+        run_date = today_trading_day
+        logger.info(
+            "EOD reconciliation | date=%s (resolved from now_dual().trading_day)",
+            run_date,
+        )
+    else:
+        if run_date != today_trading_day:
+            raise RuntimeError(
+                f"EOD reconciliation refusing run_date={run_date!r} "
+                f"!= today's trading_day {today_trading_day!r}. "
+                f"Historical reruns are unsafe: get_account_snapshot() returns "
+                f"current live IB state which would be written against the "
+                f"historical row, corrupting the prior_nav chain. "
+                f"For SPY-only corrections use infrastructure/backfill_eod_pnl_spy.py; "
+                f"a --from-snapshot mode for full historical reconstruction is owed."
+            )
+        logger.info(
+            "EOD reconciliation | date=%s (explicit; matches today's trading_day)",
+            run_date,
+        )
     _health_start = _time.time()
-    logger.info(f"EOD reconciliation | date={run_date}")
 
     config = load_config()
 
@@ -879,4 +900,20 @@ def run(run_date: str | None = None) -> None:
 
 
 if __name__ == "__main__":
-    run()
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "EOD reconciliation. Defaults to today's trading_day "
+            "(via alpha_engine_lib.dates.now_dual). Hard-fails on any "
+            "explicit --date that isn't today: live IB state would corrupt "
+            "the historical row's NAV/positions."
+        )
+    )
+    parser.add_argument(
+        "--date",
+        default=None,
+        help="YYYY-MM-DD; must equal today's trading_day or the run aborts.",
+    )
+    args = parser.parse_args()
+    run(run_date=args.date)

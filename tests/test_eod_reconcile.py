@@ -1,5 +1,7 @@
 """Unit tests for executor.eod_reconcile — P&L math and data helpers."""
 import json
+import sys
+from types import SimpleNamespace
 import pytest
 from unittest.mock import patch, MagicMock
 from io import BytesIO
@@ -9,6 +11,7 @@ from executor.eod_reconcile import (
     _load_signals_from_s3,
     _load_predictions_from_s3,
     _build_position_contexts,
+    run,
 )
 
 
@@ -371,3 +374,93 @@ class TestPnLMath:
         spy_prior_close = 445.0
         spy_return = (spy_price / spy_prior_close - 1) * 100
         assert spy_return == pytest.approx(1.1235955, rel=1e-4)
+
+
+# ── run_date gating ──────────────────────────────────────────────────────────
+# Historical reruns are unsafe: get_account_snapshot() always returns current
+# live IB state, which would be written against the historical row and
+# corrupt the prior_nav chain. The gate hard-fails before any IBKR call.
+
+
+class TestRunDateGating:
+    def test_explicit_past_date_raises(self):
+        """run(run_date=<yesterday>) must raise before any IB connection."""
+        with patch("executor.eod_reconcile.now_dual") as mock_now_dual:
+            mock_now_dual.return_value = SimpleNamespace(
+                trading_day="2026-04-28", calendar_date="2026-04-28"
+            )
+            with pytest.raises(RuntimeError, match="Historical reruns are unsafe"):
+                run(run_date="2026-04-27")
+
+    def test_explicit_future_date_raises(self):
+        """A future-dated rerun is also a mismatch and must raise."""
+        with patch("executor.eod_reconcile.now_dual") as mock_now_dual:
+            mock_now_dual.return_value = SimpleNamespace(
+                trading_day="2026-04-28", calendar_date="2026-04-28"
+            )
+            with pytest.raises(RuntimeError, match="refusing run_date"):
+                run(run_date="2026-04-29")
+
+    def test_error_message_names_both_dates(self):
+        """Error message must include both the requested and resolved dates
+        so the operator can immediately see what was rejected."""
+        with patch("executor.eod_reconcile.now_dual") as mock_now_dual:
+            mock_now_dual.return_value = SimpleNamespace(
+                trading_day="2026-04-28", calendar_date="2026-04-28"
+            )
+            with pytest.raises(RuntimeError) as exc:
+                run(run_date="2026-04-25")
+            msg = str(exc.value)
+            assert "2026-04-25" in msg
+            assert "2026-04-28" in msg
+            assert "backfill_eod_pnl_spy.py" in msg  # points operator to safe path
+
+    def test_default_resolves_to_now_dual_trading_day(self, monkeypatch, tmp_path):
+        """run() with no run_date resolves via now_dual().trading_day, not
+        date.today() (which would be UTC on ae-trading and could drift past
+        midnight Pacific)."""
+        # Patch now_dual + bail out at the first IO boundary (load_config) so
+        # we don't need to mock the full IB/S3/SQLite plumbing — the gate
+        # check fires before any of that.
+        with patch("executor.eod_reconcile.now_dual") as mock_now_dual, \
+             patch("executor.eod_reconcile.load_config") as mock_cfg:
+            mock_now_dual.return_value = SimpleNamespace(
+                trading_day="2026-04-28", calendar_date="2026-04-28"
+            )
+            mock_cfg.side_effect = RuntimeError("expected_test_sentinel")
+            # The fact that it reaches load_config (and not the historical
+            # gate) confirms run_date resolved to today.
+            with pytest.raises(RuntimeError, match="expected_test_sentinel"):
+                run(run_date=None)
+
+    def test_explicit_today_succeeds_past_gate(self):
+        """Explicit --date matching today's trading_day is permitted."""
+        with patch("executor.eod_reconcile.now_dual") as mock_now_dual, \
+             patch("executor.eod_reconcile.load_config") as mock_cfg:
+            mock_now_dual.return_value = SimpleNamespace(
+                trading_day="2026-04-28", calendar_date="2026-04-28"
+            )
+            mock_cfg.side_effect = RuntimeError("expected_test_sentinel")
+            # Same as above: reaches load_config means gate accepted today.
+            with pytest.raises(RuntimeError, match="expected_test_sentinel"):
+                run(run_date="2026-04-28")
+
+    def test_cli_date_flag_forwards_to_run(self):
+        """`python eod_reconcile.py --date YYYY-MM-DD` invokes run(run_date=...)."""
+        argv = ["eod_reconcile.py", "--date", "2026-04-25"]
+        with patch.object(sys, "argv", argv):
+            import argparse
+
+            parser = argparse.ArgumentParser()
+            parser.add_argument("--date", default=None)
+            args = parser.parse_args(argv[1:])
+            assert args.date == "2026-04-25"
+
+    def test_cli_no_args_passes_none(self):
+        """No --date passes None, which run() resolves via now_dual."""
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--date", default=None)
+        args = parser.parse_args([])
+        assert args.date is None
