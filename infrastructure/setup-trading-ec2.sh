@@ -7,7 +7,6 @@
 #
 # Prerequisites:
 #   - Amazon Linux 2023 AMI
-#   - ~/.netrc with GitHub PAT (for git pull)
 #   - ~/.alpha-engine.env with secrets (GMAIL_APP_PASSWORD, ANTHROPIC_API_KEY,
 #     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 #   - IB Gateway + IBC installed at ~/ibgateway and ~/ibc
@@ -33,25 +32,6 @@ if [ ! -d ".venv" ]; then
     echo "Creating virtualenv..."
     python3.11 -m venv .venv
 fi
-
-# ── 2a. Configure git URL rewrite for private alpha-engine-lib ──────────────
-# requirements.txt pins alpha-engine-lib from a private GitHub repo. pip
-# needs an HTTPS auth path to clone it. The PAT lives in SSM at
-# /alpha-engine/lib-token (SecureString); the EC2 instance role
-# alpha-engine-executor-role grants ssm:GetParameter on /alpha-engine/*.
-# Local shell var scope only; never exported, never logged. boot-pull.sh
-# refreshes the same insteadOf rewrite on every boot so a ~/.gitconfig
-# reset or fresh EBS recovers automatically.
-echo "Fetching alpha-engine-lib PAT from SSM..."
-AE_LIB_TOKEN=$(aws ssm get-parameter --name /alpha-engine/lib-token --with-decryption --query 'Parameter.Value' --output text --region us-east-1 2>/dev/null || echo "")
-if [ -z "$AE_LIB_TOKEN" ]; then
-    echo "ERROR: ssm:/alpha-engine/lib-token unreadable — required to pip install private alpha-engine-lib" >&2
-    echo "       Create with: aws ssm put-parameter --name /alpha-engine/lib-token --type SecureString --value <PAT> --region us-east-1" >&2
-    echo "       PAT must have Contents:read on cipher813/alpha-engine-lib." >&2
-    exit 1
-fi
-git config --global url."https://x-access-token:${AE_LIB_TOKEN}@github.com/cipher813/alpha-engine-lib".insteadOf "https://github.com/cipher813/alpha-engine-lib"
-unset AE_LIB_TOKEN
 
 echo "Installing dependencies..."
 .venv/bin/pip install --quiet --upgrade pip
