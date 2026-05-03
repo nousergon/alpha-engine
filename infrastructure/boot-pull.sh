@@ -15,25 +15,6 @@ log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
 
 log "=== boot-pull started ==="
 
-# ── Configure git auth for private alpha-engine-lib ──────────────────────────
-# requirements.txt in alpha-engine / alpha-engine-backtester pins
-# alpha-engine-lib from a private GitHub repo. pip install needs an HTTPS
-# auth path to clone it.
-#
-# The PAT lives in SSM as /alpha-engine/lib-token (SecureString). The EC2
-# instance role alpha-engine-executor-role grants ssm:GetParameter on
-# /alpha-engine/*. Fetching on every boot is idempotent and survives a
-# fresh EBS or ~/.gitconfig reset. Local shell var scope only; never
-# exported, never logged.
-AE_LIB_TOKEN=$(aws ssm get-parameter --name /alpha-engine/lib-token --with-decryption --query 'Parameter.Value' --output text --region us-east-1 2>/dev/null || echo "")
-if [ -n "$AE_LIB_TOKEN" ]; then
-    git config --global url."https://x-access-token:${AE_LIB_TOKEN}@github.com/cipher813/alpha-engine-lib".insteadOf "https://github.com/cipher813/alpha-engine-lib"
-    log "OK   git insteadOf rewrite configured for alpha-engine-lib (ssm:/alpha-engine/lib-token)"
-else
-    log "FAIL ssm:/alpha-engine/lib-token unreadable — pip install of alpha-engine-lib will fail"
-fi
-unset AE_LIB_TOKEN
-
 REPOS=(
     /home/ec2-user/alpha-engine-config
     /home/ec2-user/alpha-engine

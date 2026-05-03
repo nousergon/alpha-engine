@@ -15,13 +15,9 @@ arcticdb~=6.12
 anthropic~=0.40
 exchange-calendars~=4.5
 requests~=2.32
-# alpha-engine-lib provides setup_logging + BasePreflight. Executor
-# passes exclude_patterns=[r"Error 10197", r"Error 10349"] to suppress
-# benign IB Gateway noise (10197 = iOS app steals live-data session,
-# 10349 = TIF coerced to DAY per order preset — order still placed).
-# See daemon.py / main.py / eod_reconcile.py.
-# Private repo — pip install needs ALPHA_ENGINE_LIB_TOKEN:
-#   CI: .github/workflows/ci.yml wires a git URL insteadOf rewrite.
-#   EC2: ~/.netrc covers github.com with a PAT that has Contents:read
-#        on alpha-engine-lib (confirm via git ls-remote before deploy).
+# alpha-engine-lib provides setup_logging + BasePreflight. Executor passes
+# exclude_patterns=[r"Error 10197", r"Error 10349"] to suppress benign IB
+# Gateway noise (10197 = iOS app steals live-data session, 10349 = TIF
+# coerced to DAY per order preset — order still placed). See daemon.py /
+# main.py / eod_reconcile.py.
 alpha-engine-lib[flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.2.2
