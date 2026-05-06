@@ -39,6 +39,27 @@ logger = logging.getLogger(__name__)
 from executor.config_loader import load_config
 
 
+def _compute_unattributed_residual_pct(
+    unattributed_usd: float | None,
+    nav: float | None,
+) -> float | None:
+    """Headline metric for the *P&L attribution* row of the Phase 2
+    transparency-inventory: ``unattributed_usd / portfolio_nav × 100``.
+
+    Returns None when either input is None or when nav is zero/falsy
+    (a divide-by-zero protection — a NAV of 0 means we can't compute a
+    meaningful residual % regardless of the dollar amount).
+
+    The inventory gate is ≤1%. Sign is preserved — a negative value
+    means position-pnl + interest exceeded the actual NAV change
+    (typically an unaccounted fee). Consumers should compare on
+    absolute value when alarming.
+    """
+    if unattributed_usd is None or not nav:
+        return None
+    return (unattributed_usd / nav) * 100.0
+
+
 def _spy_close(run_date: str, config: dict | None = None) -> float:
     """Fetch SPY close for run_date from ArcticDB macro library.
 
@@ -660,6 +681,18 @@ def run(run_date: str | None = None) -> None:
     # reads this snapshot via closing_price (same source as today's
     # daily_closes), closing the source-mismatch gap that was causing NAV
     # residuals to land in cash.
+    #
+    # Phase 2 transparency-inventory: persist the NAV-reconciliation
+    # waterfall (nav_change / position_pnl / interest / dividend /
+    # unattributed) and the headline residual % as named fields. Closes
+    # the *P&L attribution* row in the gate checklist — until now these
+    # values existed in logs + the email body but weren't queryable from
+    # eod_pnl.csv. nav_reconciliation can be {} when prior_nav is None
+    # (first-ever EOD run); .get() defaults to None for those columns.
+    unattributed_for_log = nav_reconciliation.get("unattributed_usd")
+    unattributed_pct_for_log = _compute_unattributed_residual_pct(
+        unattributed_for_log, nav,
+    )
     log_eod(conn, {
         "date": run_date,
         "portfolio_nav": nav,
@@ -672,6 +705,12 @@ def run(run_date: str | None = None) -> None:
         "accrued_interest": account.get("accrued_interest"),
         "unrealized_pnl": account.get("unrealized_pnl"),
         "realized_pnl": account.get("realized_pnl"),
+        "nav_change_usd": nav_reconciliation.get("nav_change_usd"),
+        "position_pnl_usd": nav_reconciliation.get("position_pnl_usd"),
+        "interest_usd": nav_reconciliation.get("interest_usd"),
+        "dividend_usd": nav_reconciliation.get("dividend_usd"),
+        "unattributed_usd": unattributed_for_log,
+        "unattributed_residual_pct": unattributed_pct_for_log,
     })
 
     # ── Sector attribution ──────────────────────────────────────────────────

@@ -99,6 +99,19 @@ _EOD_MIGRATIONS = [
     "ALTER TABLE eod_pnl ADD COLUMN accrued_interest REAL",
     "ALTER TABLE eod_pnl ADD COLUMN unrealized_pnl REAL",
     "ALTER TABLE eod_pnl ADD COLUMN realized_pnl REAL",
+    # Phase 2 transparency-inventory: per-day P&L attribution lineage.
+    # Closes the *P&L attribution* row in the gate checklist by
+    # publishing the previously log-only NAV-reconciliation breakdown
+    # as named columns. The headline metric is unattributed_residual_pct
+    # = unattributed_usd / portfolio_nav × 100; the inventory gate is
+    # ≤1%. The other columns ride along so a downstream reader can
+    # reconstruct the attribution waterfall without re-running reconcile.
+    "ALTER TABLE eod_pnl ADD COLUMN nav_change_usd REAL",
+    "ALTER TABLE eod_pnl ADD COLUMN position_pnl_usd REAL",
+    "ALTER TABLE eod_pnl ADD COLUMN interest_usd REAL",
+    "ALTER TABLE eod_pnl ADD COLUMN dividend_usd REAL",
+    "ALTER TABLE eod_pnl ADD COLUMN unattributed_usd REAL",
+    "ALTER TABLE eod_pnl ADD COLUMN unattributed_residual_pct REAL",
 ]
 
 CREATE_SHADOW_BOOK_TABLE = """
@@ -413,7 +426,15 @@ def log_risk_event(conn: sqlite3.Connection, event: dict) -> str:
 
 
 def log_eod(conn: sqlite3.Connection, eod: dict) -> None:
-    """Insert or replace an EOD P&L record."""
+    """Insert or replace an EOD P&L record.
+
+    Phase 2 transparency-inventory adds 6 attribution fields:
+      - nav_change_usd, position_pnl_usd, interest_usd, dividend_usd
+      - unattributed_usd  (the residual after attribution)
+      - unattributed_residual_pct  (residual / NAV × 100, the inventory's
+                                    headline metric — gate is ≤1%)
+    All optional for back-compat with legacy callers.
+    """
     import json
     conn.execute(
         """
@@ -421,8 +442,10 @@ def log_eod(conn: sqlite3.Connection, eod: dict) -> None:
             (date, portfolio_nav, daily_return_pct, spy_return_pct,
              daily_alpha_pct, positions_snapshot, spy_close,
              total_cash, accrued_interest, unrealized_pnl, realized_pnl,
+             nav_change_usd, position_pnl_usd, interest_usd, dividend_usd,
+             unattributed_usd, unattributed_residual_pct,
              created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             eod["date"],
@@ -436,6 +459,12 @@ def log_eod(conn: sqlite3.Connection, eod: dict) -> None:
             eod.get("accrued_interest"),
             eod.get("unrealized_pnl"),
             eod.get("realized_pnl"),
+            eod.get("nav_change_usd"),
+            eod.get("position_pnl_usd"),
+            eod.get("interest_usd"),
+            eod.get("dividend_usd"),
+            eod.get("unattributed_usd"),
+            eod.get("unattributed_residual_pct"),
             datetime.now(timezone.utc).isoformat(),
         ),
     )
