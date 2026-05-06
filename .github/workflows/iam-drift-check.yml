@@ -1,13 +1,18 @@
 name: IAM Drift Check
 
-# Catches drift between codified inline policies under
-# infrastructure/iam/<role>/<policy>.json and the live state on AWS.
+# Catches two regression classes for codified IAM under
+# infrastructure/iam/<role>/<policy>.json:
+#
+#   1. drift between codified state and live AWS state
+#      (check-drift.py — needs OIDC read access to AWS IAM)
+#   2. foreign writers in sibling repos that bypass codification
+#      (check-no-foreign-writers.py — pure source scan, no AWS auth)
 #
 # Triggers:
-#   - Every PR that touches infrastructure/iam/** (so reviewers see drift
-#     before merge if a code change forgot to apply, or an apply forgot
-#     to commit)
-#   - Daily at 09:30 UTC (catches out-of-band manual IAM edits)
+#   - Every PR that touches infrastructure/iam/** (catches code changes
+#     that forgot to apply, or applies that forgot to commit, before merge)
+#   - Daily at 09:30 UTC (catches out-of-band manual IAM edits + new
+#     foreign writers landed in sibling repos)
 #   - Manual via workflow_dispatch
 #
 # AWS auth: OIDC → github-actions-iam-drift-check role (read-only:
@@ -38,5 +43,29 @@ jobs:
           role-to-assume: arn:aws:iam::711398986525:role/github-actions-iam-drift-check
           aws-region: us-east-1
 
-      - name: Run IAM drift check
+      - name: Run IAM drift check (codified vs live AWS)
         run: python3 infrastructure/iam/check-drift.py
+
+  foreign-writers-check:
+    runs-on: ubuntu-latest
+    # No AWS access — pure source scan across sibling repos.
+    steps:
+      - name: Checkout alpha-engine
+        uses: actions/checkout@v4
+        with:
+          path: alpha-engine
+
+      - name: Checkout sibling repos
+        run: |
+          set -e
+          for repo in alpha-engine-data alpha-engine-research alpha-engine-predictor \
+                      alpha-engine-backtester alpha-engine-dashboard alpha-engine-lib; do
+            git clone --depth=1 https://github.com/cipher813/${repo}.git ${repo} || \
+              echo "WARN: ${repo} not cloneable (private/archived?) — skipping"
+          done
+
+      - name: Run foreign-writers check across all sibling repos
+        run: |
+          cd alpha-engine
+          python3 infrastructure/iam/check-no-foreign-writers.py \
+            $(for d in ../alpha-engine*; do [ -d "$d" ] && echo --repo "$d"; done)
