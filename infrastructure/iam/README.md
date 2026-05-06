@@ -80,7 +80,7 @@ codified here, delete the file AND run `aws iam delete-role-policy` manually
 (removal is not yet automated to avoid an `apply.sh` invocation accidentally
 wiping policies whose JSON file was deleted in a stale checkout).
 
-## Drift detection
+## Drift detection (codified vs live AWS)
 
 `check-drift.py` diffs the codified state against AWS for every role
 directory under `infrastructure/iam/`. It checks both:
@@ -98,15 +98,45 @@ directory under `infrastructure/iam/`. It checks both:
 Exit code 0 = clean, 1 = drift detected, 2 = AWS CLI error or invalid
 source JSON.
 
-In CI, `.github/workflows/iam-drift-check.yml` runs the same script:
+## Foreign-writer detection (multi-writer regressions)
 
-- On every PR that touches `infrastructure/iam/**` (catches code changes
-  that forgot to apply, or applies that forgot to commit)
-- Daily at 09:30 UTC (catches out-of-band manual IAM edits)
-- Manually via `workflow_dispatch`
+`check-no-foreign-writers.py` enforces the **single-writer rule**: each
+codified role must have exactly one writer (`apply.sh` in this repo).
+Any deploy script in any sibling repo that calls `aws iam put-role-policy`
+against a codified role name is a regression risk and fails the check.
 
-Auth uses OIDC via the `github-actions-iam-drift-check` role (read-only:
-`iam:ListRolePolicies` + `iam:GetRolePolicy` on the codified roles only).
+This catches the regression class behind 4 IAM-clobber incidents in two
+months (EB-SFN role 2026-04-21 + 2026-05-04 + 2026-05-06; SF role
+2026-05-04 EOD + 2026-05-06 morning). All four had the same shape: a
+codified policy with `apply.sh` as the sanctioned writer + a stale
+inline `put-role-policy` block in `alpha-engine-data` deploy scripts.
+Whichever ran last won.
+
+```bash
+# Local — scans this repo + all sibling alpha-engine-* repos that exist
+./infrastructure/iam/check-no-foreign-writers.py
+
+# Scope to a single repo
+./infrastructure/iam/check-no-foreign-writers.py --repo ~/Development/alpha-engine-data
+```
+
+Exit code 0 = clean, 1 = foreign writer detected.
+
+## CI integration
+
+`.github/workflows/iam-drift-check.yml` runs both checks:
+
+- **Drift check** — needs OIDC AWS read access. Compares codified to live.
+- **Foreign-writers check** — pure source scan, clones every sibling
+  alpha-engine-* repo and greps for `put-role-policy` against codified
+  role names. No AWS auth needed.
+
+Triggers: every PR touching `infrastructure/iam/**`, daily at 09:30 UTC,
+manual `workflow_dispatch`.
+
+Auth (drift-check only): OIDC via the `github-actions-iam-drift-check`
+role (read-only: `iam:ListRolePolicies` + `iam:GetRolePolicy` on the
+codified roles).
 
 ## When you add a new inline policy
 
