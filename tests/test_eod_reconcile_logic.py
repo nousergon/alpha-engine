@@ -8,10 +8,46 @@ import pytest
 
 from executor.eod_reconcile import (
     _apply_dividend_delta,
+    _compute_unattributed_residual_pct,
     _load_constituents_sector_map,
     _resolve_prior_price,
     _synthesize_rationales,
 )
+
+
+class TestComputeUnattributedResidualPct:
+    """Phase 2 transparency-inventory headline metric: residual P&L
+    not attributable to position MTM, interest, or dividends, expressed
+    as % of NAV. Inventory gate is ≤1%."""
+
+    def test_typical_small_residual(self):
+        # $50 unattributed on $100,000 NAV → 0.05%
+        assert _compute_unattributed_residual_pct(50.0, 100_000.0) == pytest.approx(0.05)
+
+    def test_breaches_one_percent_gate(self):
+        # $1,500 unattributed on $100,000 NAV → 1.5% > 1% gate
+        result = _compute_unattributed_residual_pct(1_500.0, 100_000.0)
+        assert result == pytest.approx(1.5)
+        assert abs(result) > 1.0  # the alarm condition
+
+    def test_zero_residual_returns_zero(self):
+        assert _compute_unattributed_residual_pct(0.0, 100_000.0) == 0.0
+
+    def test_negative_residual_preserves_sign(self):
+        # Position pnl + interest exceeded actual NAV change (unaccounted fee)
+        assert _compute_unattributed_residual_pct(-105.0, 100_000.0) == pytest.approx(-0.105)
+
+    def test_none_unattributed_returns_none(self):
+        """First-ever EOD run has no prior_nav → nav_reconciliation is {}
+        → unattributed_usd is None. Persist NULL, not 0 — they mean
+        different things."""
+        assert _compute_unattributed_residual_pct(None, 100_000.0) is None
+
+    def test_zero_nav_returns_none_not_div_by_zero(self):
+        assert _compute_unattributed_residual_pct(50.0, 0.0) is None
+
+    def test_none_nav_returns_none(self):
+        assert _compute_unattributed_residual_pct(50.0, None) is None
 
 
 class TestResolvePriorPrice:
