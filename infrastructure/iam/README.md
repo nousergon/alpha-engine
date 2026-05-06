@@ -156,3 +156,5 @@ codified roles).
 The flat-file approach is intentionally low-ceremony — if the blast radius
 grows (cross-account, multiple roles per service, complex trust-policy
 state), migrate to CloudFormation/Terraform.
+
+<!-- ci-trigger after alpha-engine-data#172 merged -->
