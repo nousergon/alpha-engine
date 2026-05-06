@@ -1,9 +1,10 @@
-# IAM policies (alpha-engine executor)
+# IAM policies (alpha-engine — module-specific roles)
 
-Source-of-truth for the inline IAM policies on the executor's IAM roles.
-Mirrors the `alpha-engine-data` codification pattern (one JSON file per
-inline policy + an `apply.sh` runner) with a directory-per-role layout
-since the executor role has multiple inline policies.
+Source-of-truth for the inline IAM policies on this repo's IAM roles.
+Module-specific roles only — cross-cutting orchestration roles
+(SF execution role, EventBridge cron role, GitHub Actions Lambda
+deploy role) live in `alpha-engine-data/infrastructure/iam/` because
+their grants are derived from code that lives there.
 
 ## Layout
 
@@ -28,27 +29,29 @@ is the inline policy name on that role.
   `alpha-engine-ssm-read`, which already had the superset of actions).
   Trust policy + role creation are NOT managed here (out of scope for the
   flat-file approach).
-- **`alpha-engine-step-functions-role`** — assumed by all three Step
-  Functions (`alpha-engine-saturday-pipeline`, `alpha-engine-weekday-pipeline`,
-  `alpha-engine-eod-pipeline`). One consolidated inline policy granting
-  Lambda invoke, SSM run, EC2 start/stop on the trading instance, SNS
-  publish, and CloudWatch Logs delivery. Codified 2026-05-04 after an
-  asymmetric `ec2:StartInstances` / `ec2:StopInstances` grant let the EOD
-  SF stall on `StopTradingInstance` for an entire afternoon.
-- **`alpha-engine-eventbridge-sfn-role`** — assumed by EventBridge to
-  start the saturday + weekday SFN executions on cron. One inline policy
-  granting `states:StartExecution` on both state machine ARNs. Codified
-  2026-05-06 after a third recurrence of the same regression: the
-  `alpha-engine-data` deploy scripts each contained an inline
-  `aws iam put-role-policy` against this role, but only the weekday
-  script listed both ARNs — the saturday script overwrote the policy
-  with the saturday ARN alone, dropping weekday's grant. Inline blocks
-  are removed from those scripts; `apply.sh` is the only writer now.
 - **`github-actions-iam-drift-check`** — assumed by GitHub Actions via
   OIDC for the daily IAM-drift-check workflow. Single inline policy
-  granting `iam:ListRolePolicies` + `iam:GetRolePolicy` scoped to the
-  roles this directory manages. Trust policy: `repo:cipher813/alpha-engine`
-  (main + pull_request).
+  granting `iam:ListRolePolicies` + `iam:GetRolePolicy` scoped to every
+  codified role across alpha-engine + alpha-engine-data + alpha-engine-predictor.
+  Trust policy: `repo:cipher813/alpha-engine` + `repo:cipher813/alpha-engine-data`
+  (main + pull_request); widened 2026-05-06 to support alpha-engine-data's
+  drift-check workflow when the cross-cutting orchestration roles moved
+  to that repo.
+
+## Roles owned elsewhere
+
+| Role | Home repo | Why there |
+|---|---|---|
+| `alpha-engine-step-functions-role` | `alpha-engine-data` | Grants reflect the Lambdas the SF JSON invokes + EC2 instances it SSMs + the trading instance it starts/stops — all defined in `alpha-engine-data/infrastructure/`. |
+| `alpha-engine-eventbridge-sfn-role` | `alpha-engine-data` | Grants reflect which SFs the EventBridge cron rules target — same source repo. |
+| `github-actions-lambda-deploy` | `alpha-engine-data` | Cross-cutting; assumed by Lambda deploy workflows in multiple repos. |
+| `alpha-engine-predictor-role` | `alpha-engine-predictor` | Predictor Lambda's execution role. |
+
+Each repo has its own `apply.sh` + `check-drift.py` scoped to its own
+codified roles. The foreign-writer guard (`check-no-foreign-writers.py`)
+in this directory scans every sibling repo for codified-role writes
+that bypass the home repo's `apply.sh`, regardless of where the role
+is codified.
 
 ## Out of scope (not codified here)
 

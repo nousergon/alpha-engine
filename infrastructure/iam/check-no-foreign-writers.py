@@ -49,13 +49,46 @@ SCAN_EXTENSIONS = {".sh", ".yaml", ".yml", ".py", ".tf"}
 SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", "build", "dist"}
 
 
-def _codified_roles() -> set[str]:
-    """Return the set of role names codified under this directory."""
-    return {p.name for p in SCRIPT_DIR.iterdir() if p.is_dir()}
+def _codified_roles_in_repo(iam_dir: Path) -> set[str]:
+    """Return the set of role names codified under one repo's iam dir.
+
+    Handles both layouts in use across alpha-engine repos:
+      - directory-per-role: alpha-engine/infrastructure/iam/<role>/<policy>.json
+      - flat one-file-per-role: alpha-engine-data/infrastructure/iam/<role>.json
+    """
+    if not iam_dir.is_dir():
+        return set()
+
+    roles: set[str] = set()
+    for entry in iam_dir.iterdir():
+        if entry.is_dir():
+            # directory-per-role layout
+            roles.add(entry.name)
+        elif entry.is_file() and entry.suffix == ".json":
+            # flat one-file-per-role layout
+            roles.add(entry.stem)
+    return roles
+
+
+def _all_codified_roles(repo_roots: list[Path]) -> dict[str, Path]:
+    """Map role-name → home-repo across every scanned repo's iam dir."""
+    home: dict[str, Path] = {}
+    for repo in repo_roots:
+        iam_dir = repo / "infrastructure" / "iam"
+        for role in _codified_roles_in_repo(iam_dir):
+            home[role] = repo
+    return home
 
 
 def _scan_file(path: Path, role_names: set[str]) -> list[str]:
-    """Return list of (role_name, line_no, snippet) tuples flagged in this file."""
+    """Return list of findings for this file.
+
+    Logic: if the file contains BOTH (a) a write-API call (put-role-policy
+    or equivalent) and (b) a literal mention of a codified role name —
+    in non-comment lines — flag it. File-scope rather than line-window:
+    deploy scripts often declare `ROLE_NAME=...` at the top and call
+    put-role-policy with a `$ROLE_NAME` reference far below.
+    """
     findings: list[str] = []
     try:
         text = path.read_text(errors="replace")
@@ -73,23 +106,35 @@ def _scan_file(path: Path, role_names: set[str]) -> list[str]:
     ]
     write_re = re.compile("|".join(write_patterns))
 
-    # Skip pure comment lines for languages where leading `#` (sh, py, yaml)
-    # or `//` (terraform) is the comment marker. The check is about real
-    # code paths, not docstrings or commit-message-style banners.
+    # Skip pure comment lines (sh, py, yaml: `#`; tf, js: `//`).
     comment_re = re.compile(r"^\s*(#|//)")
 
+    write_lines: list[tuple[int, str]] = []
+    code_lines: list[str] = []
     for lineno, line in enumerate(text.splitlines(), 1):
         if comment_re.match(line):
             continue
-        if not write_re.search(line):
-            continue
-        # The match is a write — figure out which role(s) appear in
-        # nearby context (same line or lookahead window).
-        window_start = max(0, lineno - 5)
-        window = "\n".join(text.splitlines()[window_start:lineno + 5])
-        for role in role_names:
-            if role in window:
-                findings.append(f"{path}:{lineno}: writes codified role '{role}'\n    {line.strip()[:120]}")
+        code_lines.append(line)
+        if write_re.search(line):
+            write_lines.append((lineno, line))
+
+    if not write_lines:
+        return findings
+
+    # We have at least one non-comment write call. Now check if any codified
+    # role name appears anywhere in the non-comment portion of the file.
+    code_text = "\n".join(code_lines)
+    matched_roles = [role for role in role_names if role in code_text]
+    if not matched_roles:
+        return findings
+
+    # Report each (write line × matched role) pair.
+    for write_lineno, write_line in write_lines:
+        for role in matched_roles:
+            findings.append(
+                f"{path}:{write_lineno}: writes codified role '{role}'\n"
+                f"    {write_line.strip()[:120]}"
+            )
 
     return findings
 
@@ -107,9 +152,10 @@ def _walk(root: Path, role_names: set[str]) -> list[str]:
             continue
         if path.name in ALLOWED_WRITERS:
             continue
-        # Skip files inside the codified IAM dir itself (apply.sh, JSON
-        # docs, this script). Those are sanctioned writers/readers.
-        if SCRIPT_DIR in path.parents:
+        # Skip files inside any repo's codified IAM dir (apply.sh, JSON
+        # docs, drift-check, this script). Those are sanctioned writers/readers.
+        if any(p.name == "iam" and p.parent.name == "infrastructure"
+               for p in path.parents):
             continue
 
         findings.extend(_scan_file(path, role_names))
@@ -148,13 +194,15 @@ def main() -> int:
         ]
         roots = [p for p in siblings if p.exists()]
 
-    role_names = _codified_roles()
-    if not role_names:
-        print("No codified roles found — nothing to check.")
+    role_to_home = _all_codified_roles(roots)
+    if not role_to_home:
+        print("No codified roles found across any scanned repo — nothing to check.")
         return 0
 
+    role_names = set(role_to_home.keys())
     print(f"Scanning for foreign writers of: {sorted(role_names)}")
-    print(f"Repos: {[str(r) for r in roots]}")
+    print(f"Codified homes: {[(r, str(p.name)) for r, p in sorted(role_to_home.items())]}")
+    print(f"Repos: {[str(r.name) for r in roots]}")
 
     all_findings: list[str] = []
     for root in roots:
