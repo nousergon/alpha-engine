@@ -832,10 +832,16 @@ def run_daemon(dry_run: bool = False) -> None:
 def _trigger_eod_pipeline(config: dict, run_date: str) -> None:
     """Start the EOD Step Function pipeline after daemon shutdown.
 
-    Input shape matches the SF's expectations: trading_instance_id (array
-    for SSM sendCommand) + sns_topic_arn for HandleFailure publish.
-    Extra fields (run_date, triggered_by) are harmless — the SF ignores
-    them but they're useful for audit / debugging in execution history.
+    Input shape matches the SF's expectations:
+    - ``trading_instance_id`` (array for SSM sendCommand) — PostMarketData,
+      CaptureSnapshot, EODReconcile, StopTradingInstance all target this.
+    - ``ec2_instance_id`` (array) — DailySubstrateHealthCheck targets the
+      dashboard EC2 (where alpha-engine-dashboard + lib pin are installed).
+    - ``sns_topic_arn`` — HandleFailure publish.
+
+    Extra fields (``run_date``, ``triggered_by``) are harmless — the SF
+    ignores them but they're useful for audit / debugging in execution
+    history.
 
     Failures are non-fatal so a transient SF / IAM hiccup doesn't crash
     the daemon mid-shutdown. SF failure surfaces via the SNS HandleFailure
@@ -847,6 +853,7 @@ def _trigger_eod_pipeline(config: dict, run_date: str) -> None:
         sfn = _b3_sf.client("stepfunctions", region_name="us-east-1")
         state_machine_arn = "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-eod-pipeline"
         trading_instance_id = "i-018eb3307a21329bf"
+        dashboard_instance_id = "i-09b539c844515d549"
         sns_topic_arn = config.get(
             "sns_topic_arn",
             "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
@@ -857,6 +864,7 @@ def _trigger_eod_pipeline(config: dict, run_date: str) -> None:
             name=f"eod-{run_date}-{int(__import__('time').time())}",
             input=_json_sf.dumps({
                 "trading_instance_id": [trading_instance_id],
+                "ec2_instance_id": [dashboard_instance_id],
                 "sns_topic_arn": sns_topic_arn,
                 "run_date": run_date,
                 "triggered_by": "daemon_shutdown",

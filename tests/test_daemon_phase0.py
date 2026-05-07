@@ -274,8 +274,10 @@ class TestTriggerEodPipeline:
             assert kwargs["name"].startswith("eod-2026-04-29-")
 
     def test_input_payload_shape(self):
-        """Input must include trading_instance_id (array — SF SSM step expects
-        it) + sns_topic_arn (HandleFailure publish target)."""
+        """Input must include trading_instance_id (array — PostMarketData,
+        CaptureSnapshot, EODReconcile, StopTradingInstance target it),
+        ec2_instance_id (array — DailySubstrateHealthCheck targets the
+        dashboard EC2), and sns_topic_arn (HandleFailure publish target)."""
         import json
 
         from executor.daemon import _trigger_eod_pipeline
@@ -290,6 +292,11 @@ class TestTriggerEodPipeline:
             payload = json.loads(sfn.start_execution.call_args.kwargs["input"])
             assert isinstance(payload["trading_instance_id"], list)
             assert payload["trading_instance_id"][0].startswith("i-")
+            assert isinstance(payload["ec2_instance_id"], list)
+            assert payload["ec2_instance_id"][0].startswith("i-")
+            assert payload["ec2_instance_id"][0] != payload["trading_instance_id"][0], (
+                "trading EC2 and dashboard EC2 must be distinct instances"
+            )
             assert payload["sns_topic_arn"].startswith("arn:aws:sns:")
             assert payload["run_date"] == "2026-04-29"
             assert payload["triggered_by"] == "daemon_shutdown"
