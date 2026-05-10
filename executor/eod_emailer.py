@@ -286,6 +286,18 @@ def build_eod_email(
             )
             plain_parts.append(f"  {ticker}: {narrative}")
         html_parts.append("</table>")
+        html_parts.append(
+            '<p style="font-size:11px; color:#888; margin-top:4px;">'
+            'ⓘ α in <b>GBM:</b> rows is log-domain decimal at the 21d horizon '
+            '(post 2026-05-09 canonical-alpha cutover). Top-of-email Daily Alpha '
+            'is unchanged: arithmetic portfolio return − SPY return.'
+            '</p>'
+        )
+        plain_parts.append(
+            "  Note: α in GBM: rows is log-domain decimal at 21d horizon "
+            "(post 2026-05-09 cutover). Top-of-email Daily Alpha is "
+            "unchanged arithmetic portfolio − SPY."
+        )
         plain_parts.append("")
 
     # ── Sector Attribution ─────────────────────────────────────────────────
