@@ -22,11 +22,14 @@ import pytest
 
 from executor.decision_capture import (
     DecisionCaptureWriteError,
+    _classify_exit_rule_kind,
     _classify_trigger_kind,
     build_entry_trigger_payload,
+    build_exit_rule_payload,
     build_position_sizer_payload,
     build_risk_guard_payload,
     capture_entry_trigger,
+    capture_exit_rule,
     capture_position_sizer,
     capture_risk_guard,
     is_decision_capture_enabled,
@@ -949,3 +952,248 @@ class TestRiskGuardCapture:
         suffix = run_id.split("_")[-1]
         assert len(suffix) == 8
         assert all(c in "0123456789abcdef" for c in suffix)
+
+
+# ── Exit rules (PR 4 — daemon-side intraday) ─────────────────────────────
+
+
+def _make_stop(ticker: str = "AAPL") -> dict:
+    """Stop record fixture matching the daemon's order_book.stop shape."""
+    return {
+        "ticker": ticker,
+        "entry_price": 170.00,
+        "current_stop": 167.00,
+        "trail_atr": 2.50,
+        "atr_multiple": 2.0,
+        "high_water": 178.50,
+        "shares": 150,
+        "entry_date": "2026-05-08",
+        "profit_take_executed": False,
+    }
+
+
+def _make_exit_price_state() -> dict:
+    return {"last": 175.25, "high": 178.50, "low": 174.10}
+
+
+def _make_exit_signal(reason: str = "intraday_trailing_stop") -> dict:
+    """IntradayExitManager.evaluate() return shape."""
+    return {
+        "ticker": "AAPL",
+        "action": "EXIT",
+        "shares": 150,
+        "reason": reason,
+        "detail": "price $175.25 <= stop $167.00 (ATR $2.50 × 2.0)",
+    }
+
+
+def _make_exit_strategy_config() -> dict:
+    return {
+        "intraday_profit_take_pct": 0.08,
+        "intraday_collapse_pct": 0.05,
+        "intraday_tighten_after_days": 3,
+        "intraday_tighten_atr_multiple": 1.5,
+    }
+
+
+class TestExitRuleKindClassifier:
+    """IntradayExitManager exit-signal reasons map to canonical rule kinds."""
+
+    @pytest.mark.parametrize("reason,expected", [
+        ("intraday_trailing_stop", "atr_trail"),
+        ("intraday_profit_take", "profit_take"),
+        ("intraday_collapse", "collapse"),
+        ("unknown_reason_string", "unknown"),
+        ("", "unknown"),
+    ])
+    def test_classify_kind(self, reason, expected):
+        assert _classify_exit_rule_kind(reason) == expected
+
+
+class TestExitRulePayloadShape:
+    """Snapshot + agent_output mirror the rule engine's view + the fire."""
+
+    def test_snapshot_carries_producer_provenance(self):
+        snapshot, _, _ = build_exit_rule_payload(
+            stop=_make_stop(),
+            price_state=_make_exit_price_state(),
+            exit_signal=_make_exit_signal(),
+            strategy_config=_make_exit_strategy_config(),
+        )
+        assert snapshot["_producer"] == "alpha-engine.executor.exit_rules"
+        assert snapshot["_producer_version"] == "1.0.0"
+        # Layer field distinguishes daemon-intraday from planner-side
+        # captures (PR 4b will set this to "planner").
+        assert snapshot["evaluation_layer"] == "daemon_intraday"
+
+    def test_snapshot_carries_full_position_state(self):
+        snapshot, _, _ = build_exit_rule_payload(
+            stop=_make_stop(),
+            price_state=_make_exit_price_state(),
+            exit_signal=_make_exit_signal(),
+            strategy_config=_make_exit_strategy_config(),
+        )
+        assert snapshot["ticker"] == "AAPL"
+        assert snapshot["entry_price"] == 170.00
+        assert snapshot["entry_date"] == "2026-05-08"
+        assert snapshot["current_stop"] == 167.00
+        assert snapshot["trail_atr"] == 2.50
+        assert snapshot["atr_multiple"] == 2.0
+        assert snapshot["high_water"] == 178.50
+        assert snapshot["shares_held"] == 150
+        assert snapshot["profit_take_executed"] is False
+        # Market state
+        assert snapshot["current_price"] == 175.25
+        assert snapshot["day_high"] == 178.50
+        assert snapshot["day_low"] == 174.10
+
+    def test_snapshot_computes_gain_pct(self):
+        snapshot, _, _ = build_exit_rule_payload(
+            stop=_make_stop(),  # entry_price=170, current_price=175.25
+            price_state=_make_exit_price_state(),
+            exit_signal=_make_exit_signal(),
+            strategy_config=_make_exit_strategy_config(),
+        )
+        # (175.25 - 170) / 170 = 0.030882...
+        assert abs(snapshot["gain_pct"] - 0.030882) < 1e-5
+
+    def test_snapshot_thresholds_captured(self):
+        snapshot, _, _ = build_exit_rule_payload(
+            stop=_make_stop(),
+            price_state=_make_exit_price_state(),
+            exit_signal=_make_exit_signal(),
+            strategy_config=_make_exit_strategy_config(),
+        )
+        thr = snapshot["thresholds"]
+        assert thr["intraday_profit_take_pct"] == 0.08
+        assert thr["intraday_collapse_pct"] == 0.05
+        assert thr["intraday_tighten_after_days"] == 3
+        assert thr["intraday_tighten_atr_multiple"] == 1.5
+
+    def test_zero_entry_price_safely_nulls_gain_pct(self):
+        """Anti-regression: division-by-zero guard on entry_price=0."""
+        stop = _make_stop()
+        stop["entry_price"] = 0.0
+        snapshot, _, _ = build_exit_rule_payload(
+            stop=stop,
+            price_state=_make_exit_price_state(),
+            exit_signal=_make_exit_signal(),
+            strategy_config=_make_exit_strategy_config(),
+        )
+        assert snapshot["gain_pct"] is None
+
+    @pytest.mark.parametrize("reason,kind", [
+        ("intraday_trailing_stop", "atr_trail"),
+        ("intraday_profit_take", "profit_take"),
+        ("intraday_collapse", "collapse"),
+    ])
+    def test_agent_output_maps_canonical_kind(self, reason, kind):
+        _, output, _ = build_exit_rule_payload(
+            stop=_make_stop(),
+            price_state=_make_exit_price_state(),
+            exit_signal=_make_exit_signal(reason=reason),
+            strategy_config=_make_exit_strategy_config(),
+        )
+        assert output["outcome"] == "fired"
+        assert output["fired_rule"] == reason
+        assert output["fired_rule_kind"] == kind
+
+    def test_agent_output_carries_fill_outcome(self):
+        _, output, _ = build_exit_rule_payload(
+            stop=_make_stop(),
+            price_state=_make_exit_price_state(),
+            exit_signal=_make_exit_signal(),
+            strategy_config=_make_exit_strategy_config(),
+            fill_price=175.30,
+            actual_shares_exited=150,
+            trade_id="trade-abc",
+        )
+        assert output["action"] == "EXIT"
+        assert output["shares_requested"] == 150
+        assert output["fill_price"] == 175.30
+        assert output["actual_shares_exited"] == 150
+        assert output["trade_id"] == "trade-abc"
+
+
+class TestExitRuleCapture:
+    """End-to-end capture path with env-flag + S3 stub."""
+
+    def test_writes_v2_artifact_to_canonical_key(self, monkeypatch):
+        monkeypatch.setenv("ALPHA_ENGINE_DECISION_CAPTURE_ENABLED", "true")
+        s3 = _make_s3_stub()
+        s3_key = capture_exit_rule(
+            run_date="2026-05-15",
+            stop=_make_stop(),
+            price_state=_make_exit_price_state(),
+            exit_signal=_make_exit_signal(),
+            strategy_config=_make_exit_strategy_config(),
+            s3_client=s3,
+        )
+        s3.put_object.assert_called_once()
+        put_kwargs = s3.put_object.call_args.kwargs
+        assert put_kwargs["Bucket"] == "alpha-engine-research"
+        assert "/executor:exit_rules/" in put_kwargs["Key"]
+        assert put_kwargs["Key"].endswith(".json")
+        assert s3_key == put_kwargs["Key"]
+        body = json.loads(put_kwargs["Body"].decode("utf-8"))
+        assert body["schema_version"] == 2
+        assert body["agent_id"] == "executor:exit_rules"
+        assert body["model_metadata"] is None
+        assert body["full_prompt_context"] is None
+        assert body["input_data_snapshot"]["ticker"] == "AAPL"
+        assert body["agent_output"]["fired_rule_kind"] == "atr_trail"
+
+    def test_disabled_when_env_off(self, monkeypatch):
+        monkeypatch.delenv(
+            "ALPHA_ENGINE_DECISION_CAPTURE_ENABLED", raising=False,
+        )
+        s3 = _make_s3_stub()
+        result = capture_exit_rule(
+            run_date="2026-05-15",
+            stop=_make_stop(),
+            price_state=_make_exit_price_state(),
+            exit_signal=_make_exit_signal(),
+            strategy_config=_make_exit_strategy_config(),
+            s3_client=s3,
+        )
+        assert result is None
+        s3.put_object.assert_not_called()
+
+    def test_run_id_includes_ticker_and_uuid_suffix(self, monkeypatch):
+        monkeypatch.setenv("ALPHA_ENGINE_DECISION_CAPTURE_ENABLED", "true")
+        s3 = _make_s3_stub()
+        capture_exit_rule(
+            run_date="2026-05-15",
+            stop=_make_stop(ticker="NVDA"),
+            price_state=_make_exit_price_state(),
+            exit_signal=_make_exit_signal(),
+            strategy_config=_make_exit_strategy_config(),
+            s3_client=s3,
+        )
+        body = json.loads(s3.put_object.call_args.kwargs["Body"].decode("utf-8"))
+        run_id = body["run_id"]
+        assert run_id.startswith("2026-05-15_NVDA_")
+        suffix = run_id.split("_")[-1]
+        assert len(suffix) == 8
+        assert all(c in "0123456789abcdef" for c in suffix)
+
+    def test_s3_failure_propagates_capture_write_error(self, monkeypatch):
+        from botocore.exceptions import ClientError
+
+        monkeypatch.setenv("ALPHA_ENGINE_DECISION_CAPTURE_ENABLED", "true")
+        s3 = _make_s3_stub()
+        s3.put_object.side_effect = ClientError(
+            error_response={
+                "Error": {"Code": "AccessDenied", "Message": "Denied"},
+            },
+            operation_name="PutObject",
+        )
+        with pytest.raises(DecisionCaptureWriteError):
+            capture_exit_rule(
+                run_date="2026-05-15",
+                stop=_make_stop(),
+                price_state=_make_exit_price_state(),
+                exit_signal=_make_exit_signal(),
+                strategy_config=_make_exit_strategy_config(),
+                s3_client=s3,
+            )

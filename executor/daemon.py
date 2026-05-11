@@ -43,6 +43,7 @@ load_secrets()
 from executor.decision_capture import (
     DecisionCaptureWriteError,
     capture_entry_trigger,
+    capture_exit_rule,
     is_decision_capture_enabled,
 )
 from executor.entry_triggers import EntryTriggerEngine
@@ -751,6 +752,37 @@ def run_daemon(dry_run: bool = False) -> None:
                         if not dry_run:
                             trades_executed += 1
                             executed_tickers.add(exit_signal.get("ticker"))
+                            # Emit executor:exit_rules DecisionArtifact
+                            # (L2308 PR 4 — daemon-side intraday exits).
+                            # Lands AFTER the fill succeeded (mirrors PR 1
+                            # entry-trigger capture pattern). Best-effort:
+                            # capture failure must never kill subsequent
+                            # exit executions. Skipped naturally on
+                            # dry_run via the not-dry_run guard above.
+                            if is_decision_capture_enabled():
+                                try:
+                                    capture_exit_rule(
+                                        run_date=run_date,
+                                        stop=stop,
+                                        price_state=price_state,
+                                        exit_signal=exit_signal,
+                                        strategy_config=strategy_config,
+                                    )
+                                except DecisionCaptureWriteError as _cap_exc:
+                                    logger.warning(
+                                        "decision_capture S3 write failed "
+                                        "for EXIT %s — continuing daemon "
+                                        "(capture is observability, not "
+                                        "load-bearing): %s",
+                                        exit_signal.get("ticker"), _cap_exc,
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    logger.exception(
+                                        "decision_capture raised unexpected "
+                                        "exception for EXIT %s — continuing "
+                                        "daemon",
+                                        exit_signal.get("ticker"),
+                                    )
                     except (ConnectionError, OSError, asyncio_exceptions) as e:
                         logger.warning("Connection lost during exit %s: %s — reconnecting", exit_signal.get("ticker"), e)
                         ibkr, monitor = _reconnect(ibkr, monitor, order_book, config, client_id)
