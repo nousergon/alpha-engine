@@ -478,31 +478,142 @@ def decide_entries(
             plan.blocked.append({**_shadow_base, "block_reason": "already in portfolio"})
             continue
 
-        # Momentum confirmation gate.
+        # Momentum confirmation gate (stance-conditional).
         # As of 2026-05-11 (alpha-engine-predictor#136), the predictor
         # emits ``momentum_veto`` + ``momentum_20d`` on every prediction —
-        # rule computation lives with the predictor (alongside gbm_veto)
-        # so signal-side logic is consolidated and can leverage the
-        # predictor's macro/regime context. The executor consumes the
-        # boolean here; ``momentum_gate_enabled`` config still gates the
-        # whole rule for break-glass.
+        # rule computation lives with the predictor. Stance taxonomy arc
+        # (predictor#137 / lib#38/#39) adds per-pick stance routing:
         #
-        # Backward-compat fallback: if ``momentum_veto`` is absent from
-        # the prediction (older predictor build OR ticker missing from
-        # predictions_by_ticker), fall back to the executor-side inline
-        # computation from ``price_histories``. Once the predictor half
-        # has been live for 1+ trading week and all predictions carry
-        # the field, this fallback can be removed.
+        #   momentum stance → existing momentum_veto applies as-is
+        #   value stance    → INVERT — require drawdown to qualify (a
+        #                     value pick must actually be oversold;
+        #                     skip the standard veto)
+        #   quality stance  → relax momentum threshold (-15% vs -5%) —
+        #                     defensive names can absorb deeper
+        #                     drawdowns before we abandon them
+        #   catalyst stance → skip momentum check entirely; require
+        #                     catalyst_date (executor's exit-boundary
+        #                     signal — without it the position has no
+        #                     event-driven thesis to anchor on)
+        #
+        # Stance read from ``pred_data["stance"]`` (predictor's argmax
+        # over its softmax loadings). Continuous loadings live at
+        # ``pred_data["stance_loadings"]`` for future weighted-gate
+        # consumption — v1 routes by the discrete label only.
+        #
+        # Backward-compat: stance=None means legacy artifact (predictor
+        # pre-#137) → falls through to the original momentum-stance
+        # behavior (existing momentum_veto). When predictor_momentum_veto
+        # is also absent → inline executor-side fallback.
         pred_data_for_veto = predictions_by_ticker.get(ticker, {})
         if config.get("momentum_gate_enabled", True):
             mom_threshold_pct = config.get("momentum_gate_threshold", -5.0)
             mom_threshold_decimal = float(mom_threshold_pct) / 100.0
             predictor_momentum_veto = pred_data_for_veto.get("momentum_veto")
             predictor_momentum_20d = pred_data_for_veto.get("momentum_20d")
+            stance = pred_data_for_veto.get("stance")  # may be None (legacy)
+            value_drawdown_min = config.get("value_stance_drawdown_min", -0.05)
+            quality_threshold_pct = config.get(
+                "quality_stance_momentum_threshold", -15.0
+            )
+            quality_threshold_decimal = float(quality_threshold_pct) / 100.0
 
             momentum_20d_decimal: float | None = None
-            veto_source: str | None = None  # "predictor" | "executor_fallback" | None
-            if predictor_momentum_veto is not None:
+            if isinstance(predictor_momentum_20d, (int, float)):
+                momentum_20d_decimal = float(predictor_momentum_20d)
+
+            # ── Value stance: require drawdown to qualify ───────────────
+            # A value pick must actually be oversold — that's the entry
+            # premise. If the ticker isn't down, the stance label is
+            # mis-applied (or the underlying feature has noise) and the
+            # pick doesn't fit its declared strategy. Block.
+            if stance == "value":
+                if (
+                    momentum_20d_decimal is not None
+                    and momentum_20d_decimal > value_drawdown_min
+                ):
+                    reason = (
+                        f"value stance gate: 20d="
+                        f"{momentum_20d_decimal * 100:.1f}% > drawdown min "
+                        f"{value_drawdown_min * 100:.1f}% "
+                        "(value picks require actual drawdown)"
+                    )
+                    logger.info(f"SKIP ENTER {ticker} — {reason}")
+                    plan.blocked.append({**_shadow_base, "block_reason": reason})
+                    plan.risk_events.append({**_event_base,
+                        "event_type": "veto",
+                        "rule": "stance_gate",
+                        "stance": "value",
+                        "reason": reason,
+                        "value": momentum_20d_decimal,
+                        "threshold": value_drawdown_min,
+                    })
+                    continue
+                # Else: drawdown qualifies. Skip the standard momentum
+                # gate (the predictor's veto is for trend-following,
+                # inappropriate for value picks).
+                logger.debug(
+                    f"PASS value gate {ticker} — 20d="
+                    f"{momentum_20d_decimal * 100 if momentum_20d_decimal is not None else '?':.1f}%"
+                )
+
+            # ── Quality stance: relaxed threshold ───────────────────────
+            # Defensive names (low vol, low debt) can absorb deeper
+            # drawdowns before we abandon them. Default -15% vs the
+            # standard -5%. Backtester-tunable.
+            elif stance == "quality":
+                if (
+                    momentum_20d_decimal is not None
+                    and momentum_20d_decimal < quality_threshold_decimal
+                ):
+                    reason = (
+                        f"quality stance gate (relaxed): 20d="
+                        f"{momentum_20d_decimal * 100:.1f}% < "
+                        f"{quality_threshold_pct}%"
+                    )
+                    logger.info(f"SKIP ENTER {ticker} — {reason}")
+                    plan.blocked.append({**_shadow_base, "block_reason": reason})
+                    plan.risk_events.append({**_event_base,
+                        "event_type": "veto",
+                        "rule": "stance_gate",
+                        "stance": "quality",
+                        "reason": reason,
+                        "value": momentum_20d_decimal,
+                        "threshold": quality_threshold_decimal,
+                    })
+                    continue
+
+            # ── Catalyst stance: skip momentum, require catalyst_date ──
+            # Event-driven thesis trumps momentum considerations.
+            # Without catalyst_date the position has no exit boundary;
+            # the executor's catalyst gate (future PR) hard-exits at
+            # catalyst_date + 3 trading days — that contract requires
+            # the date.
+            elif stance == "catalyst":
+                catalyst_date = pred_data_for_veto.get("catalyst_date")
+                if not catalyst_date:
+                    reason = (
+                        "catalyst stance gate: catalyst_date missing — "
+                        "event-driven thesis requires an exit boundary"
+                    )
+                    logger.info(f"SKIP ENTER {ticker} — {reason}")
+                    plan.blocked.append({**_shadow_base, "block_reason": reason})
+                    plan.risk_events.append({**_event_base,
+                        "event_type": "veto",
+                        "rule": "stance_gate",
+                        "stance": "catalyst",
+                        "reason": reason,
+                        "value": None,
+                        "threshold": None,
+                    })
+                    continue
+                # Catalyst stance with valid date → no momentum check.
+                logger.debug(
+                    f"PASS catalyst gate {ticker} — catalyst_date={catalyst_date}"
+                )
+
+            # ── Default (momentum / None): existing momentum_veto ────────
+            elif predictor_momentum_veto is not None:
                 # Predictor-side veto is authoritative. ``momentum_20d``
                 # in the prediction is a decimal (matches feature
                 # engineering's ``close/close.shift(20) - 1``).
