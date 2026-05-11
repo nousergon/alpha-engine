@@ -75,6 +75,9 @@ _PRODUCER_NAME_POSITION_SIZER = "alpha-engine.executor.position_sizer"
 _AGENT_ID_RISK_GUARD = "executor:risk_guard"
 _PRODUCER_NAME_RISK_GUARD = "alpha-engine.executor.risk_guard"
 
+_AGENT_ID_EXIT_RULES = "executor:exit_rules"
+_PRODUCER_NAME_EXIT_RULES = "alpha-engine.executor.exit_rules"
+
 # Bump when the snapshot/output shape changes; readers can filter on this
 # rather than guessing from S3 timestamps. Per-component versioning so a
 # bump in one producer (e.g. entry_triggers) doesn't force a re-tag of
@@ -646,12 +649,204 @@ def capture_risk_guard(
     return s3_key
 
 
+# ── Exit rules payload + capture (daemon-side intraday) ──────────────────
+
+
+# Map IntradayExitManager exit-signal reason strings to canonical kinds.
+# Mirrors the reason values in executor/intraday_exit_manager.py.
+_INTRADAY_EXIT_REASON_TO_KIND = {
+    "intraday_trailing_stop": "atr_trail",
+    "intraday_profit_take": "profit_take",
+    "intraday_collapse": "collapse",
+}
+
+
+def _classify_exit_rule_kind(exit_reason: str) -> str:
+    """Map an exit signal's ``reason`` field to a canonical rule kind.
+
+    Returns ``"unknown"`` for unmapped reasons — surfaces a producer-side
+    gap rather than silently labeling. Future planner-side captures (PR 4b)
+    will add entries for ``atr_trail`` / ``time_decay`` /
+    ``catalyst_hard_exit`` / ``momentum_exit`` / ``fallback_stop`` etc.
+    via the same map.
+    """
+    if not exit_reason:
+        return "unknown"
+    return _INTRADAY_EXIT_REASON_TO_KIND.get(exit_reason, "unknown")
+
+
+def build_exit_rule_payload(
+    *,
+    stop: dict,
+    price_state: dict,
+    exit_signal: dict,
+    strategy_config: dict,
+    fill_price: float | None = None,
+    actual_shares_exited: int | None = None,
+    trade_id: str | int | None = None,
+) -> tuple[dict, dict, str]:
+    """Build ``(input_data_snapshot, agent_output, input_data_summary)``
+    for one ``IntradayExitManager.evaluate`` fire event (daemon-side
+    intraday exit rule).
+
+    Snapshot mirrors what the rule engine saw at decision time:
+    - Position state from the stop record (entry_price, current_stop,
+      trail_atr, atr_multiple, high_water, shares, entry_date, ticker)
+    - Live price state (last, high, low)
+    - Config thresholds (intraday_profit_take_pct, intraday_collapse_pct,
+      intraday_tighten_after_days, intraday_tighten_atr_multiple)
+    - Computed gain/loss vs entry, days_held — load-bearing for grading
+      "did this exit fire too early / too late?"
+
+    agent_output records the fired rule (atr_trail / profit_take /
+    collapse) + the executed fill outcome, joinable against trades.csv
+    by ticker + date.
+    """
+    entry_price = stop.get("entry_price")
+    current_price = price_state.get("last")
+    gain_pct: float | None = None
+    if entry_price and entry_price > 0 and current_price is not None:
+        gain_pct = (current_price - entry_price) / entry_price
+
+    entry_date_str = stop.get("entry_date")
+    days_held: int | None = None
+    if entry_date_str:
+        try:
+            from datetime import date as _date
+            days_held = (
+                _date.today() - _date.fromisoformat(entry_date_str)
+            ).days
+        except (ValueError, TypeError):
+            days_held = None
+
+    snapshot = {
+        "_producer": _PRODUCER_NAME_EXIT_RULES,
+        "_producer_version": _PRODUCER_VERSION,
+        # Position state
+        "ticker": stop.get("ticker"),
+        "entry_price": entry_price,
+        "entry_date": entry_date_str,
+        "current_stop": stop.get("current_stop"),
+        "trail_atr": stop.get("trail_atr"),
+        "atr_multiple": stop.get("atr_multiple"),
+        "high_water": stop.get("high_water"),
+        "shares_held": stop.get("shares"),
+        "profit_take_executed": stop.get("profit_take_executed", False),
+        # Market state
+        "current_price": current_price,
+        "day_high": price_state.get("high"),
+        "day_low": price_state.get("low"),
+        # Derived signals (load-bearing for grading)
+        "gain_pct": gain_pct,
+        "days_held": days_held,
+        # Config thresholds evaluated by the rules
+        "thresholds": {
+            "intraday_profit_take_pct": strategy_config.get(
+                "intraday_profit_take_pct", 0.08,
+            ),
+            "intraday_collapse_pct": strategy_config.get(
+                "intraday_collapse_pct", 0.05,
+            ),
+            "intraday_tighten_after_days": strategy_config.get(
+                "intraday_tighten_after_days", 3,
+            ),
+            "intraday_tighten_atr_multiple": strategy_config.get(
+                "intraday_tighten_atr_multiple", 1.5,
+            ),
+        },
+        # Capture layer (daemon-side intraday vs planner-side
+        # evaluate_exits — PR 4b will add "planner" as a layer)
+        "evaluation_layer": "daemon_intraday",
+    }
+
+    fired_reason = exit_signal.get("reason")
+    agent_output = {
+        "outcome": "fired",
+        "action": exit_signal.get("action"),  # "EXIT" | "REDUCE"
+        "fired_rule": fired_reason,
+        "fired_rule_kind": _classify_exit_rule_kind(fired_reason),
+        "shares_requested": exit_signal.get("shares"),
+        "detail": exit_signal.get("detail"),
+        "fill_price": fill_price,
+        "actual_shares_exited": actual_shares_exited,
+        "trade_id": trade_id,
+    }
+
+    summary = (
+        f"{stop.get('ticker') or '<unknown>'} "
+        f"{exit_signal.get('action', 'EXIT')} "
+        f"fired={fired_reason} gain={gain_pct:.1%}"
+        if gain_pct is not None
+        else f"{stop.get('ticker') or '<unknown>'} "
+             f"{exit_signal.get('action', 'EXIT')} fired={fired_reason}"
+    )
+    return snapshot, agent_output, summary
+
+
+def capture_exit_rule(
+    *,
+    run_date: str,
+    stop: dict,
+    price_state: dict,
+    exit_signal: dict,
+    strategy_config: dict,
+    fill_price: float | None = None,
+    actual_shares_exited: int | None = None,
+    trade_id: str | int | None = None,
+    s3_client: Any | None = None,
+    s3_bucket: str = "alpha-engine-research",
+) -> str | None:
+    """Emit one ``executor:exit_rules`` artifact for a single
+    ``IntradayExitManager.evaluate`` fire event.
+
+    No-op when the env-flag feature gate is off. Raises
+    ``DecisionCaptureWriteError`` on S3 failure per
+    ``feedback_no_silent_fails``.
+
+    Planner-side ``evaluate_exits`` captures will share this same
+    helper via a follow-up PR (4b) that extracts a per-position helper
+    from the existing ``evaluate_exits`` loop so the input snapshot can
+    include the planner's wider context (signal_at_exit, stance,
+    catalyst_date, sector etc.).
+    """
+    if not is_decision_capture_enabled():
+        return None
+
+    snapshot, agent_output, summary = build_exit_rule_payload(
+        stop=stop,
+        price_state=price_state,
+        exit_signal=exit_signal,
+        strategy_config=strategy_config,
+        fill_price=fill_price,
+        actual_shares_exited=actual_shares_exited,
+        trade_id=trade_id,
+    )
+
+    ticker = stop.get("ticker") or "unknown"
+    run_id = f"{run_date}_{ticker}_{uuid.uuid4().hex[:8]}"
+
+    s3_key = capture_decision(
+        run_id=run_id,
+        agent_id=_AGENT_ID_EXIT_RULES,
+        model_metadata=None,
+        full_prompt_context=None,
+        input_data_snapshot=snapshot,
+        agent_output=agent_output,
+        input_data_summary=summary,
+        s3_client=s3_client,
+        s3_bucket=s3_bucket,
+    )
+    return s3_key
+
+
 __all__ = [
     "DecisionCaptureWriteError",
     "build_entry_trigger_payload",
+    "build_exit_rule_payload",
     "build_position_sizer_payload",
     "build_risk_guard_payload",
     "capture_entry_trigger",
+    "capture_exit_rule",
     "capture_position_sizer",
     "capture_risk_guard",
     "is_decision_capture_enabled",
