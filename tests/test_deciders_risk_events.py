@@ -312,6 +312,271 @@ def test_predictor_momentum_veto_with_missing_momentum_20d_logs_unknown():
     assert ev["value"] is None  # no diagnostic value to record
 
 
+# ── Stance-conditional gating (stance arc PR 3) ─────────────────────────────
+
+
+def _pred_with_stance(
+    stance: str,
+    momentum_20d: float | None = None,
+    catalyst_date: str | None = None,
+    **extra,
+) -> dict:
+    """Build a minimal prediction payload with stance fields for testing."""
+    base = {
+        "stance": stance,
+        "stance_loadings": {
+            "momentum": 0.25, "value": 0.25,
+            "quality": 0.25, "catalyst": 0.25,
+        },
+        "catalyst_date": catalyst_date,
+        "predicted_alpha": 0.01,
+        "predicted_direction": "UP",
+        "prediction_confidence": 0.65,
+        "combined_rank": 5,
+        "gbm_veto": False,
+        "momentum_veto": False,
+    }
+    if momentum_20d is not None:
+        base["momentum_20d"] = momentum_20d
+    base.update(extra)
+    return base
+
+
+# ── Value stance: invert momentum gate ──
+
+
+def test_value_stance_blocks_when_drawdown_insufficient():
+    """value stance picks must actually be oversold — that's the entry
+    premise. If 20d ret is flat or up, the stance label is misapplied
+    and the pick doesn't fit its declared strategy. Block.
+
+    This is the institutional value-sleeve check: a "value" pick must
+    look like value (downward price action), not just be labeled
+    value via factor model noise.
+    """
+    enter = [{"ticker": "AAPL", "signal": "ENTER", "score": 85,
+              "conviction": "rising", "sector": "Technology",
+              "rating": "BUY", "price_target_upside": 0.20}]
+    predictions = {"AAPL": _pred_with_stance("value", momentum_20d=0.02)}  # +2% — not value
+    inputs = _make_inputs(
+        signals_date="2026-05-08", run_date="2026-05-11",
+        enter_signals=enter,
+        predictions_by_ticker=predictions,
+        config_overrides={"momentum_gate_enabled": True,
+                          "value_stance_drawdown_min": -0.05},
+    )
+    plan = decide_entries(predictions_date="2026-05-11", **inputs)
+    veto_events = [e for e in plan.risk_events if e["rule"] == "stance_gate"]
+    assert len(veto_events) == 1
+    ev = veto_events[0]
+    assert ev["stance"] == "value"
+    assert ev["value"] == pytest.approx(0.02)
+    assert ev["threshold"] == pytest.approx(-0.05)
+    assert plan.n_entered == 0
+
+
+def test_value_stance_allows_drawdown_through_momentum_gate():
+    """When a value pick HAS the drawdown that justifies it, the
+    standard momentum gate (which blocks falling knives) is BYPASSED.
+    This is the executor-side resolution of today's bull-market 0-
+    entries mismatch — research's value picks no longer get killed
+    by the trend-following gate.
+    """
+    enter = [{"ticker": "WING", "signal": "ENTER", "score": 85,
+              "conviction": "rising", "sector": "Consumer Discretionary",
+              "rating": "BUY", "price_target_upside": 0.20}]
+    # WING dropped 28% — a true value/buy-the-dip candidate
+    predictions = {"WING": _pred_with_stance("value", momentum_20d=-0.28)}
+    inputs = _make_inputs(
+        signals_date="2026-05-08", run_date="2026-05-11",
+        enter_signals=enter,
+        predictions_by_ticker=predictions,
+        config_overrides={"momentum_gate_enabled": True,
+                          "momentum_gate_threshold": -5.0,
+                          "value_stance_drawdown_min": -0.05},
+    )
+    plan = decide_entries(predictions_date="2026-05-11", **inputs)
+    # No stance_gate veto fires — the drawdown qualifies
+    stance_vetos = [e for e in plan.risk_events if e["rule"] == "stance_gate"]
+    assert stance_vetos == [], (
+        "value stance with sufficient drawdown must pass — got "
+        f"{stance_vetos}"
+    )
+    # Also confirm: standard momentum_gate did NOT fire either (would
+    # have triggered for -28% drawdown if stance routing failed).
+    momentum_vetos = [e for e in plan.risk_events if e["rule"] == "momentum_gate"]
+    assert momentum_vetos == [], (
+        "value stance must skip the standard momentum_gate — got "
+        f"{momentum_vetos}"
+    )
+
+
+# ── Quality stance: relaxed threshold ──
+
+
+def test_quality_stance_uses_relaxed_threshold():
+    """quality stance accepts deeper drawdowns than momentum's default
+    -5% — default -15%. A defensive name with -10% drawdown should
+    pass the quality gate but would fail a standard momentum gate.
+    """
+    enter = [{"ticker": "JNJ", "signal": "ENTER", "score": 85,
+              "conviction": "rising", "sector": "Health Care",
+              "rating": "BUY", "price_target_upside": 0.10}]
+    predictions = {"JNJ": _pred_with_stance("quality", momentum_20d=-0.10)}
+    inputs = _make_inputs(
+        signals_date="2026-05-08", run_date="2026-05-11",
+        enter_signals=enter,
+        predictions_by_ticker=predictions,
+        config_overrides={"momentum_gate_enabled": True,
+                          "momentum_gate_threshold": -5.0,
+                          "quality_stance_momentum_threshold": -15.0},
+    )
+    plan = decide_entries(predictions_date="2026-05-11", **inputs)
+    stance_vetos = [e for e in plan.risk_events if e["rule"] == "stance_gate"]
+    assert stance_vetos == [], (
+        "quality stance at -10% should pass (relaxed -15% threshold); got "
+        f"{stance_vetos}"
+    )
+
+
+def test_quality_stance_blocks_at_relaxed_threshold():
+    """quality stance still blocks when drawdown exceeds the relaxed
+    threshold (default -15%). A defensive name down -20% has lost the
+    defensive thesis."""
+    enter = [{"ticker": "PG", "signal": "ENTER", "score": 85,
+              "conviction": "rising", "sector": "Consumer Staples",
+              "rating": "BUY", "price_target_upside": 0.10}]
+    predictions = {"PG": _pred_with_stance("quality", momentum_20d=-0.20)}
+    inputs = _make_inputs(
+        signals_date="2026-05-08", run_date="2026-05-11",
+        enter_signals=enter,
+        predictions_by_ticker=predictions,
+        config_overrides={"momentum_gate_enabled": True,
+                          "quality_stance_momentum_threshold": -15.0},
+    )
+    plan = decide_entries(predictions_date="2026-05-11", **inputs)
+    stance_vetos = [e for e in plan.risk_events if e["rule"] == "stance_gate"]
+    assert len(stance_vetos) == 1
+    ev = stance_vetos[0]
+    assert ev["stance"] == "quality"
+    assert ev["value"] == pytest.approx(-0.20)
+    assert ev["threshold"] == pytest.approx(-0.15)
+
+
+# ── Catalyst stance: skip momentum, require date ──
+
+
+def test_catalyst_stance_requires_catalyst_date():
+    """catalyst stance is event-driven. Without catalyst_date the
+    position has no exit boundary — the executor's future catalyst
+    gate hard-exits at catalyst_date + 3 trading days. No date = no
+    exit boundary = block."""
+    enter = [{"ticker": "NVDA", "signal": "ENTER", "score": 85,
+              "conviction": "rising", "sector": "Technology",
+              "rating": "BUY", "price_target_upside": 0.20}]
+    predictions = {"NVDA": _pred_with_stance("catalyst", catalyst_date=None)}
+    inputs = _make_inputs(
+        signals_date="2026-05-08", run_date="2026-05-11",
+        enter_signals=enter,
+        predictions_by_ticker=predictions,
+        config_overrides={"momentum_gate_enabled": True},
+    )
+    plan = decide_entries(predictions_date="2026-05-11", **inputs)
+    stance_vetos = [e for e in plan.risk_events if e["rule"] == "stance_gate"]
+    assert len(stance_vetos) == 1
+    ev = stance_vetos[0]
+    assert ev["stance"] == "catalyst"
+    assert "catalyst_date missing" in ev["reason"]
+
+
+def test_catalyst_stance_with_date_skips_momentum_gate():
+    """catalyst stance with a valid date bypasses the momentum gate
+    entirely — even severe drawdowns are acceptable if there's an
+    event-driven thesis with a defined exit boundary."""
+    enter = [{"ticker": "MRNA", "signal": "ENTER", "score": 85,
+              "conviction": "rising", "sector": "Health Care",
+              "rating": "BUY", "price_target_upside": 0.30}]
+    # Down 25% — would trip ANY non-catalyst stance gate
+    predictions = {"MRNA": _pred_with_stance(
+        "catalyst", momentum_20d=-0.25, catalyst_date="2026-06-15",
+    )}
+    inputs = _make_inputs(
+        signals_date="2026-05-08", run_date="2026-05-11",
+        enter_signals=enter,
+        predictions_by_ticker=predictions,
+        config_overrides={"momentum_gate_enabled": True,
+                          "momentum_gate_threshold": -5.0,
+                          "quality_stance_momentum_threshold": -15.0},
+    )
+    plan = decide_entries(predictions_date="2026-05-11", **inputs)
+    stance_vetos = [e for e in plan.risk_events if e["rule"] == "stance_gate"]
+    momentum_vetos = [e for e in plan.risk_events if e["rule"] == "momentum_gate"]
+    assert stance_vetos == [], (
+        f"catalyst stance with valid date should pass; got {stance_vetos}"
+    )
+    assert momentum_vetos == [], (
+        f"catalyst stance must skip the momentum gate; got {momentum_vetos}"
+    )
+
+
+# ── Momentum stance + None / legacy ──
+
+
+def test_momentum_stance_uses_standard_gate():
+    """momentum stance pins down the trend-following branch — same
+    behavior as the legacy non-stance path. Predictor's momentum_veto
+    (if True) blocks; otherwise passes."""
+    enter = [{"ticker": "TSLA", "signal": "ENTER", "score": 85,
+              "conviction": "rising", "sector": "Technology",
+              "rating": "BUY", "price_target_upside": 0.20}]
+    # momentum_veto=True from predictor → existing gate fires
+    predictions = {"TSLA": _pred_with_stance(
+        "momentum", momentum_20d=-0.10, momentum_veto=True,
+    )}
+    inputs = _make_inputs(
+        signals_date="2026-05-08", run_date="2026-05-11",
+        enter_signals=enter,
+        predictions_by_ticker=predictions,
+        config_overrides={"momentum_gate_enabled": True},
+    )
+    plan = decide_entries(predictions_date="2026-05-11", **inputs)
+    # momentum stance falls through to the existing momentum_gate
+    # rule path (not the stance_gate rule path)
+    momentum_vetos = [e for e in plan.risk_events if e["rule"] == "momentum_gate"]
+    assert len(momentum_vetos) == 1
+    assert momentum_vetos[0]["veto_source"] == "predictor"
+
+
+def test_stance_none_is_legacy_behavior():
+    """stance=None (pre-predictor#137 artifacts) must NOT trip the
+    stance-conditional branches — falls through to the existing
+    momentum_veto path. Pinned so the rollout transition doesn't
+    block legacy predictions."""
+    enter = [{"ticker": "AAPL", "signal": "ENTER", "score": 85,
+              "conviction": "rising", "sector": "Technology",
+              "rating": "BUY", "price_target_upside": 0.20}]
+    # No stance field at all — legacy prediction
+    predictions = {"AAPL": {
+        "predicted_alpha": 0.02,
+        "predicted_direction": "UP",
+        "prediction_confidence": 0.65,
+        "combined_rank": 5,
+        "gbm_veto": False,
+        "momentum_veto": False,
+        "momentum_20d": 0.08,
+    }}
+    inputs = _make_inputs(
+        signals_date="2026-05-08", run_date="2026-05-11",
+        enter_signals=enter,
+        predictions_by_ticker=predictions,
+    )
+    plan = decide_entries(predictions_date="2026-05-11", **inputs)
+    stance_vetos = [e for e in plan.risk_events if e["rule"] == "stance_gate"]
+    assert stance_vetos == [], (
+        f"stance=None must NOT trip the stance_gate branches; got {stance_vetos}"
+    )
+
+
 # ── Predictor GBM veto override ─────────────────────────────────────────────
 
 
