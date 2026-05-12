@@ -15,9 +15,10 @@ Setup (one-time):
 from __future__ import annotations
 
 import logging
-import os
 
 import requests
+
+from alpha_engine_lib.secrets import get_secret
 
 logger = logging.getLogger(__name__)
 
@@ -70,8 +71,8 @@ def send_trade_alert(
 
     Returns True if sent successfully, False otherwise.
     """
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    token = get_secret("TELEGRAM_BOT_TOKEN", required=False)
+    chat_id = get_secret("TELEGRAM_CHAT_ID", required=False)
     if not token or not chat_id:
         logger.debug("Telegram not configured — skipping notification")
         return False
@@ -94,8 +95,8 @@ def send_trade_alert(
 
 def send_daemon_status(message: str) -> bool:
     """Send a general status message (daemon start/stop, errors)."""
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    token = get_secret("TELEGRAM_BOT_TOKEN", required=False)
+    chat_id = get_secret("TELEGRAM_CHAT_ID", required=False)
     if not token or not chat_id:
         logger.warning("Telegram not configured — TELEGRAM_BOT_TOKEN=%s TELEGRAM_CHAT_ID=%s", "set" if token else "MISSING", "set" if chat_id else "MISSING")
         return False
