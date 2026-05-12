@@ -27,7 +27,10 @@ min_score_to_enter: 30           # backstop only — predictor veto is primary g
 # 5 saturated at conf=0.99 — the per-ticker signal looked fine but the batch
 # distribution was degenerate. Default off; opt in only after shadow validation.
 batch_confidence_tightening_enabled: false
-batch_confidence_threshold: 0.65    # if mean batch confidence < this, tighten
+# Confidence semantics post-2026-05-12: |p_up - 0.5| * 2 ∈ [0, 1] (predictor PR #143).
+# Threshold rescaled from 0.65 (old winner-prob units) to 0.30 (new units) via
+# new = (old - 0.5) * 2.
+batch_confidence_threshold: 0.30    # if mean batch confidence < this, tighten
 batch_confidence_min_score_bump: 10 # bump min_score_to_enter by this when triggered
 momentum_gate_enabled: false      # disabled — predictor mean-reversion conflicts with this
 min_conviction_to_enter:         # only these conviction levels allow new entries

@@ -307,7 +307,10 @@ def _apply_batch_confidence_tightening(
     if not config.get("batch_confidence_tightening_enabled", False):
         return config
 
-    threshold = config.get("batch_confidence_threshold", 0.65)
+    # Confidence semantics post-2026-05-12: |p_up - 0.5| * 2 ∈ [0, 1]
+    # (alpha-engine-predictor PR #143). Prior 0.65 winner-prob threshold
+    # rescales to 0.30 via new = (old - 0.5) * 2.
+    threshold = config.get("batch_confidence_threshold", 0.30)
     bump = config.get("batch_confidence_min_score_bump", 10)
     base_min_score = config.get("min_score_to_enter", 70)
 
