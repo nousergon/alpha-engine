@@ -299,7 +299,9 @@ class TestNotifier:
         assert _send_telegram("token", "123", "hello") is False
 
     def test_send_trade_alert_no_config(self):
-        with patch.dict("os.environ", {}, clear=True):
+        # Preserve ALPHA_ENGINE_SECRETS_SOURCE=env from conftest so get_secret()
+        # reads from this (cleared) env-dict instead of falling through to SSM.
+        with patch.dict("os.environ", {"ALPHA_ENGINE_SECRETS_SOURCE": "env"}, clear=True):
             assert send_trade_alert("BUY", "AAPL", 10, 150.0) is False
 
     @patch("executor.notifier._send_telegram", return_value=True)
@@ -309,7 +311,9 @@ class TestNotifier:
             mock_send.assert_called_once()
 
     def test_send_daemon_status_no_config(self):
-        with patch.dict("os.environ", {}, clear=True):
+        # Preserve ALPHA_ENGINE_SECRETS_SOURCE=env from conftest so get_secret()
+        # reads from this (cleared) env-dict instead of falling through to SSM.
+        with patch.dict("os.environ", {"ALPHA_ENGINE_SECRETS_SOURCE": "env"}, clear=True):
             assert send_daemon_status("test") is False
 
     @patch("executor.notifier._send_telegram", return_value=True)

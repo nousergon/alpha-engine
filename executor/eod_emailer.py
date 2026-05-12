@@ -26,6 +26,8 @@ from email.mime.text import MIMEText
 import boto3
 from botocore.exceptions import ClientError
 
+from alpha_engine_lib.secrets import get_secret
+
 _GMAIL_SMTP_HOST = "smtp.gmail.com"
 _GMAIL_SMTP_PORT = 587
 
@@ -444,7 +446,7 @@ def send_eod_email(
         except Exception as e:
             logger.warning("EOD email archival failed (non-fatal): %s", e)
 
-    app_password = os.environ.get("GMAIL_APP_PASSWORD", "").replace(" ", "")
+    app_password = (get_secret("GMAIL_APP_PASSWORD", required=False, default="") or "").replace(" ", "")
 
     if app_password:
         # Gmail SMTP — email originates from Gmail's servers, passes SPF/DKIM
