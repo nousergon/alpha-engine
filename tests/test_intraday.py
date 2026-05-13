@@ -13,7 +13,7 @@ import pytest
 from executor.entry_triggers import EntryTriggerEngine
 from executor.intraday_exit_manager import IntradayExitManager
 from executor.market_hours import is_market_hours, is_trading_day
-from executor.notifier import _escape_markdown, _send_telegram, send_daemon_status, send_trade_alert
+from executor.notifier import send_daemon_status, send_trade_alert
 from executor.retry import retry
 
 _ET = pytz.timezone("US/Eastern")
@@ -279,24 +279,11 @@ class TestMarketHours:
 
 
 class TestNotifier:
-    def test_escape_markdown(self):
-        assert _escape_markdown("hello_world") == "hello-world"
-        assert _escape_markdown("code`block`") == "code'block'"
-        assert _escape_markdown("[link]") == "(link)"
-
-    @patch("executor.notifier.requests.post")
-    def test_send_telegram_success(self, mock_post):
-        mock_post.return_value = MagicMock(status_code=200)
-        assert _send_telegram("token", "123", "hello") is True
-
-    @patch("executor.notifier.requests.post")
-    def test_send_telegram_failure(self, mock_post):
-        mock_post.return_value = MagicMock(status_code=400, text="Bad Request")
-        assert _send_telegram("token", "123", "hello") is False
-
-    @patch("executor.notifier.requests.post", side_effect=Exception("timeout"))
-    def test_send_telegram_exception(self, mock_post):
-        assert _send_telegram("token", "123", "hello") is False
+    """Daemon-side formatter tests. Primitive send/escape behavior is locked
+    upstream in alpha_engine_lib.telegram's own test suite (29 tests). These
+    tests cover only the daemon-specific message-shape contracts and that
+    the formatters correctly route through the lib substrate.
+    """
 
     def test_send_trade_alert_no_config(self):
         # Preserve ALPHA_ENGINE_SECRETS_SOURCE=env from conftest so get_secret()
@@ -304,11 +291,25 @@ class TestNotifier:
         with patch.dict("os.environ", {"ALPHA_ENGINE_SECRETS_SOURCE": "env"}, clear=True):
             assert send_trade_alert("BUY", "AAPL", 10, 150.0) is False
 
-    @patch("executor.notifier._send_telegram", return_value=True)
+    @patch("executor.notifier.send_message", return_value=True)
     def test_send_trade_alert_success(self, mock_send):
-        with patch.dict("os.environ", {"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "c"}):
-            assert send_trade_alert("BUY", "AAPL", 10, 150.0, "pullback", "daemon") is True
-            mock_send.assert_called_once()
+        assert send_trade_alert("BUY", "AAPL", 10, 150.0, "pullback", "daemon") is True
+        mock_send.assert_called_once()
+
+    @patch("executor.notifier.send_message", return_value=True)
+    def test_send_trade_alert_message_format(self, mock_send):
+        send_trade_alert("BUY", "AAPL", 10, 150.0, "pullback", "daemon")
+        msg = mock_send.call_args.args[0]
+        assert "*BUY AAPL*" in msg
+        assert "Shares: 10 @ $150.00" in msg
+        assert "Trigger: pullback" in msg
+        assert "Source: daemon" in msg
+
+    @patch("executor.notifier.send_message", return_value=True)
+    def test_send_trade_alert_unknown_action_uses_fallback_emoji(self, mock_send):
+        send_trade_alert("WEIRD", "AAPL", 10, 150.0)
+        msg = mock_send.call_args.args[0]
+        assert "*WEIRD AAPL*" in msg
 
     def test_send_daemon_status_no_config(self):
         # Preserve ALPHA_ENGINE_SECRETS_SOURCE=env from conftest so get_secret()
@@ -316,10 +317,10 @@ class TestNotifier:
         with patch.dict("os.environ", {"ALPHA_ENGINE_SECRETS_SOURCE": "env"}, clear=True):
             assert send_daemon_status("test") is False
 
-    @patch("executor.notifier._send_telegram", return_value=True)
+    @patch("executor.notifier.send_message", return_value=True)
     def test_send_daemon_status_success(self, mock_send):
-        with patch.dict("os.environ", {"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "c"}):
-            assert send_daemon_status("daemon started") is True
+        assert send_daemon_status("daemon started") is True
+        mock_send.assert_called_once_with("daemon started")
 
 
 # ---------------------------------------------------------------------------

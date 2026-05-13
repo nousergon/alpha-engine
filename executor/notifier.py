@@ -1,61 +1,31 @@
 """
-Telegram trade notification sender.
+Telegram trade notification sender — daemon-side structured-message formatters.
 
-Sends push notifications for intraday trade executions via Telegram bot API.
-Fire-and-forget with a 5-second timeout — a failed notification never blocks
-trade execution.
+Sits on top of ``alpha_engine_lib.telegram.send_message`` (lib v0.14.0+), which
+handles token/chat_id resolution, markdown escape, retry/timeout, and
+fire-and-forget bool-return semantics. This module contributes daemon-specific
+*message formatting* — emoji + structured trade/status templates — and
+nothing else.
 
 Setup (one-time):
   1. Message @BotFather on Telegram → /newbot → save the bot token
-  2. Add to .env: TELEGRAM_BOT_TOKEN=<token>
+  2. Set ``TELEGRAM_BOT_TOKEN`` in SSM at ``/alpha-engine/TELEGRAM_BOT_TOKEN``
   3. Message the bot, then call getUpdates to get your chat_id
-  4. Add to .env: TELEGRAM_CHAT_ID=<chat_id>
+  4. Set ``TELEGRAM_CHAT_ID`` in SSM at ``/alpha-engine/TELEGRAM_CHAT_ID``
+
+Migration arc: ROADMAP L1067 PR 2a (2026-05-13). Previously this module owned
+the primitive send path inline; the surveillance Lambda arc required a second
+producer, so the primitive was consolidated into ``alpha_engine_lib.telegram``
+to prevent the "two writers diverged silently" antipattern.
 """
 
 from __future__ import annotations
 
 import logging
 
-import requests
-
-from alpha_engine_lib.secrets import get_secret
+from alpha_engine_lib.telegram import send_message
 
 logger = logging.getLogger(__name__)
-
-_TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
-
-
-def _escape_markdown(text: str) -> str:
-    """Escape Telegram Markdown v1 special characters.
-
-    Replaces characters that Telegram interprets as formatting markers
-    (_, `, [, ]) to prevent 400 Bad Request parse errors. Preserves
-    * for bold markers which we control in our message templates.
-    """
-    return (
-        text
-        .replace("_", "-")
-        .replace("`", "'")
-        .replace("[", "(")
-        .replace("]", ")")
-    )
-
-
-def _send_telegram(token: str, chat_id: str, text: str) -> bool:
-    """Fire-and-forget Telegram message. Returns True on success."""
-    try:
-        resp = requests.post(
-            _TELEGRAM_API.format(token=token),
-            json={"chat_id": chat_id, "text": _escape_markdown(text), "parse_mode": "Markdown"},
-            timeout=5,
-        )
-        if resp.status_code == 200:
-            return True
-        logger.warning("Telegram API returned %d: %s", resp.status_code, resp.text[:200])
-        return False
-    except Exception:
-        logger.warning("Telegram send failed", exc_info=True)
-        return False
 
 
 def send_trade_alert(
@@ -66,18 +36,12 @@ def send_trade_alert(
     trigger: str = "",
     source: str = "daemon",
 ) -> bool:
-    """
-    Send a Telegram push notification for a trade execution.
+    """Send a Telegram push notification for a trade execution.
 
-    Returns True if sent successfully, False otherwise.
+    Returns True if sent successfully, False otherwise (missing secrets,
+    network error, non-200 response — all swallowed by the lib substrate).
     """
-    token = get_secret("TELEGRAM_BOT_TOKEN", required=False)
-    chat_id = get_secret("TELEGRAM_CHAT_ID", required=False)
-    if not token or not chat_id:
-        logger.debug("Telegram not configured — skipping notification")
-        return False
-
-    emoji = {"BUY": "\U0001f7e2", "SELL": "\U0001f534", "REDUCE": "\U0001f7e1"}.get(action, "\u26aa")
+    emoji = {"BUY": "\U0001f7e2", "SELL": "\U0001f534", "REDUCE": "\U0001f7e1"}.get(action, "⚪")
     msg = (
         f"{emoji} *{action} {ticker}*\n"
         f"Shares: {shares} @ ${price:.2f}\n"
@@ -85,7 +49,7 @@ def send_trade_alert(
         f"Source: {source}"
     )
 
-    ok = _send_telegram(token, chat_id, msg)
+    ok = send_message(msg)
     if ok:
         logger.info("Telegram alert sent: %s %s", action, ticker)
     else:
@@ -94,11 +58,5 @@ def send_trade_alert(
 
 
 def send_daemon_status(message: str) -> bool:
-    """Send a general status message (daemon start/stop, errors)."""
-    token = get_secret("TELEGRAM_BOT_TOKEN", required=False)
-    chat_id = get_secret("TELEGRAM_CHAT_ID", required=False)
-    if not token or not chat_id:
-        logger.warning("Telegram not configured — TELEGRAM_BOT_TOKEN=%s TELEGRAM_CHAT_ID=%s", "set" if token else "MISSING", "set" if chat_id else "MISSING")
-        return False
-
-    return _send_telegram(token, chat_id, message)
+    """Send a general status message (daemon start/stop, errors, IB events)."""
+    return send_message(message)
