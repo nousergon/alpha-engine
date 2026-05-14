@@ -36,6 +36,37 @@ def _emit(events: list[dict] | None, event: dict) -> None:
         events.append(event)
 
 
+def regime_conditional_threshold_scale(
+    intensity_z: float | None,
+    *,
+    scale: float = 0.10,
+    floor: float = 0.60,
+    ceil: float = 1.40,
+) -> float:
+    """Map regime intensity_z to a threshold-scaling factor for drawdown tiers.
+
+    Direction convention matches ``position_sizer.regime_conditional_size_multiplier``:
+    positive z = risk-on (looser drawdown response), negative = risk-off
+    (tighter — fire sooner). Returns 1.0 when ``intensity_z`` is None
+    (substrate unavailable) so the tiers behave as if the wire were off.
+
+    Math: ``1.0 + intensity_z * scale`` clamped to ``[floor, ceil]``.
+    Applied to the SOFT tier thresholds only — the hard circuit-breaker
+    threshold (``drawdown_circuit_breaker``) is intentionally NOT
+    regime-scaled to preserve the absolute capital-preservation floor.
+
+    Example with scale=0.10, threshold=-0.05 (5% drawdown):
+      * intensity_z=-2 (risk-off): scale=0.80, threshold=-0.040 — tier
+        fires at 4% drawdown (sooner — preserves capital in stress).
+      * intensity_z=+2 (risk-on):  scale=1.20, threshold=-0.060 — tier
+        fires at 6% drawdown (later — tolerates noise in calm regimes).
+    """
+    if intensity_z is None:
+        return 1.0
+    raw = 1.0 + float(intensity_z) * float(scale)
+    return max(float(floor), min(float(ceil), raw))
+
+
 def check_correlation(
     ticker: str,
     current_positions: dict[str, dict],
@@ -139,6 +170,7 @@ def compute_drawdown_multiplier(
     peak_nav: float,
     config: dict,
     events: list[dict] | None = None,
+    regime_intensity_z: float | None = None,
 ) -> tuple[float, str]:
     """
     Compute position sizing multiplier based on current drawdown tier.
@@ -150,6 +182,18 @@ def compute_drawdown_multiplier(
     When `events` is supplied, appends a structured `halt` event on
     circuit-breaker fire or a `throttle` event when an active tier is
     reducing sizing below 1.0. No event is emitted at full sizing.
+
+    Regime-aware tier thresholds (Stage D' Wire 3, regime-v3-260514):
+        When ``regime_drawdown_enabled`` is True in config AND
+        ``regime_intensity_z`` is non-None, the SOFT tier thresholds are
+        multiplied by ``regime_conditional_threshold_scale(intensity_z)``.
+        Risk-off regimes (z<0) tighten the thresholds → tiers fire at
+        smaller drawdowns (preserves capital in stress). Risk-on (z>0)
+        loosens them → tiers tolerate more drawdown before throttling.
+
+        The hard circuit_breaker is NOT regime-scaled — the absolute
+        capital-preservation floor stays constant regardless of regime.
+        Default ``regime_drawdown_enabled=False`` ships the wire dormant.
     """
     if peak_nav <= 0:
         return 1.0, "no peak NAV recorded"
@@ -157,6 +201,19 @@ def compute_drawdown_multiplier(
     drawdown = (portfolio_nav - peak_nav) / peak_nav  # negative number
 
     strategy_cfg = load_strategy_config(config)
+
+    # Resolve the regime threshold-scale once for this call. When the
+    # wire is OFF or intensity_z is missing, falls through to 1.0
+    # (no behavioral change vs. pre-Wire-3 baseline).
+    if config.get("regime_drawdown_enabled", False):
+        regime_threshold_scale = regime_conditional_threshold_scale(
+            regime_intensity_z,
+            scale=config.get("regime_drawdown_scale", 0.10),
+            floor=config.get("regime_drawdown_floor", 0.60),
+            ceil=config.get("regime_drawdown_ceil", 1.40),
+        )
+    else:
+        regime_threshold_scale = 1.0
 
     if not strategy_cfg.get("graduated_drawdown_enabled", True):
         # Fall back to original binary circuit breaker
@@ -178,19 +235,25 @@ def compute_drawdown_multiplier(
 
     # Tiers are sorted by threshold ascending (most negative last).
     # Walk through tiers; the last tier whose threshold is breached applies.
+    # Soft thresholds are regime-scaled; circuit_breaker below is NOT.
     active_multiplier = 1.0
     active_desc = f"drawdown {drawdown:.1%} — full sizing"
     active_threshold: float | None = None
     active_tier_desc: str | None = None
 
     for threshold, multiplier, description in tiers:
-        if drawdown <= threshold:
+        scaled_threshold = float(threshold) * regime_threshold_scale
+        if drawdown <= scaled_threshold:
             active_multiplier = multiplier
-            active_desc = f"drawdown {drawdown:.1%} — {description} (multiplier={multiplier})"
-            active_threshold = float(threshold)
+            active_desc = (
+                f"drawdown {drawdown:.1%} — {description} "
+                f"(multiplier={multiplier})"
+            )
+            active_threshold = scaled_threshold
             active_tier_desc = description
 
-    # Hard halt at the deepest configured tier (circuit breaker preserved)
+    # Hard halt at the deepest configured tier (circuit breaker preserved).
+    # NOT regime-scaled — absolute capital-preservation floor.
     hard_halt = -config.get("drawdown_circuit_breaker", 0.08)
     if drawdown <= hard_halt:
         reason = f"circuit breaker: {drawdown:.1%} from peak (limit {hard_halt:.1%})"
@@ -213,6 +276,12 @@ def compute_drawdown_multiplier(
             "context": {
                 "multiplier": float(active_multiplier),
                 "tier_description": active_tier_desc,
+                "regime_threshold_scale": float(regime_threshold_scale),
+                "regime_intensity_z": (
+                    float(regime_intensity_z)
+                    if regime_intensity_z is not None
+                    else None
+                ),
             },
         })
 
@@ -232,6 +301,7 @@ def check_order(
     config: dict,
     price_histories: dict[str, pd.DataFrame] | None = None,
     events: list[dict] | None = None,
+    regime_intensity_z: float | None = None,
 ) -> tuple[bool, str]:
     """
     Validate an order against all risk rules.
@@ -298,6 +368,7 @@ def check_order(
     #    per ticker checked.
     dd_multiplier, dd_reason = compute_drawdown_multiplier(
         portfolio_nav, peak_nav, config,
+        regime_intensity_z=regime_intensity_z,
     )
     if dd_multiplier <= 0.0:
         return False, f"Drawdown halt: {dd_reason}"

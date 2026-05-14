@@ -118,6 +118,21 @@ regime_sizing_scale: 0.05        # per-σ sensitivity; +1σ → 1.05× tilt
 regime_sizing_floor: 0.70        # clamp lower bound on the multiplier
 regime_sizing_ceil:  1.30        # clamp upper bound on the multiplier
 
+# ── Regime-aware drawdown tiers (Stage D' Wire 3, regime-v3-260514) ─────────
+# Off by default; ships dormant. When ON, the SOFT graduated-drawdown tier
+# thresholds are scaled by ``1.0 + intensity_z * regime_drawdown_scale``
+# clamped to ``[regime_drawdown_floor, regime_drawdown_ceil]``. Risk-off
+# regimes (intensity_z < 0) tighten thresholds → tiers fire at smaller
+# drawdowns (preserves capital in stress); risk-on (z > 0) loosens →
+# tolerates more drawdown before throttling. The hard ``drawdown_circuit_breaker``
+# is NOT regime-scaled — absolute capital-preservation floor. Operator
+# flips ``regime_drawdown_enabled: true`` after 4+ weeks of substrate
+# observation alongside Wire 2.
+regime_drawdown_enabled: false   # gate-off by default; flip after observation window
+regime_drawdown_scale: 0.10      # per-σ sensitivity on the threshold magnitude
+regime_drawdown_floor: 0.60      # clamp lower bound (max tightening = 40%)
+regime_drawdown_ceil:  1.40      # clamp upper bound (max loosening = 40%)
+
 # ── IBKR connection ─────────────────────────────────────────────────────────
 ibkr_host: "127.0.0.1"
 ibkr_port: 4002                  # 4002 = paper trading, 4001 = live
