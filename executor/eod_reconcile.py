@@ -533,17 +533,35 @@ def run(run_date: str | None = None) -> None:
         else f"NAV=${nav:,.2f} | prior_nav={prior_nav}"
     )
 
-    # ── Load closing prices from ArcticDB universe library ─────────────────
+    # ── Load closing prices from ArcticDB ──────────────────────────────────
     # Hard-fails on any miss: EOD reconcile must reconcile against an
     # authoritative price source, not IB Gateway's delayed intraday data.
-    from executor.price_cache import _open_universe_library
+    #
+    # Macro-routed held positions (SPY/sector ETFs/etc.) live in the
+    # `macro` library, NOT `universe`. The portfolio-optimizer cutover
+    # (2026-05-13) made SPY a held core position; its first EOD on
+    # 2026-05-14 raised NoSuchVersionException because reconcile was
+    # universe-only. Mirror price_cache.load_price_histories' macro-aware
+    # dispatch (executor/price_cache.py:128-145, _MACRO_SYMBOLS).
+    from executor.price_cache import (
+        _open_universe_library,
+        _open_macro_library,
+        _MACRO_SYMBOLS,
+    )
     universe_lib = _open_universe_library(trades_bucket)
+    macro_lib = None  # lazy-open only if a macro-routed held ticker appears
     target_ts = pd.Timestamp(run_date).normalize()
     closing_prices: dict[str, float] = {}
     missing: list[str] = []
     for ticker in positions.keys():
+        if ticker in _MACRO_SYMBOLS:
+            if macro_lib is None:
+                macro_lib = _open_macro_library(trades_bucket)
+            lib = macro_lib
+        else:
+            lib = universe_lib
         try:
-            df = universe_lib.read(ticker).data
+            df = lib.read(ticker).data
         except Exception as e:
             missing.append(f"{ticker} ({e.__class__.__name__})")
             continue

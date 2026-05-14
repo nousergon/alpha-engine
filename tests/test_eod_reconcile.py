@@ -504,3 +504,41 @@ class TestSnapshotContract:
         parser.add_argument("--date", default=None)
         args = parser.parse_args([])
         assert args.date is None
+
+
+# ── Held-position close lookup: macro-routed tickers ─────────────────────────
+# 2026-05-14 EOD: portfolio-optimizer cutover (Tue 2026-05-13) introduced SPY
+# as a held core position. The held-position close lookup in run() reads from
+# universe_lib only; SPY lives in macro_lib, so universe_lib.read("SPY")
+# raised NoSuchVersionException and the whole EOD reconcile crashed. The fix
+# mirrors price_cache.load_price_histories' macro-aware dispatch.
+
+
+def test_eod_reconcile_uses_macro_aware_dispatch_for_held_positions():
+    """Pin the macro-aware dispatch in run()'s held-position close lookup.
+
+    Source-level pin: a future PR that removes the dispatch and reverts
+    to universe-only reads would re-introduce the 2026-05-14 EOD outage
+    the moment the optimizer holds SPY (or any sector ETF — XLB/XLC/XLE
+    /XLF/XLI/XLK/XLP/XLRE/XLU/XLV/XLY).
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).parent.parent / "executor" / "eod_reconcile.py").read_text()
+
+    assert "_MACRO_SYMBOLS" in src, (
+        "eod_reconcile.run() must import _MACRO_SYMBOLS from price_cache "
+        "and dispatch held-position reads between universe_lib and "
+        "macro_lib — universe-only reads crash on SPY (held under "
+        "portfolio-optimizer cutover, 2026-05-13)."
+    )
+    assert "_open_macro_library" in src, (
+        "eod_reconcile.run() must lazy-open macro_lib for held tickers "
+        "in _MACRO_SYMBOLS — without this, SPY/sector-ETF held positions "
+        "raise NoSuchVersionException against universe_lib."
+    )
+    assert "if ticker in _MACRO_SYMBOLS" in src, (
+        "Held-position read loop must branch on _MACRO_SYMBOLS membership "
+        "to route reads between universe_lib and macro_lib (mirrors "
+        "price_cache.load_price_histories:128-145)."
+    )
