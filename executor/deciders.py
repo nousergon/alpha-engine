@@ -61,6 +61,8 @@ logger = logging.getLogger(__name__)
 
 def decide_drawdown_response(
     portfolio_nav: float, peak_nav: float, config: dict,
+    *,
+    regime_intensity_z: float | None = None,
 ) -> tuple[float, str]:
     """Compute drawdown-tier sizing multiplier + reason.
 
@@ -68,8 +70,16 @@ def decide_drawdown_response(
     underlying ``compute_drawdown_multiplier`` (in ``risk_guard``) is
     already pure — this name appears in the live shell + backtester so
     both paths read symmetrically.
+
+    ``regime_intensity_z`` (Stage D' Wire 3) optionally scales the
+    soft tier thresholds — see ``risk_guard.compute_drawdown_multiplier``
+    docstring for the semantics. Default ``None`` keeps the legacy
+    threshold table.
     """
-    return compute_drawdown_multiplier(portfolio_nav, peak_nav, config)
+    return compute_drawdown_multiplier(
+        portfolio_nav, peak_nav, config,
+        regime_intensity_z=regime_intensity_z,
+    )
 
 
 def enrich_positions(
@@ -843,6 +853,7 @@ def decide_entries(
             config=config,
             price_histories=price_histories,
             events=check_events,
+            regime_intensity_z=regime_intensity_z,
         )
         # Merge per-ticker risk-guard events into the plan-level log,
         # stamping the lineage fields that risk_guard doesn't know about

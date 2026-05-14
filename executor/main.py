@@ -967,14 +967,48 @@ def run(
                 pos["catalyst_date"] = stance_info.get("catalyst_date")
             logger.info(f"Entry dates resolved for {len(entry_dates)}/{len(current_positions)} positions")
     
+        # ── 2b'. Resolve regime substrate ONCE per planning cycle ──────────────
+        # Used by Wire 2 (position_sizer regime multiplier) AND Wire 3
+        # (regime-aware drawdown tiers). Gated by either flag so the
+        # read is skipped entirely when both wires are off — avoids
+        # per-cycle S3 GET when neither feature is active. Returns None
+        # on any failure mode; both wires degrade to legacy behavior
+        # under None.
+        regime_intensity_z: float | None = None
+        if (
+            (config.get("regime_sizing_enabled", False)
+             or config.get("regime_drawdown_enabled", False))
+            and not simulate
+        ):
+            try:
+                from executor.signal_reader import (
+                    extract_intensity_z,
+                    read_regime_substrate,
+                )
+                substrate = read_regime_substrate(signals_bucket)
+                regime_intensity_z = extract_intensity_z(substrate)
+                logger.info(
+                    "regime wires enabled | intensity_z=%s",
+                    f"{regime_intensity_z:.3f}" if regime_intensity_z is not None else "None",
+                )
+            except Exception as _rs_err:
+                logger.warning(
+                    "regime substrate read failed (%s) — falling back to legacy behavior",
+                    _rs_err,
+                )
+                regime_intensity_z = None
+
         # ── 2c. Compute graduated drawdown multiplier ──────────────────────────
         # Pass an events sink so any halt/throttle event lands in
         # `risk_events` ONCE per planning cycle (the per-ticker check_order
         # call deliberately does NOT propagate events to its inner
         # compute_drawdown_multiplier — see risk_guard.py:check_order).
+        # ``regime_intensity_z`` resolved above is threaded in so Wire 3
+        # scales the soft tier thresholds when the wire is enabled.
         dd_events: list[dict] = []
         dd_multiplier, dd_reason = compute_drawdown_multiplier(
             portfolio_nav, peak_nav, config, events=dd_events,
+            regime_intensity_z=regime_intensity_z,
         )
         if dd_multiplier < 1.0:
             logger.info(f"Drawdown tier active: {dd_reason}")
@@ -1210,33 +1244,8 @@ def run(
             blocked_entries: list[dict] = []
             plan_risk_events: list[dict] = []
         else:
-            # Stage D' Wire 2: optionally load regime substrate so
-            # position_sizer can apply a regime-conditional multiplier.
-            # Gated by config so the read is skipped entirely when the
-            # wire is off — avoids a per-cycle S3 GET when the feature
-            # is disabled. Returns None when substrate is unavailable
-            # (fresh deploy, sidecar miss, etc.) — sizing falls back to
-            # 1.0× under the helper's guard.
-            regime_intensity_z = None
-            if config.get("regime_sizing_enabled", False) and not simulate:
-                try:
-                    from executor.signal_reader import (
-                        extract_intensity_z,
-                        read_regime_substrate,
-                    )
-                    substrate = read_regime_substrate(signals_bucket)
-                    regime_intensity_z = extract_intensity_z(substrate)
-                    logger.info(
-                        "regime_sizing_enabled=True | intensity_z=%s",
-                        f"{regime_intensity_z:.3f}" if regime_intensity_z is not None else "None",
-                    )
-                except Exception as _rs_err:
-                    logger.warning(
-                        "regime substrate read failed (%s) — falling back to 1.0× sizing",
-                        _rs_err,
-                    )
-                    regime_intensity_z = None
-
+            # ``regime_intensity_z`` resolved once at §2b' above — threaded
+            # into both Wire 2 (position_sizer) and Wire 3 (compute_drawdown_multiplier).
             n_entered, entry_orders, blocked_entries, plan_risk_events = _plan_entries(
                 enter_signals=enter_signals,
                 signals_raw=signals_raw,
