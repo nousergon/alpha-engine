@@ -8,7 +8,10 @@
             "Resource": "*",
             "Condition": {
                 "StringLike": {
-                    "cloudwatch:namespace": "AlphaEngine/*"
+                    "cloudwatch:namespace": [
+                        "AlphaEngine",
+                        "AlphaEngine/*"
+                    ]
                 }
             }
         },
