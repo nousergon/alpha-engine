@@ -257,6 +257,34 @@ def _build_position_contexts(
     return contexts, data_warnings
 
 
+def _extract_json_object(text: str) -> dict:
+    """Defensively parse the top-level JSON object from an LLM response.
+
+    Three observed anomalies that break bare ``json.loads`` (L1248/L2669):
+    markdown code fences (```` ```json\n{...}\n``` ````), conversational
+    preamble (``"Sure, here's the JSON:\n{...}"``), and trailing text after
+    the closing brace. Falls back to bare ``json.loads`` on clean input.
+    Raises ``json.JSONDecodeError`` if nothing parseable is found — the
+    caller continues to the template fallback path.
+    """
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        lines = stripped.split("\n")
+        lines = lines[1:]  # drop opening fence (e.g. ```json)
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        stripped = "\n".join(lines).strip()
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start >= 0 and end > start:
+        return json.loads(stripped[start:end + 1])
+    raise json.JSONDecodeError("no JSON object found in LLM response", text, 0)
+
+
 def _synthesize_rationales(contexts: list[dict]) -> dict[str, str]:
     """Call Haiku to synthesize per-position narratives. Falls back to templates."""
     if not contexts:
@@ -281,7 +309,16 @@ def _synthesize_rationales(contexts: list[dict]) -> dict[str, str]:
             max_tokens=2000,
             messages=[{"role": "user", "content": prompt}],
         )
-        result = json.loads(response.content[0].text)
+        raw = response.content[0].text
+        try:
+            result = _extract_json_object(raw)
+        except json.JSONDecodeError as e:
+            # Log a bounded sample of the raw response so the next recurrence
+            # surfaces a concrete failure mode (which anomaly) rather than the
+            # opaque "Expecting value: line 1 column 1 (char 0)" we used to see.
+            sample = raw[:400] + ("..." if len(raw) > 400 else "")
+            logger.warning(f"LLM rationale parse failed: {e} — raw[:400]={sample!r}")
+            raise
         return {n["ticker"]: n["narrative"] for n in result.get("narratives", [])}
     except Exception as e:
         logger.warning(f"LLM rationale synthesis failed: {e} — using template fallback")

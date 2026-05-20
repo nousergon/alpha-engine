@@ -9,6 +9,7 @@ import pytest
 from executor.eod_reconcile import (
     _apply_dividend_delta,
     _compute_unattributed_residual_pct,
+    _extract_json_object,
     _load_constituents_sector_map,
     _resolve_prior_price,
     _synthesize_rationales,
@@ -191,6 +192,53 @@ class TestSynthesizeRationales:
         assert len(result) == 2
         assert "AAPL" in result
         assert "MSFT" in result
+
+
+class TestExtractJsonObject:
+    """L1248/L2669: defensive JSON extraction in `_synthesize_rationales`
+    handles three observed LLM-output anomalies (markdown fences, preamble,
+    trailing text) before falling back to the template path."""
+
+    def test_clean_json_round_trips(self):
+        assert _extract_json_object('{"a": 1}') == {"a": 1}
+
+    def test_clean_json_with_narratives_shape(self):
+        text = '{"narratives": [{"ticker": "AAPL", "narrative": "looks ok"}]}'
+        assert _extract_json_object(text) == {"narratives": [{"ticker": "AAPL", "narrative": "looks ok"}]}
+
+    def test_markdown_json_fence(self):
+        text = '```json\n{"narratives": [{"ticker": "MSFT", "narrative": "x"}]}\n```'
+        assert _extract_json_object(text) == {"narratives": [{"ticker": "MSFT", "narrative": "x"}]}
+
+    def test_markdown_bare_fence(self):
+        text = '```\n{"narratives": []}\n```'
+        assert _extract_json_object(text) == {"narratives": []}
+
+    def test_conversational_preamble(self):
+        text = 'Sure, here are the narratives:\n{"narratives": [{"ticker": "GOOG", "narrative": "y"}]}'
+        assert _extract_json_object(text) == {"narratives": [{"ticker": "GOOG", "narrative": "y"}]}
+
+    def test_trailing_text_after_json(self):
+        text = '{"narratives": [{"ticker": "NVDA", "narrative": "z"}]}\n\nHope this helps!'
+        assert _extract_json_object(text) == {"narratives": [{"ticker": "NVDA", "narrative": "z"}]}
+
+    def test_preamble_and_fenced_and_trailing(self):
+        text = (
+            "Here's the JSON you asked for:\n"
+            "```json\n"
+            '{"narratives": [{"ticker": "AMZN", "narrative": "ok"}]}\n'
+            "```\n"
+            "Let me know if you need anything else."
+        )
+        assert _extract_json_object(text) == {"narratives": [{"ticker": "AMZN", "narrative": "ok"}]}
+
+    def test_garbage_raises(self):
+        with pytest.raises(json.JSONDecodeError):
+            _extract_json_object("totally not JSON at all")
+
+    def test_empty_raises(self):
+        with pytest.raises(json.JSONDecodeError):
+            _extract_json_object("")
 
 
 class TestLoadConstituentsSectorMap:
