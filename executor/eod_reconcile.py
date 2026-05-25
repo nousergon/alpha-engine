@@ -651,8 +651,13 @@ def run(run_date: str | None = None) -> None:
     target_ts = pd.Timestamp(run_date).normalize()
     closing_prices: dict[str, float] = {}
     missing: list[str] = []
+    # L1346 (c) second-half routing post-#245: SPY removed from macro-routed
+    # set since universe.SPY now carries full OHLCV. Defensive macro fallback
+    # for SPY preserves backwards compat — mirrors price_cache.py + predictor
+    # #196 pattern.
+    _MACRO_SYMBOLS_NO_OHLCV = _MACRO_SYMBOLS - {"SPY"}
     for ticker in positions.keys():
-        if ticker in _MACRO_SYMBOLS:
+        if ticker in _MACRO_SYMBOLS_NO_OHLCV:
             if macro_lib is None:
                 macro_lib = _open_macro_library(trades_bucket)
             lib = macro_lib
@@ -661,8 +666,22 @@ def run(run_date: str | None = None) -> None:
         try:
             df = lib.read(ticker).data
         except Exception as e:
-            missing.append(f"{ticker} ({e.__class__.__name__})")
-            continue
+            # SPY-specific defensive fallback to macro.SPY if universe.SPY
+            # unreadable. Removed once L1346 (b)+(c) soak clean ≥1 cycle.
+            if ticker == "SPY" and lib is universe_lib:
+                if macro_lib is None:
+                    macro_lib = _open_macro_library(trades_bucket)
+                try:
+                    df = macro_lib.read(ticker).data
+                except Exception as e2:
+                    missing.append(
+                        f"{ticker} (universe={e.__class__.__name__}, "
+                        f"macro={e2.__class__.__name__})"
+                    )
+                    continue
+            else:
+                missing.append(f"{ticker} ({e.__class__.__name__})")
+                continue
         if df.empty or "Close" not in df.columns:
             missing.append(f"{ticker} (no Close column)")
             continue
