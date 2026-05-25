@@ -299,6 +299,38 @@ _RATIONALES_TOOL = {
 _COST_TELEMETRY_BUCKET = "alpha-engine-research"
 _COST_TELEMETRY_PREFIX = "decision_artifacts/_cost_raw"
 
+# Phase 4 #1 — cost-budget WARN threshold. Shared env var with
+# alpha-engine-research's ``llm_cost_tracker.RunBudgetExceededError`` +
+# alpha-engine-data's ``_cost_telemetry.CostBudgetExceededError`` so a
+# single operator knob ceilings cost across all SF entry points.
+# Executor's posture is WARN-only (NOT raise) per [[feedback_no_silent_fails]]
+# applied carefully: the EOD report is operator-critical and survives
+# a cost-sink miss; we cannot let a single anomalous narrative call
+# take down the trading-day reconcile. The WARN log + the per-call
+# JSONL row on S3 are the operator-facing signals.
+_COST_BUDGET_ENV_VAR = "ALPHA_ENGINE_RUN_BUDGET_USD"
+_COST_BUDGET_DEFAULT_USD = 100.0
+
+
+def _resolve_cost_budget_ceiling() -> float:
+    """Read ``ALPHA_ENGINE_RUN_BUDGET_USD`` (shared with research + data).
+
+    Returns the positive threshold to WARN above, or 0.0 to disable.
+    Parse failure → disable (don't let a malformed env take down EOD).
+    """
+    import os
+    raw = os.environ.get(_COST_BUDGET_ENV_VAR, "")
+    if not raw:
+        return _COST_BUDGET_DEFAULT_USD
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "[cost_telemetry] ALPHA_ENGINE_RUN_BUDGET_USD=%r is not a "
+            "number; disabling cost-budget WARN", raw,
+        )
+        return 0.0
+
 # Anthropic snapshot suffix: -YYYYMMDD on family names (e.g.
 # "claude-haiku-4-5-20251001"). Cost-telemetry rate cards are family-
 # keyed, so strip the suffix before pricing lookup. Mirrors the research-
@@ -351,12 +383,29 @@ def _record_eod_narrative_cost(response, run_date: str) -> None:
             Body=body,
             ContentType="application/x-ndjson",
         )
+        cost_usd = float(record.get("cost_usd", 0))
         logger.info(
             "[cost_telemetry] EOD narrative cost recorded: $%.4f → "
             "s3://%s/%s",
-            float(record.get("cost_usd", 0)),
+            cost_usd,
             _COST_TELEMETRY_BUCKET, key,
         )
+
+        # Phase 4 #1 — WARN if this single call alone exceeds the run
+        # budget (signal that a narrative prompt expansion or runaway
+        # loop pushed one call into the danger zone). Doesn't raise:
+        # EOD report continues. Operators see the WARN + dashboard's
+        # next refresh shows the spike in the "Recent calls" tab.
+        ceiling = _resolve_cost_budget_ceiling()
+        if ceiling > 0 and cost_usd > ceiling:
+            logger.warning(
+                "[cost_telemetry] EOD narrative single call exceeded "
+                "cost budget: $%.4f > ceiling=$%.4f (env var "
+                "ALPHA_ENGINE_RUN_BUDGET_USD). Investigate the prompt "
+                "or position-count expansion — typical EOD call is "
+                "under $0.01. JSONL row preserved on S3 for diagnosis.",
+                cost_usd, ceiling,
+            )
     except Exception as exc:
         # Best-effort. Operator-facing WARN; EOD report continues.
         logger.warning(

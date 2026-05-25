@@ -663,3 +663,76 @@ class TestRecordEodNarrativeCost:
         # Drive the no-context fast path (returns {} without calling LLM).
         eod_reconcile._synthesize_rationales([])
         assert called["n"] == 0
+
+
+class TestCostBudgetWarn:
+    """Phase 4 #1 — WARN when a single EOD narrative call blows the
+    shared ALPHA_ENGINE_RUN_BUDGET_USD threshold. Executor's posture
+    is WARN-only (not raise) per the established "EOD report must
+    survive" semantic."""
+
+    def test_warn_emitted_when_call_exceeds_ceiling(self, monkeypatch, caplog):
+        """A single-call cost > $1 with a $0.001 ceiling should WARN
+        loud but NOT raise. The cost row + EOD report both survive."""
+        import boto3 as _boto3
+        from executor import eod_reconcile
+
+        monkeypatch.setenv("ALPHA_ENGINE_RUN_BUDGET_USD", "0.001")
+
+        class _StubS3:
+            def put_object(self, **kwargs):
+                return {}
+
+        monkeypatch.setattr(_boto3, "client", lambda svc: _StubS3())
+
+        response = _FakeAnthropicMessage(
+            model="claude-haiku-4-5-20251001",
+            usage=_FakeUsage(input_tokens=1000, output_tokens=200),
+        )
+        # Cost: (1000 * 1 + 200 * 5) / 1M = 0.002 > 0.001 ceiling.
+        # Must NOT raise.
+        eod_reconcile._record_eod_narrative_cost(response, "2026-05-25")
+        assert any(
+            "exceeded cost budget" in r.message
+            and "ALPHA_ENGINE_RUN_BUDGET_USD" in r.message
+            for r in caplog.records
+        )
+
+    def test_no_warn_when_call_under_ceiling(self, monkeypatch, caplog):
+        import boto3 as _boto3
+        from executor import eod_reconcile
+
+        monkeypatch.setenv("ALPHA_ENGINE_RUN_BUDGET_USD", "100")
+
+        class _StubS3:
+            def put_object(self, **kwargs):
+                return {}
+
+        monkeypatch.setattr(_boto3, "client", lambda svc: _StubS3())
+
+        response = _FakeAnthropicMessage(
+            model="claude-haiku-4-5-20251001",
+            usage=_FakeUsage(input_tokens=1000, output_tokens=200),
+        )
+        eod_reconcile._record_eod_narrative_cost(response, "2026-05-25")
+        assert not any("exceeded cost budget" in r.message for r in caplog.records)
+
+    def test_zero_ceiling_disables_warn(self, monkeypatch, caplog):
+        import boto3 as _boto3
+        from executor import eod_reconcile
+
+        monkeypatch.setenv("ALPHA_ENGINE_RUN_BUDGET_USD", "0")
+
+        class _StubS3:
+            def put_object(self, **kwargs):
+                return {}
+
+        monkeypatch.setattr(_boto3, "client", lambda svc: _StubS3())
+
+        # Even an enormous call should not WARN when ceiling=0.
+        response = _FakeAnthropicMessage(
+            model="claude-haiku-4-5",
+            usage=_FakeUsage(input_tokens=1_000_000, output_tokens=200_000),
+        )
+        eod_reconcile._record_eod_narrative_cost(response, "2026-05-25")
+        assert not any("exceeded cost budget" in r.message for r in caplog.records)
