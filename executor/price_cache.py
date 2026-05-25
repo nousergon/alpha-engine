@@ -131,8 +131,17 @@ def load_price_histories(
     read_errors: list[str] = []
     empty: list[str] = []
 
+    # L1346 (c) second-half routing post-#245:
+    # SPY is no longer in `_MACRO_SYMBOLS_NO_OHLCV` because universe.SPY
+    # now carries full OHLCV (alpha-engine-data #245 _UNIVERSE_EXTRA
+    # write path; gate (a) verified via 5/24 DataPhase1 SSM log).
+    # Defensive fallback to macro.SPY preserves backwards compat during
+    # the cross-repo retirement — mirrors alpha-engine-predictor #196's
+    # universe-preferred + macro-fallback shape. Non-SPY macro symbols
+    # (VIX/TNX/IRX/sector ETFs) remain macro-routed (still Close-only).
+    _MACRO_SYMBOLS_NO_OHLCV = _MACRO_SYMBOLS - {"SPY"}
     for ticker in tickers:
-        if ticker in _MACRO_SYMBOLS:
+        if ticker in _MACRO_SYMBOLS_NO_OHLCV:
             if macro is None:
                 macro = _open_macro_library(signals_bucket)
             lib = macro
@@ -141,8 +150,24 @@ def load_price_histories(
         try:
             df = lib.read(ticker).data
         except Exception as e:
-            read_errors.append(f"{ticker} ({e.__class__.__name__})")
-            continue
+            # L1346 (c) SPY-specific fallback: if SPY isn't in universe
+            # (e.g. universe.SPY backfill hadn't run yet), fall through
+            # to macro.SPY. Removed once L1346 (b) + (c) soak clean for
+            # ≥1 Saturday cycle on production.
+            if ticker == "SPY" and lib is universe:
+                if macro is None:
+                    macro = _open_macro_library(signals_bucket)
+                try:
+                    df = macro.read(ticker).data
+                except Exception as e2:
+                    read_errors.append(
+                        f"{ticker} (universe={e.__class__.__name__}, "
+                        f"macro={e2.__class__.__name__})"
+                    )
+                    continue
+            else:
+                read_errors.append(f"{ticker} ({e.__class__.__name__})")
+                continue
         if df.empty:
             empty.append(ticker)
             continue
