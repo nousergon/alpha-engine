@@ -7,13 +7,19 @@ no-conviction fill, cash is a pinned operational sleeve, conviction picks
 express deviation from SPY within sector + position + vol-target constraints.
 
 Math:
-    maximize   wᵀα̂  −  λ · wᵀΣw  −  τ · ‖w − w_prev‖₁
+    maximize   wᵀα̂  −  λ · wᵀΣ_H w  −  τ · ‖w − w_prev‖₁
     s.t.       Σwᵢ = 1                                    (budget)
                w[CASH] = cash_sleeve                       (sleeve pin)
                0 ≤ wᵢ ≤ stance_capᵢ                       (per-name cap)
                Σ_{i∈sector S} wᵢ ≤ max_sector_pct          (sector cap)
                wᵢ = 0 for i with eligibility=False         (gate mask)
-               wᵀΣw ≤ σ²_target_daily                      (vol-target SOC)
+               wᵀΣ_H w ≤ σ²_target_H                       (vol-target SOC)
+
+Horizon convention: Σ_H is the H-day covariance, where H is set via
+``cfg["sigma_horizon_days"]`` (default 1 = daily, preserves legacy behavior).
+Under i.i.d. log-return assumption, Σ_H = H · Σ_daily — see
+`alpha-engine-docs/private/optimizer-sota-upgrades-260526.md` §A.1 for the
+rationale (align Σ horizon with the canonical 21d log-domain α̂).
 
 This module is a pure function over numpy inputs. It does no I/O, no logging
 config side effects, no S3 calls — easy to unit-test (PR 1) and easy to wire
@@ -124,8 +130,12 @@ def solve_target_weights(
         w[cash_idx] == cfg["cash_sleeve_pct"],
     ]
     if cfg.get("vol_target_annual") is not None:
-        sigma_target_daily = cfg["vol_target_annual"] / np.sqrt(252)
-        constraints.append(cp.quad_form(w, sigma_psd) <= sigma_target_daily ** 2)
+        # Σ is at horizon H. Under i.i.d. log-returns, Var_ann = Var_H · (252/H),
+        # so the H-day variance budget that corresponds to annual vol_target is
+        # vol_target² · H/252. At default H=1 this reduces to (vol_target/√252)².
+        horizon = int(cfg.get("sigma_horizon_days", 1))
+        sigma_target_squared = (cfg["vol_target_annual"] ** 2) * horizon / 252
+        constraints.append(cp.quad_form(w, sigma_psd) <= sigma_target_squared)
     if eligibility_idx.size > 0:
         constraints.append(w[eligibility_idx] == 0)
 
@@ -169,6 +179,10 @@ OPTIMIZER_CONFIG_DEFAULTS: dict = {
     "max_sector_pct": 0.25,
     "covariance_shrinkage": "ledoit_wolf",
     "min_position_pct": 0.005,
+    # Horizon (trading days) at which Σ is expressed. 1 = legacy daily Σ
+    # (bit-identical to pre-260526 behavior); set to 21 to align Σ with the
+    # canonical 21d log-domain α̂. See optimizer-sota-upgrades-260526.md §A.1.
+    "sigma_horizon_days": 1,
 }
 
 
@@ -209,6 +223,13 @@ def _validate_inputs(
 
 
 def _estimate_covariance(returns_panel: np.ndarray, cfg: dict) -> np.ndarray:
+    """Return covariance at horizon ``cfg["sigma_horizon_days"]``.
+
+    Estimates Σ_daily via the configured shrinkage (Ledoit-Wolf default) on the
+    NaN-clean returns panel, then scales by horizon-days under i.i.d. log-return
+    assumption: Σ_H = H · Σ_daily. Default H=1 preserves legacy daily Σ
+    bit-identical (1 × Σ = Σ).
+    """
     clean = returns_panel[~np.isnan(returns_panel).any(axis=1)]
     if clean.shape[0] < 20:
         raise ValueError(
@@ -222,10 +243,18 @@ def _estimate_covariance(returns_panel: np.ndarray, cfg: dict) -> np.ndarray:
                 "scikit-learn is required for Ledoit-Wolf shrinkage. Install "
                 "via `pip install 'scikit-learn>=1.3,<1.6'`."
             ) from e
-        return LedoitWolf().fit(clean).covariance_
-    if cfg["covariance_shrinkage"] == "sample":
-        return np.cov(clean, rowvar=False)
-    raise ValueError(f"Unknown covariance_shrinkage: {cfg['covariance_shrinkage']}")
+        sigma_daily = LedoitWolf().fit(clean).covariance_
+    elif cfg["covariance_shrinkage"] == "sample":
+        sigma_daily = np.cov(clean, rowvar=False)
+    else:
+        raise ValueError(
+            f"Unknown covariance_shrinkage: {cfg['covariance_shrinkage']}"
+        )
+
+    horizon = int(cfg.get("sigma_horizon_days", 1))
+    if horizon < 1:
+        raise ValueError(f"sigma_horizon_days must be ≥ 1; got {horizon}")
+    return horizon * sigma_daily
 
 
 def _real_sectors(sectors: list[str]) -> set[str]:
@@ -288,9 +317,13 @@ def _build_diagnostics(
     status: str,
     cfg: dict,
 ) -> dict:
-    daily_var = float(weights @ sigma @ weights)
-    daily_var = max(daily_var, 0.0)
-    vol_ann = float(np.sqrt(252 * daily_var))
+    # sigma is at horizon H per _estimate_covariance. Annualize:
+    # Var_ann = Var_H · (252/H) → vol_ann = √(252/H · Var_H). At default
+    # H=1 this is the legacy √(252 · daily_var).
+    horizon = int(cfg.get("sigma_horizon_days", 1))
+    horizon_var = float(weights @ sigma @ weights)
+    horizon_var = max(horizon_var, 0.0)
+    vol_ann = float(np.sqrt((252 / horizon) * horizon_var))
     spy_only = np.zeros_like(weights)
     spy_only[spy_idx] = 1.0 - cfg["cash_sleeve_pct"]
     active_share = float(np.sum(np.abs(weights - spy_only)) / 2)

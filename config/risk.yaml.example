@@ -327,6 +327,13 @@ portfolio_optimizer:
   # Covariance estimator. "ledoit_wolf" is the institutional default;
   # "sample" disables shrinkage (useful only for synthetic-input tests).
   covariance_shrinkage: ledoit_wolf
+  # Σ horizon in trading days. 1 (default) = legacy daily Σ, bit-identical to
+  # pre-260526 behavior. Set to 21 to align Σ with the canonical 21d log-domain
+  # α̂; under i.i.d. log-returns Σ_H = H · Σ_daily, with vol-target SOC and
+  # vol_ann diagnostic both horizon-aware (test_portfolio_optimizer.py covers
+  # scaling-invariance with compensating λ rescale). Plan:
+  # alpha-engine-docs/private/optimizer-sota-upgrades-260526.md §A.1.
+  sigma_horizon_days: 1
   # Minimum position pct — weights below this are clipped to 0 (clean output;
   # avoid tiny stub positions like today's UNP 0.1% NAV residual).
   min_position_pct: 0.005
