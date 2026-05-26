@@ -123,6 +123,9 @@ def _build_and_solve(
 
     signals_by_ticker = signals_raw.get("signals", {})
     alpha_hat = _build_alpha_hat(tickers, predictions_by_ticker, spy_idx, cash_idx)
+    alpha_uncertainty = _build_alpha_uncertainty(
+        tickers, predictions_by_ticker, spy_idx, cash_idx,
+    )
     returns_panel = _build_returns_panel(tickers, price_histories, cash_idx)
     w_prev = _build_w_prev(tickers, current_positions, portfolio_nav, cash_idx, optimizer_cfg)
     sectors = _build_sectors(tickers, signals_by_ticker, spy_idx, cash_idx)
@@ -146,13 +149,35 @@ def _build_and_solve(
         spy_idx=spy_idx,
         cash_idx=cash_idx,
         cfg=optimizer_cfg,
+        alpha_uncertainty=alpha_uncertainty,
     )
 
     would_be_trades = _compute_trade_deltas(
         tickers, result.weights, w_prev, portfolio_nav, optimizer_cfg,
     )
 
-    return {
+    # B.4 ablation: when the α̂-uncertainty penalty is configured ON, solve
+    # a second time with γ=0 so the shadow log carries both perspectives
+    # side-by-side. Operators read the ablation diff to decide whether the
+    # uncertainty signal is shaping sizing in a sane way before B.5 cutover.
+    # No-op when γ=0 (default) or when no per-ticker σ_α̂ is available —
+    # the active solve already IS the no-penalty solve in that regime.
+    ablation = _maybe_run_ablation(
+        tickers=tickers,
+        alpha_hat=alpha_hat,
+        alpha_uncertainty=alpha_uncertainty,
+        returns_panel=returns_panel,
+        w_prev=w_prev,
+        sectors=sectors,
+        stance_caps=stance_caps,
+        eligibility=eligibility,
+        spy_idx=spy_idx,
+        cash_idx=cash_idx,
+        optimizer_cfg=optimizer_cfg,
+        active_weights=result.weights,
+    )
+
+    out: dict = {
         "run_date": run_date,
         "written_at_utc": datetime.now(timezone.utc).isoformat(),
         "shadow_status": "ok",
@@ -162,6 +187,7 @@ def _build_and_solve(
         "target_weights": [float(x) for x in result.weights],
         "current_weights": [float(x) for x in w_prev],
         "alpha_hat": [float(x) for x in alpha_hat],
+        "alpha_uncertainty": _alpha_uncertainty_to_json(alpha_uncertainty),
         "eligibility": [bool(x) for x in eligibility],
         "eligibility_reasons": list(eligibility_reasons),
         "stance_caps": [float(x) for x in stance_caps],
@@ -170,6 +196,102 @@ def _build_and_solve(
         "diagnostics": result.diagnostics,
         "legacy_orders": [_redact_order(o) for o in legacy_orders],
         "optimizer_cfg": optimizer_cfg,
+    }
+    if ablation is not None:
+        out["uncertainty_ablation"] = ablation
+    return out
+
+
+def _alpha_uncertainty_to_json(arr: np.ndarray) -> list:
+    """Convert per-ticker σ_α̂ array to a JSON-safe list. NaN entries are
+    emitted as None so consumers can distinguish 'unknown' from 0 (which
+    means 'sentinel — no uncertainty' for SPY/CASH)."""
+    out: list = []
+    for v in arr:
+        if not np.isfinite(v):
+            out.append(None)
+        else:
+            out.append(float(v))
+    return out
+
+
+def _maybe_run_ablation(
+    *,
+    tickers: list[str],
+    alpha_hat: np.ndarray,
+    alpha_uncertainty: np.ndarray,
+    returns_panel: np.ndarray,
+    w_prev: np.ndarray,
+    sectors: list[str],
+    stance_caps: np.ndarray,
+    eligibility: np.ndarray,
+    spy_idx: int,
+    cash_idx: int,
+    optimizer_cfg: dict,
+    active_weights: np.ndarray,
+) -> dict | None:
+    """Run a second solve with γ=0 for side-by-side comparison.
+
+    Skipped (returns None) when γ=0 already (no difference would result)
+    or when alpha_uncertainty has no usable signal (all-NaN). In both
+    cases the canonical solve IS the no-penalty solve.
+    """
+    gamma = float(optimizer_cfg.get("alpha_uncertainty_penalty", 0.0))
+    if gamma <= 0.0:
+        return None
+    has_any_signal = bool(np.any(np.isfinite(alpha_uncertainty) & (alpha_uncertainty > 0.0)))
+    if not has_any_signal:
+        return None
+
+    no_penalty_cfg = {**optimizer_cfg, "alpha_uncertainty_penalty": 0.0}
+    try:
+        no_penalty_result = solve_target_weights(
+            tickers=tickers,
+            alpha_hat=alpha_hat,
+            returns_panel=returns_panel,
+            w_prev=w_prev,
+            sectors=sectors,
+            stance_caps=stance_caps,
+            eligibility=eligibility,
+            spy_idx=spy_idx,
+            cash_idx=cash_idx,
+            cfg=no_penalty_cfg,
+            alpha_uncertainty=alpha_uncertainty,  # passed but γ=0 → unused
+        )
+    except Exception as exc:
+        logger.warning(
+            "Uncertainty-ablation solve failed (non-blocking, shadow continues): %s",
+            exc,
+        )
+        return None
+
+    no_penalty_weights = np.asarray(no_penalty_result.weights, dtype=np.float64)
+    active = np.asarray(active_weights, dtype=np.float64)
+    deltas = active - no_penalty_weights
+    # Per-ticker rows make the diff readable in the shadow JSON. Only
+    # include names that actually moved (≥1bp) to keep the log compact.
+    per_ticker = []
+    for i, t in enumerate(tickers):
+        if abs(deltas[i]) >= 1e-4:
+            per_ticker.append({
+                "ticker": t,
+                "with_penalty": float(active[i]),
+                "no_penalty": float(no_penalty_weights[i]),
+                "delta": float(deltas[i]),
+                "sigma_alpha": (
+                    float(alpha_uncertainty[i])
+                    if np.isfinite(alpha_uncertainty[i])
+                    else None
+                ),
+            })
+    return {
+        "gamma": gamma,
+        "no_penalty_weights": [float(x) for x in no_penalty_weights],
+        "no_penalty_diagnostics": no_penalty_result.diagnostics,
+        "l1_delta": float(np.sum(np.abs(deltas))),
+        "max_abs_delta": float(np.max(np.abs(deltas))),
+        "n_names_moved": len(per_ticker),
+        "per_ticker_delta": per_ticker,
     }
 
 
@@ -251,6 +373,46 @@ def _build_alpha_hat(
         if not math.isfinite(alpha[i]):
             alpha[i] = 0.0
     return alpha
+
+
+def _build_alpha_uncertainty(
+    tickers: list[str],
+    predictions_by_ticker: dict[str, dict],
+    spy_idx: int,
+    cash_idx: int,
+) -> np.ndarray:
+    """Read per-ticker σ_α̂ from the predictor's BayesianRidge posterior
+    (predicted_alpha_std field shipped in B.1, predictor PR #199).
+
+    Returns a length-N array with:
+      • 0.0 for SPY and CASH (sentinels — no uncertainty)
+      • finite σ_α̂ ≥ 0 when the predictor emitted a usable value
+      • NaN when the predictor's predicted_alpha_std was missing, None,
+        or non-numeric (legacy Ridge fallback case during the 1-week
+        soak between B.1 landing and the first BayesianRidge model
+        promoted by the Saturday training cycle)
+
+    The downstream B.3 solve_target_weights treats NaN entries as
+    zero-penalty for that name — partial-rollout is tolerated by design.
+    Plan: alpha-engine-docs/private/optimizer-sota-upgrades-260526.md §B.4.
+    """
+    sigma = np.full(len(tickers), np.nan)
+    for i, t in enumerate(tickers):
+        if i == spy_idx or i == cash_idx:
+            sigma[i] = 0.0
+            continue
+        pred = predictions_by_ticker.get(t, {})
+        raw_std = pred.get("predicted_alpha_std")  # B.1 field; may be missing/None
+        if raw_std is None:
+            continue
+        try:
+            v = float(raw_std)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(v) and v >= 0.0:
+            sigma[i] = v
+        # else leave NaN — partial-rollout case; B.3 handles by skipping penalty
+    return sigma
 
 
 def _build_returns_panel(

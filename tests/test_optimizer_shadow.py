@@ -26,6 +26,7 @@ import pytest
 
 from executor.optimizer_shadow import (
     _build_alpha_hat,
+    _build_alpha_uncertainty,
     _build_eligibility,
     _build_sectors,
     _build_stance_caps,
@@ -283,3 +284,192 @@ def test_wrapper_never_raises_writes_sentinel_on_failure():
     body = json.loads(s3.put_object.call_args_list[0].kwargs["Body"])
     assert body["shadow_status"] == "failed"
     assert "SPY price history" in body["error"]
+
+
+# ─── B.4 uncertainty wiring + ablation tests ────────────────────────────────
+# Plan: alpha-engine-docs/private/optimizer-sota-upgrades-260526.md §B.4
+#
+# The shadow wrapper reads B.1's predicted_alpha_std from
+# predictions_by_ticker, threads it to solve_target_weights, and logs an
+# ablation comparison (with/without penalty) when γ > 0.
+
+
+class TestBuildAlphaUncertainty:
+    """The new helper that reads predicted_alpha_std from the predictor
+    output. NaN-tolerant to handle the 1-week soak case."""
+
+    def _tickers_with_sentinels(self):
+        return ["AAPL", "MSFT", "JNJ", "SPY", "CASH"]
+
+    def test_predicted_alpha_std_present_populates_array(self):
+        tickers = self._tickers_with_sentinels()
+        preds = {
+            "AAPL": {"predicted_alpha": 0.04, "predicted_alpha_std": 0.021},
+            "MSFT": {"predicted_alpha": 0.02, "predicted_alpha_std": 0.018},
+            "JNJ":  {"predicted_alpha": -0.01, "predicted_alpha_std": 0.030},
+        }
+        sigma = _build_alpha_uncertainty(tickers, preds, spy_idx=3, cash_idx=4)
+        assert sigma[0] == pytest.approx(0.021)
+        assert sigma[1] == pytest.approx(0.018)
+        assert sigma[2] == pytest.approx(0.030)
+        assert sigma[3] == 0.0  # SPY sentinel
+        assert sigma[4] == 0.0  # CASH sentinel
+
+    def test_missing_field_yields_nan_per_partial_rollout(self):
+        """During the 1-week soak window the legacy Ridge model is still
+        in production — predictions JSON has no predicted_alpha_std for
+        any ticker. Result: all-NaN for non-sentinel tickers, optimizer's
+        B.3 path falls through to zero penalty."""
+        tickers = self._tickers_with_sentinels()
+        preds = {
+            "AAPL": {"predicted_alpha": 0.04},  # no std (legacy Ridge)
+            "MSFT": {"predicted_alpha": 0.02},
+            "JNJ":  {"predicted_alpha": -0.01},
+        }
+        sigma = _build_alpha_uncertainty(tickers, preds, spy_idx=3, cash_idx=4)
+        assert np.isnan(sigma[0])
+        assert np.isnan(sigma[1])
+        assert np.isnan(sigma[2])
+        # Sentinels still zero
+        assert sigma[3] == 0.0 and sigma[4] == 0.0
+
+    def test_none_field_yields_nan(self):
+        """Predictor explicitly emits None when legacy Ridge model loaded
+        (B.1 fallback path). Treat as missing."""
+        tickers = ["AAPL", "SPY", "CASH"]
+        preds = {"AAPL": {"predicted_alpha": 0.04, "predicted_alpha_std": None}}
+        sigma = _build_alpha_uncertainty(tickers, preds, spy_idx=1, cash_idx=2)
+        assert np.isnan(sigma[0])
+        assert sigma[1] == 0.0
+        assert sigma[2] == 0.0
+
+    def test_negative_or_non_numeric_yields_nan(self):
+        """Invalid σ (negative, non-numeric) → NaN. The optimizer's B.3
+        coercion path will then treat them as zero penalty."""
+        tickers = ["A", "B", "C", "SPY", "CASH"]
+        preds = {
+            "A": {"predicted_alpha": 0.01, "predicted_alpha_std": -0.05},
+            "B": {"predicted_alpha": 0.02, "predicted_alpha_std": "not-a-number"},
+            "C": {"predicted_alpha": 0.03, "predicted_alpha_std": float("inf")},
+        }
+        sigma = _build_alpha_uncertainty(tickers, preds, spy_idx=3, cash_idx=4)
+        assert np.isnan(sigma[0])
+        assert np.isnan(sigma[1])
+        assert np.isnan(sigma[2])
+
+    def test_partial_rollout_some_tickers_have_std_others_dont(self):
+        """Mixed case: AAPL has BR std (fresh BayesianRidge inference),
+        MSFT was scored by legacy Ridge inside the same predictions JSON
+        (transient mid-rollout state). Must work."""
+        tickers = ["AAPL", "MSFT", "SPY", "CASH"]
+        preds = {
+            "AAPL": {"predicted_alpha": 0.04, "predicted_alpha_std": 0.025},
+            "MSFT": {"predicted_alpha": 0.02},  # legacy path
+        }
+        sigma = _build_alpha_uncertainty(tickers, preds, spy_idx=2, cash_idx=3)
+        assert sigma[0] == pytest.approx(0.025)
+        assert np.isnan(sigma[1])
+        assert sigma[2] == 0.0 and sigma[3] == 0.0
+
+
+class TestShadowWiringAndAblation:
+    """End-to-end: shadow wrapper threads predicted_alpha_std into the
+    optimizer and emits the ablation block when γ > 0."""
+
+    def _inputs_with_std(self, gamma=0.0):
+        inputs = _baseline_inputs()
+        # Augment predictions with BR std field per B.1
+        inputs["predictions_by_ticker"]["AAPL"]["predicted_alpha_std"] = 0.040  # diffuse
+        inputs["predictions_by_ticker"]["MSFT"]["predicted_alpha_std"] = 0.005  # confident
+        inputs["predictions_by_ticker"]["JNJ"]["predicted_alpha_std"] = 0.020
+        if gamma > 0:
+            inputs["config"] = {
+                **inputs["config"],
+                "portfolio_optimizer": {"alpha_uncertainty_penalty": gamma},
+            }
+        return inputs
+
+    def test_shadow_log_includes_alpha_uncertainty_field(self):
+        """Per-ticker σ_α̂ emitted in the shadow JSON for full diagnostic
+        visibility. NaN-as-None per JSON-safe conversion."""
+        inputs = self._inputs_with_std(gamma=0.0)
+        s3 = MagicMock()
+        log = run_shadow_optimizer(s3_client=s3, **inputs)
+        assert log is not None
+        assert "alpha_uncertainty" in log
+        assert len(log["alpha_uncertainty"]) == log["n_tickers"]
+        # Ordering: same as `tickers` list. SPY/CASH at end are 0.0 (sentinels).
+        # The 3 real tickers should have populated σ_α̂ (sorted alphabetically
+        # by _build_universe → AAPL, JNJ, MSFT order).
+        tickers = log["tickers"]
+        spy_pos = tickers.index("SPY")
+        cash_pos = tickers.index("CASH")
+        assert log["alpha_uncertainty"][spy_pos] == 0.0
+        assert log["alpha_uncertainty"][cash_pos] == 0.0
+        # AAPL appears in the universe with predicted_alpha_std=0.040
+        assert log["alpha_uncertainty"][tickers.index("AAPL")] == pytest.approx(0.040)
+        assert log["alpha_uncertainty"][tickers.index("MSFT")] == pytest.approx(0.005)
+        assert log["alpha_uncertainty"][tickers.index("JNJ")]  == pytest.approx(0.020)
+
+    def test_ablation_skipped_when_gamma_zero(self):
+        """Default γ=0 → no ablation block (active solve already IS no-penalty)."""
+        inputs = self._inputs_with_std(gamma=0.0)
+        s3 = MagicMock()
+        log = run_shadow_optimizer(s3_client=s3, **inputs)
+        assert log is not None
+        assert "uncertainty_ablation" not in log
+        # Diagnostics should also report penalty_used=False
+        assert log["diagnostics"]["alpha_uncertainty_penalty_used"] is False
+
+    def test_ablation_emitted_when_gamma_positive(self):
+        """γ > 0 with usable σ_α̂ signal → ablation block populated with
+        side-by-side no-penalty weights + diff summary."""
+        inputs = self._inputs_with_std(gamma=500.0)
+        s3 = MagicMock()
+        log = run_shadow_optimizer(s3_client=s3, **inputs)
+        assert log is not None
+        ab = log.get("uncertainty_ablation")
+        assert ab is not None
+        assert ab["gamma"] == 500.0
+        assert len(ab["no_penalty_weights"]) == log["n_tickers"]
+        assert "no_penalty_diagnostics" in ab
+        assert ab["l1_delta"] >= 0
+        assert ab["max_abs_delta"] >= 0
+        # Diagnostics on the canonical (with-penalty) solve must report
+        # penalty_used=True
+        assert log["diagnostics"]["alpha_uncertainty_penalty_used"] is True
+
+    def test_ablation_skipped_when_no_usable_std_signal(self):
+        """γ > 0 but predictions JSON has no predicted_alpha_std anywhere
+        (legacy Ridge inference) → ablation skipped (canonical IS
+        no-penalty already since the B.3 path treats all-NaN as inactive)."""
+        inputs = _baseline_inputs()
+        inputs["config"] = {
+            **inputs["config"],
+            "portfolio_optimizer": {"alpha_uncertainty_penalty": 500.0},
+        }
+        # No predicted_alpha_std added to any ticker
+        s3 = MagicMock()
+        log = run_shadow_optimizer(s3_client=s3, **inputs)
+        assert log is not None
+        assert "uncertainty_ablation" not in log
+        # And the canonical solve also reports no penalty active
+        assert log["diagnostics"]["alpha_uncertainty_penalty_used"] is False
+
+    def test_per_ticker_delta_only_lists_names_that_moved(self):
+        """The shadow JSON's per_ticker_delta list only includes names that
+        moved ≥ 1bp — keeps the log compact while preserving observability
+        on the names that actually changed under the penalty."""
+        # Construct a case where most names don't move: γ very low so the
+        # penalty is dominated by α̂ gain
+        inputs = self._inputs_with_std(gamma=0.01)
+        s3 = MagicMock()
+        log = run_shadow_optimizer(s3_client=s3, **inputs)
+        assert log is not None
+        ab = log.get("uncertainty_ablation")
+        if ab is not None:
+            # All listed names actually moved by ≥ 1bp
+            for entry in ab["per_ticker_delta"]:
+                assert abs(entry["delta"]) >= 1e-4
+            # n_names_moved must equal length of the list
+            assert ab["n_names_moved"] == len(ab["per_ticker_delta"])
