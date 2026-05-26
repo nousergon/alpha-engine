@@ -244,3 +244,160 @@ def test_infeasibility_falls_back_to_current_weights_plus_cash():
             "Fallback should preserve the rough current allocation profile "
             "(asset 0 was 0.50, SPY was 0.47)"
         )
+
+
+# ─── A.1 horizon-scaling tests ──────────────────────────────────────────────
+# Plan: alpha-engine-docs/private/optimizer-sota-upgrades-260526.md §A.1
+#
+# Σ is configurable at horizon H (default 1 = daily). The optimizer's three
+# Σ touchpoints (objective, vol-target SOC, diagnostics) must all consume
+# the same horizon; default H=1 preserves bit-identical legacy behavior.
+
+
+def _estimate_cov_via_solve(u: dict) -> np.ndarray:
+    """Helper to extract the Σ used inside solve via _estimate_covariance."""
+    from executor.portfolio_optimizer import (
+        OPTIMIZER_CONFIG_DEFAULTS,
+        _estimate_covariance,
+    )
+    cfg = {**OPTIMIZER_CONFIG_DEFAULTS, **u["cfg"]}
+    return _estimate_covariance(u["returns_panel"], cfg)
+
+
+def test_default_horizon_preserves_legacy_behavior():
+    """Default cfg (no sigma_horizon_days) must match explicit H=1 bit-identical."""
+    u_default = _baseline_universe(n_active=2)
+    u_default["alpha_hat"][:2] = 0.05
+    u_default["cfg"] = {"covariance_shrinkage": "sample"}
+
+    u_h1 = _baseline_universe(n_active=2)
+    u_h1["alpha_hat"][:2] = 0.05
+    u_h1["returns_panel"] = u_default["returns_panel"].copy()
+    u_h1["cfg"] = {"covariance_shrinkage": "sample", "sigma_horizon_days": 1}
+
+    r_default = _solve(u_default)
+    r_h1 = _solve(u_h1)
+
+    np.testing.assert_allclose(r_default.weights, r_h1.weights, atol=1e-8)
+    assert r_default.diagnostics["portfolio_vol_ann"] == pytest.approx(
+        r_h1.diagnostics["portfolio_vol_ann"], abs=1e-10
+    )
+
+
+def test_sigma_scales_linearly_with_horizon():
+    """Σ_H = H · Σ_daily — covariance matrix scales linearly in horizon-days."""
+    u_h1 = _baseline_universe(n_active=3)
+    u_h1["cfg"] = {"covariance_shrinkage": "sample", "sigma_horizon_days": 1}
+    sigma_1 = _estimate_cov_via_solve(u_h1)
+
+    u_h21 = _baseline_universe(n_active=3)
+    u_h21["returns_panel"] = u_h1["returns_panel"].copy()
+    u_h21["cfg"] = {"covariance_shrinkage": "sample", "sigma_horizon_days": 21}
+    sigma_21 = _estimate_cov_via_solve(u_h21)
+
+    np.testing.assert_allclose(sigma_21, 21.0 * sigma_1, rtol=1e-10)
+
+
+def test_scaling_invariance_horizon_with_compensating_lambda():
+    """Mathematical invariance: solving with (Σ_H, λ_old/H) yields same weights as (Σ_1, λ_old).
+
+    Proves the load-bearing claim that absorbing horizon into λ is mathematically
+    equivalent to scaling Σ by H and rescaling λ. This is the SOTA-rationale gate
+    from the plan doc §A.1 — without this proof, the horizon switch would silently
+    change optimum weights.
+    """
+    u_base = _baseline_universe(n_active=3)
+    u_base["alpha_hat"][:3] = np.array([0.03, 0.05, 0.02])
+    lambda_base = 5.0
+
+    u_h1 = {**u_base, "cfg": {
+        "covariance_shrinkage": "sample",
+        "sigma_horizon_days": 1,
+        "risk_aversion": lambda_base,
+    }}
+    u_h21 = {**u_base, "cfg": {
+        "covariance_shrinkage": "sample",
+        "sigma_horizon_days": 21,
+        "risk_aversion": lambda_base / 21.0,  # compensating rescale
+    }}
+
+    r_h1 = _solve(u_h1)
+    r_h21 = _solve(u_h21)
+
+    np.testing.assert_allclose(r_h1.weights, r_h21.weights, atol=1e-5)
+
+
+def test_vol_ann_diagnostic_horizon_invariant():
+    """Same portfolio under H=1 and H=21 must produce the same annualized vol diagnostic."""
+    u_h1 = _baseline_universe(n_active=2)
+    u_h1["alpha_hat"][:2] = 0.05
+    u_h1["cfg"] = {"covariance_shrinkage": "sample", "sigma_horizon_days": 1}
+    r_h1 = _solve(u_h1)
+
+    u_h21 = _baseline_universe(n_active=2)
+    u_h21["alpha_hat"][:2] = 0.05
+    u_h21["returns_panel"] = u_h1["returns_panel"].copy()
+    u_h21["cfg"] = {
+        "covariance_shrinkage": "sample",
+        "sigma_horizon_days": 21,
+        "risk_aversion": OPTIMIZER_CONFIG_DEFAULTS["risk_aversion"] / 21.0,
+    }
+    r_h21 = _solve(u_h21)
+
+    assert r_h21.diagnostics["portfolio_vol_ann"] == pytest.approx(
+        r_h1.diagnostics["portfolio_vol_ann"], rel=1e-5
+    )
+
+
+def test_vol_target_soc_horizon_aware():
+    """vol_target_annual must bind to the same annualized cap regardless of Σ horizon.
+
+    A binding 10% annual vol cap on a high-vol universe should produce the same
+    portfolio annualized vol whether Σ is daily (H=1) or 21d (H=21).
+    """
+    N = 6
+    T = 5000
+    rng = np.random.default_rng(11)
+    active_vol = 0.05
+    spy_vol = 0.005
+    returns = np.column_stack([
+        rng.normal(0, active_vol, T),
+        rng.normal(0, active_vol, T),
+        rng.normal(0, active_vol, T),
+        rng.normal(0, active_vol, T),
+        rng.normal(0, spy_vol, T),
+        np.zeros(T),
+    ])
+    base_u = {
+        "tickers": ["T0", "T1", "T2", "T3", "SPY", "CASH"],
+        "alpha_hat": np.array([0.10, 0.10, 0.10, 0.10, 0.0, -1e-6]),
+        "returns_panel": returns,
+        "w_prev": np.zeros(N),
+        "sectors": ["tech", "tech", "tech", "tech", "__benchmark__", "__cash__"],
+        "stance_caps": np.array([0.08, 0.08, 0.08, 0.08, 1.0, 1.0]),
+        "eligibility": np.ones(N, dtype=bool),
+        "spy_idx": 4,
+        "cash_idx": 5,
+    }
+    cfg_common = {"vol_target_annual": 0.10, "covariance_shrinkage": "sample"}
+
+    r_h1 = solve_target_weights(**{**base_u, "cfg": {**cfg_common, "sigma_horizon_days": 1}})
+    r_h21 = solve_target_weights(**{
+        **base_u, "cfg": {**cfg_common, "sigma_horizon_days": 21, "risk_aversion": 5.0 / 21.0},
+    })
+
+    assert r_h1.diagnostics["portfolio_vol_ann"] <= 0.10 + 5e-3
+    assert r_h21.diagnostics["portfolio_vol_ann"] <= 0.10 + 5e-3
+    assert r_h1.diagnostics["portfolio_vol_ann"] == pytest.approx(
+        r_h21.diagnostics["portfolio_vol_ann"], rel=1e-3,
+    )
+
+
+def test_sigma_horizon_days_below_one_raises():
+    """sigma_horizon_days < 1 is a config error — raise loud per no-silent-fails."""
+    u = _baseline_universe(n_active=1)
+    u["alpha_hat"][0] = 0.05
+    u["cfg"] = {"sigma_horizon_days": 0, "covariance_shrinkage": "sample"}
+
+    with pytest.raises(ValueError, match="sigma_horizon_days must be ≥ 1"):
+        _solve(u)
