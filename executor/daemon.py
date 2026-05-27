@@ -50,6 +50,7 @@ from executor.intraday_snapshot import (
     IntradaySnapshotWriter,
     compute_surveillance_universe,
 )
+from executor.open_orders_artifact import OpenOrdersSnapshotWriter
 from executor.daemon_state_logger import get_logger as _get_decision_logger
 from executor.market_hours import is_market_hours
 from executor.notifier import send_daemon_status, send_trade_alert
@@ -519,6 +520,15 @@ def run_daemon(dry_run: bool = False) -> None:
         daemon_pid=os.getpid(),
     )
 
+    # Open-IB-orders snapshot writer — publishes trades/open_orders/latest.json
+    # each tick so the dashboard's reconciliation table can render the
+    # "Working $" column alongside the optimizer's "Planned $". Same
+    # fire-and-forget contract as IntradaySnapshotWriter.
+    open_orders_writer = OpenOrdersSnapshotWriter(
+        bucket=config["signals_bucket"],
+        daemon_pid=os.getpid(),
+    )
+
     n_urgent = len(order_book.pending_urgent_exits())
     send_daemon_status(
         f"\u2705 *Daemon started*\n"
@@ -828,6 +838,23 @@ def run_daemon(dry_run: bool = False) -> None:
                 # swallow S3 errors. This catch ensures no unexpected
                 # exception from the writer leaks into the trade loop.
                 logger.warning("intraday snapshot writer raised: %s", _snap_err)
+
+            # ── Open-IB-orders snapshot ──────────────────────────────
+            # Refresh trades/open_orders/latest.json each tick so the
+            # dashboard's reconciliation view sees the current working-
+            # order state. Fire-and-forget; same defensive try/except
+            # belt as the price snapshot writer above.
+            try:
+                if ibkr.ib.isConnected():
+                    open_orders_writer.write(
+                        ibkr.ib.openTrades(),
+                        calendar_date=run_date,
+                        trading_day=run_date,
+                    )
+            except Exception as _oo_err:  # noqa: BLE001
+                logger.warning(
+                    "open-orders snapshot writer raised: %s", _oo_err,
+                )
 
             # ── Heartbeat ─────────────────────────────────────────────
             _elapsed = _time.time() - _last_heartbeat
