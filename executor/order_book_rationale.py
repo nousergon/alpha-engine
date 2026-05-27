@@ -46,7 +46,7 @@ from typing import Any, Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = "1.1.0"
 
 # Default S3 prefix. Lives under ``trades/`` alongside the order book
 # itself (``trades/order_book/{date}.json``) so the rationale and the
@@ -507,6 +507,26 @@ def build_order_book_rationale(
             f"n_{r['terminal_state']}", 0
         ) + 1
 
+    # Optimizer reconciliation projection — surfaces target-vs-current
+    # NAV state + the rebalance band so consumers can render the
+    # three-way "target / current / planned trade / residual gap" view
+    # without re-reading the optimizer shadow log. All four fields are
+    # None on legacy non-optimizer runs (the shadow log is absent).
+    portfolio_nav: float | None = None
+    optimizer_trades: list[dict[str, Any]] | None = None
+    rebalance_band_pct: float | None = None
+    if isinstance(optimizer_shadow_log, Mapping):
+        _nav = optimizer_shadow_log.get("portfolio_nav")
+        if isinstance(_nav, (int, float)):
+            portfolio_nav = float(_nav)
+        _trades = optimizer_shadow_log.get("would_be_trades")
+        if isinstance(_trades, list):
+            optimizer_trades = [dict(t) for t in _trades if isinstance(t, Mapping)]
+        _cfg = optimizer_shadow_log.get("optimizer_cfg") or {}
+        _band = _cfg.get("rebalance_band_pct") if isinstance(_cfg, Mapping) else None
+        if isinstance(_band, (int, float)):
+            rebalance_band_pct = float(_band)
+
     return {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
@@ -516,6 +536,9 @@ def build_order_book_rationale(
         "signal_date": signal_date,
         "prediction_date": prediction_date,
         "market_regime": market_regime,
+        "portfolio_nav": portfolio_nav,
+        "optimizer_trades": optimizer_trades,
+        "rebalance_band_pct": rebalance_band_pct,
         "summary": summary,
         "tickers": records,
     }
