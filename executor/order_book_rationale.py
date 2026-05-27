@@ -62,25 +62,22 @@ STATE_PREDICTOR_VETOED = "predictor_vetoed"
 STATE_RISK_BLOCKED = "risk_blocked"
 STATE_HELD = "held"
 # Generic NO_ACTION kept as a compatibility alias — the producer now
-# always emits one of the four named sub-states below. Consumers reading
+# always emits one of the two sub-states below. Consumers reading
 # pre-1.2.0 artifacts may still encounter the bare slug.
 STATE_NO_ACTION = "no_action"
-# Sub-states (schema 1.2.0+) — split the residual no-action bucket so
-# the per-ticker decision chain explains *why* the ticker was considered
-# but not acted on. Priority order at classification time:
-#   1. Research HOLD on a non-held ticker         → research_hold
-#   2. Research EXIT/REDUCE on a non-held ticker  → research_exit (orphan)
-#   3. Optimizer view present, target ≈ 0         → optimizer_zero_weight
-#   4. Anything else                              → unknown (should be 0)
-STATE_NO_ACTION_RESEARCH_HOLD = "no_action_research_hold"
-STATE_NO_ACTION_RESEARCH_EXIT = "no_action_research_exit"
+# Sub-states (schema 1.2.0+) — the only ways a ticker can land in the
+# no-action bucket post-filter are:
+#   1. Research ENTER + optimizer eligible + target ≈ 0 → optimizer_zero
+#      (the "we looked and chose not to" case)
+#   2. Anything else → unknown (should be 0; flags a producer bug)
+# Research HOLD / EXIT / REDUCE on a non-held ticker is filtered out
+# of the considered universe entirely — those rows are dead signals
+# (no possible order-book interaction) and would only add noise.
 STATE_NO_ACTION_OPTIMIZER_ZERO = "no_action_optimizer_zero_weight"
 STATE_NO_ACTION_UNKNOWN = "no_action_unknown"
 
 _NO_ACTION_STATES = frozenset({
     STATE_NO_ACTION,
-    STATE_NO_ACTION_RESEARCH_HOLD,
-    STATE_NO_ACTION_RESEARCH_EXIT,
     STATE_NO_ACTION_OPTIMIZER_ZERO,
     STATE_NO_ACTION_UNKNOWN,
 })
@@ -92,12 +89,10 @@ _STATE_ORDER = {
     STATE_PREDICTOR_VETOED: 3,
     STATE_RISK_BLOCKED: 4,
     STATE_HELD: 5,
-    STATE_NO_ACTION_RESEARCH_HOLD: 6,
-    STATE_NO_ACTION_RESEARCH_EXIT: 7,
-    STATE_NO_ACTION_OPTIMIZER_ZERO: 8,
-    STATE_NO_ACTION_UNKNOWN: 9,
+    STATE_NO_ACTION_OPTIMIZER_ZERO: 6,
+    STATE_NO_ACTION_UNKNOWN: 7,
     # Compatibility — legacy aggregate slug sorts with the others.
-    STATE_NO_ACTION: 9,
+    STATE_NO_ACTION: 7,
 }
 
 # risk_events rules emitted when the *predictor* (not research/risk)
@@ -220,38 +215,23 @@ _OPTIMIZER_TARGET_ZERO_EPSILON = 1e-6
 
 def _classify_no_action(
     *,
-    sig: Mapping[str, Any] | None,
     opt_view: Mapping[str, Any] | None,
 ) -> tuple[str, str | None]:
     """Classify a ticker that fell through to the no-action terminal state.
 
-    Priority — first match wins:
-      1. Research HOLD on a non-held ticker (informational; research
-         said hold but we don't own it).
-      2. Research EXIT or REDUCE on a non-held ticker (orphan exit
-         signal; we never owned it).
-      3. Optimizer view present and target weight ≈ 0 (research said
-         ENTER or was silent; the optimizer looked and chose not to
-         allocate — the load-bearing "considered but not selected"
-         case).
-      4. Unknown — production should never produce this; surfacing it
-         distinctly lets the dashboard flag a producer bug.
+    Post-filter, the only way to land here is a research ENTER signal
+    that didn't make it into approved / blocked / risk-evented. The
+    optimizer view (when present) supplies the explanation.
+
+      - Optimizer view present, target ≈ 0 → optimizer_zero_weight
+        (the "we looked and chose not to allocate" case).
+      - Anything else → unknown — should be 0 in production; surfacing
+        distinctly lets the dashboard flag a producer bug.
 
     Returns the sub-state slug + a short human-readable detail string
     appended to the decision chain so the per-ticker drill-down
     explains the fallthrough.
     """
-    signal = (sig or {}).get("signal") if sig else None
-    if signal == "HOLD":
-        return (
-            STATE_NO_ACTION_RESEARCH_HOLD,
-            "research HOLD on a ticker not currently held",
-        )
-    if signal in ("EXIT", "REDUCE"):
-        return (
-            STATE_NO_ACTION_RESEARCH_EXIT,
-            f"research {signal} on a ticker not currently held (orphan)",
-        )
     if isinstance(opt_view, Mapping):
         tgt = opt_view.get("target_weight")
         if isinstance(tgt, (int, float)) and abs(tgt) < _OPTIMIZER_TARGET_ZERO_EPSILON:
@@ -261,7 +241,7 @@ def _classify_no_action(
             )
     return (
         STATE_NO_ACTION_UNKNOWN,
-        "no research action signal and no optimizer view",
+        "research ENTER signal with no order, block, or optimizer view",
     )
 
 
@@ -453,8 +433,18 @@ def build_order_book_rationale(
         if t and t not in first_event:
             first_event[t] = ev
 
+    # The considered universe is "tickers with at least one possible
+    # order-book interaction today." Research HOLD / EXIT / REDUCE on a
+    # ticker we do NOT currently hold is an informational research view
+    # with no actionable side — there is nothing to sell, and HOLD by
+    # definition does not change position. Such signals are dead for
+    # the order-book rationale and are filtered out so they don't bulk
+    # up the table with rows the operator cannot act on. Research HOLD /
+    # EXIT / REDUCE on a held ticker is still surfaced — those tickers
+    # are in _held_set and pick up the STATE_HELD / urgent_exit /
+    # reduce path naturally.
     considered = (
-        set(enter) | set(research_hold) | set(exited) | set(reduced)
+        set(enter)
         | set(approved) | set(urgent) | set(blocked) | set(first_event)
         | _held_set
     )
@@ -568,9 +558,7 @@ def build_order_book_rationale(
                     ),
                 })
         else:
-            state, _na_detail = _classify_no_action(
-                sig=sig, opt_view=opt_view,
-            )
+            state, _na_detail = _classify_no_action(opt_view=opt_view)
             chain.append({
                 "stage": "no_action",
                 "result": state,
