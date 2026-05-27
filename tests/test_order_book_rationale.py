@@ -461,6 +461,66 @@ class TestOptimizerShadowLogSynthesis:
         # Legacy rule slug survives — synth row was filtered.
         assert nvda["exclusion"]["rule"] == "legacy_rule"
 
+    def test_reconciliation_fields_projected_from_shadow_log(self):
+        # Producer must surface portfolio_nav, would_be_trades, and the
+        # rebalance band into the rationale payload so the dashboard
+        # renders the target-vs-current-vs-planned reconciliation view
+        # without a second S3 read of the optimizer shadow log.
+        scenario = self._optimizer_scenario()
+        scenario["optimizer_shadow_log"] = {
+            **scenario["optimizer_shadow_log"],
+            "portfolio_nav": 125_000.0,
+            "would_be_trades": [
+                {"ticker": "AAPL", "action": "BUY",
+                 "delta_weight": 0.041, "delta_dollars": 5125.0,
+                 "target_weight": 0.041, "current_weight": 0.0},
+                {"ticker": "MSFT", "action": "SELL",
+                 "delta_weight": -0.032, "delta_dollars": -4000.0,
+                 "target_weight": 0.0, "current_weight": 0.032},
+            ],
+            "optimizer_cfg": {
+                **scenario["optimizer_shadow_log"]["optimizer_cfg"],
+                "rebalance_band_pct": 0.005,
+            },
+        }
+        payload = build_order_book_rationale(**scenario)
+        assert payload["portfolio_nav"] == 125_000.0
+        assert payload["rebalance_band_pct"] == 0.005
+        trades = payload["optimizer_trades"]
+        assert isinstance(trades, list) and len(trades) == 2
+        aapl_trade = next(t for t in trades if t["ticker"] == "AAPL")
+        assert aapl_trade["action"] == "BUY"
+        assert aapl_trade["delta_dollars"] == 5125.0
+        assert aapl_trade["target_weight"] == 0.041
+
+    def test_reconciliation_fields_none_when_no_shadow_log(self, scenario):
+        # Legacy non-optimizer run → fields default to None so the
+        # consumer can detect "no reconciliation view available" without
+        # KeyErrors.
+        payload = build_order_book_rationale(**scenario)
+        assert payload["portfolio_nav"] is None
+        assert payload["optimizer_trades"] is None
+        assert payload["rebalance_band_pct"] is None
+
+    def test_reconciliation_fields_partial_shadow_log_safe(self):
+        # Defensive: a shadow log that omits portfolio_nav /
+        # would_be_trades / rebalance_band_pct (e.g. an older
+        # producer or a sentinel-state log) must not crash the
+        # rationale build. Missing fields → None.
+        scenario = self._optimizer_scenario()
+        scenario["optimizer_shadow_log"] = {
+            "shadow_status": "ok",
+            "tickers": scenario["optimizer_shadow_log"]["tickers"],
+            "eligibility": scenario["optimizer_shadow_log"]["eligibility"],
+            "eligibility_reasons":
+                scenario["optimizer_shadow_log"]["eligibility_reasons"],
+            "optimizer_cfg": scenario["optimizer_shadow_log"]["optimizer_cfg"],
+        }
+        payload = build_order_book_rationale(**scenario)
+        assert payload["portfolio_nav"] is None
+        assert payload["optimizer_trades"] is None
+        assert payload["rebalance_band_pct"] is None
+
     def test_optimizer_shadow_eligibility_reasons_field_in_log(self):
         # Sanity: the field name the producer reads matches what
         # optimizer_shadow.py emits. Pins the contract between the two
