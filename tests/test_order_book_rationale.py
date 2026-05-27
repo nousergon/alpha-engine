@@ -18,6 +18,8 @@ from executor.order_book_rationale import (
     STATE_APPROVED_ENTRY,
     STATE_HELD,
     STATE_NO_ACTION,
+    STATE_NO_ACTION_OPTIMIZER_ZERO,
+    STATE_NO_ACTION_UNKNOWN,
     STATE_PREDICTOR_VETOED,
     STATE_REDUCE,
     STATE_RISK_BLOCKED,
@@ -142,14 +144,20 @@ def test_every_terminal_state_resolved(scenario):
     assert by_ticker["NVDA"] == STATE_RISK_BLOCKED
     assert by_ticker["AMD"] == STATE_PREDICTOR_VETOED
     assert by_ticker["KO"] == STATE_HELD
-    assert by_ticker["XOM"] == STATE_NO_ACTION
+    # XOM: research EXIT signal on a non-held ticker — operationally
+    # a dead signal (no possible order) so filtered out of the
+    # considered universe entirely under 1.2.0+. Pre-1.2.0 emitted a
+    # bare STATE_NO_ACTION row for it.
+    assert "XOM" not in by_ticker
 
 
 def test_considered_universe_is_union_of_all_sources(scenario):
+    # XOM (research EXIT on a non-held ticker) is filtered out under
+    # the 1.2.0+ rule — operationally dead signal, nothing to sell.
     payload = build_order_book_rationale(**scenario)
     tickers = {r["ticker"] for r in payload["tickers"]}
-    assert tickers == {"AAPL", "MSFT", "TSLA", "NVDA", "AMD", "KO", "XOM"}
-    assert payload["summary"]["n_considered"] == 7
+    assert tickers == {"AAPL", "MSFT", "TSLA", "NVDA", "AMD", "KO"}
+    assert payload["summary"]["n_considered"] == 6
 
 
 def test_excluded_ticker_carries_specific_gate(scenario):
@@ -207,14 +215,21 @@ def test_summary_counts_match_records(scenario):
     assert s[f"n_{STATE_RISK_BLOCKED}"] == 1
     assert s[f"n_{STATE_PREDICTOR_VETOED}"] == 1
     assert s[f"n_{STATE_HELD}"] == 1
-    assert s[f"n_{STATE_NO_ACTION}"] == 1
+    # XOM (research EXIT on a non-held ticker) is filtered out — no
+    # no-action sub-state appears in this scenario's summary at all.
+    assert f"n_{STATE_NO_ACTION}" not in s
+    assert f"n_{STATE_NO_ACTION_OPTIMIZER_ZERO}" not in s
+    assert f"n_{STATE_NO_ACTION_UNKNOWN}" not in s
 
 
 def test_records_sorted_actioned_first(scenario):
     payload = build_order_book_rationale(**scenario)
     states = [r["terminal_state"] for r in payload["tickers"]]
     assert states[0] == STATE_APPROVED_ENTRY
-    assert states[-1] == STATE_NO_ACTION
+    # KO (STATE_HELD) is the lowest-priority remaining state after
+    # XOM was filtered out — held tickers always sit last among the
+    # remaining actioned/considered states.
+    assert states[-1] == STATE_HELD
 
 
 def test_payload_is_audit_stable_and_serializable(scenario):
@@ -286,7 +301,7 @@ def test_write_creates_dated_artifact_and_sidecar(scenario):
     # Sidecar must carry artifact_key so load_latest_eval_artifact resolves.
     assert sidecar["artifact_key"] == result["artifact_key"]
     assert sidecar["run_id"] == "2605151400"
-    assert sidecar["n_considered"] == 7
+    assert sidecar["n_considered"] == 6
 
 
 def test_write_latest_false_skips_sidecar(scenario):
@@ -313,7 +328,7 @@ def test_round_trip_via_lib_loader(scenario):
         s3, bucket="alpha-engine-research", prefix=DEFAULT_S3_PREFIX
     )
     assert loaded["run_id"] == payload["run_id"]
-    assert loaded["summary"]["n_considered"] == 7
+    assert loaded["summary"]["n_considered"] == 6
 
 
 # ── optimizer-aware path (L121) ─────────────────────────────────────────
@@ -589,11 +604,15 @@ class TestHeldFromPortfolioTruth:
         assert axp["terminal_state"] == STATE_HELD
         assert axp["held"] is True
 
-    def test_non_held_ticker_with_research_hold_is_no_action(self):
+    def test_non_held_ticker_with_research_hold_filtered_out(self):
         # SYK case: research recommends HOLD but the ticker is not in
-        # the portfolio (cur_w=0). Research HOLD on a non-held ticker
-        # is an informational opinion, NOT a held state — resolve to
-        # STATE_NO_ACTION so the table doesn't claim we hold it.
+        # the portfolio. Research HOLD on a non-held ticker is an
+        # informational opinion with NO possible order-book interaction
+        # (we can't "hold" something we don't own; HOLD does not
+        # initiate a buy). Under 1.2.0+ such rows are filtered from
+        # the considered universe rather than added as a no-action
+        # row — they would only bulk the table with noise the
+        # operator cannot act on.
         payload = build_order_book_rationale(
             signals={"enter": [], "exit": [], "reduce": [],
                      "hold": [_sig("SYK", "HOLD")]},
@@ -610,9 +629,9 @@ class TestHeldFromPortfolioTruth:
             run_id="2605201400",
             current_positions={},
         )
-        syk = next(r for r in payload["tickers"] if r["ticker"] == "SYK")
-        assert syk["terminal_state"] == STATE_NO_ACTION
-        assert syk["held"] is False
+        tickers = {r["ticker"] for r in payload["tickers"]}
+        assert "SYK" not in tickers
+        assert payload["summary"]["n_considered"] == 0
 
     def test_held_ticker_silent_from_research_appears_in_table(self):
         # A position the IB portfolio holds but research has no opinion
@@ -746,3 +765,193 @@ def test_obr_write_failure_publishes_alert_not_silent_swallow():
         "lazily (inside the except) so a missing lib at boot doesn't "
         "break the planner cold-start."
     )
+
+
+# ── considered-universe filter + no-action sub-states (schema 1.2.0+) ──
+#
+# 1.2.0+ filters dead-signal rows (research HOLD / EXIT / REDUCE on a
+# non-held ticker) out of the considered universe entirely — those
+# signals have no possible order-book interaction and would only add
+# noise. Post-filter, the only way to land in the no-action bucket
+# is a research ENTER signal that didn't materialize as an order,
+# block, or risk event. Two sub-states remain:
+#   - optimizer_zero_weight (the "optimizer chose 0" case)
+#   - unknown (should be 0; flags a producer bug per
+#     [[feedback_no_silent_fails]])
+
+
+class TestDeadSignalFiltering:
+    """Research HOLD / EXIT / REDUCE on a non-held ticker is dead — no
+    order is possible. 1.2.0+ filters these out of the considered
+    universe entirely so the table only carries rows the operator can
+    act on (or already has)."""
+
+    def _empty_books(self) -> dict[str, Any]:
+        return {
+            "date": "2026-05-27",
+            "approved_entries": [],
+            "urgent_exits": [],
+            "active_stops": [],
+            "executed_today": [],
+        }
+
+    def _base_kwargs(self) -> dict[str, Any]:
+        return dict(
+            order_book_data=self._empty_books(),
+            blocked_entries=[],
+            risk_events=[],
+            market_regime="neutral",
+            run_date="2026-05-27",
+            signal_date="2026-05-27",
+            prediction_date="2026-05-27",
+            calendar_date="2026-05-27",
+            trading_day="2026-05-27",
+            run_id="2605271400",
+            current_positions={},
+        )
+
+    def test_research_hold_on_non_position_filtered_out(self):
+        payload = build_order_book_rationale(
+            signals={"enter": [], "exit": [], "reduce": [],
+                     "hold": [_sig("SYK", "HOLD")]},
+            predictions_by_ticker={},
+            **self._base_kwargs(),
+        )
+        assert payload["summary"]["n_considered"] == 0
+
+    def test_research_exit_on_non_position_filtered_out(self):
+        payload = build_order_book_rationale(
+            signals={"enter": [], "exit": [_sig("XOM", "EXIT")],
+                     "reduce": [], "hold": []},
+            predictions_by_ticker={},
+            **self._base_kwargs(),
+        )
+        assert payload["summary"]["n_considered"] == 0
+
+    def test_research_reduce_on_non_position_filtered_out(self):
+        payload = build_order_book_rationale(
+            signals={"enter": [], "exit": [], "reduce": [_sig("BAC", "REDUCE")],
+                     "hold": []},
+            predictions_by_ticker={},
+            **self._base_kwargs(),
+        )
+        assert payload["summary"]["n_considered"] == 0
+
+    def test_research_hold_on_held_position_still_surfaces(self):
+        # The filter is "non-held only" — HOLD on a position we DO own
+        # must still surface (as STATE_HELD) so the table answers
+        # "what positions am I carrying?" for the full portfolio.
+        kwargs = self._base_kwargs()
+        kwargs["current_positions"] = {"AAPL": {"mkt_val": 5000}}
+        payload = build_order_book_rationale(
+            signals={"enter": [], "exit": [], "reduce": [],
+                     "hold": [_sig("AAPL", "HOLD")]},
+            predictions_by_ticker={},
+            **kwargs,
+        )
+        aapl = next(r for r in payload["tickers"] if r["ticker"] == "AAPL")
+        assert aapl["terminal_state"] == STATE_HELD
+
+
+class TestNoActionSubStates:
+    def _empty_books(self) -> dict[str, Any]:
+        return {
+            "date": "2026-05-27",
+            "approved_entries": [],
+            "urgent_exits": [],
+            "active_stops": [],
+            "executed_today": [],
+        }
+
+    def _base_kwargs(self) -> dict[str, Any]:
+        return dict(
+            order_book_data=self._empty_books(),
+            blocked_entries=[],
+            risk_events=[],
+            market_regime="neutral",
+            run_date="2026-05-27",
+            signal_date="2026-05-27",
+            prediction_date="2026-05-27",
+            calendar_date="2026-05-27",
+            trading_day="2026-05-27",
+            run_id="2605271400",
+            current_positions={},
+        )
+
+    def test_research_enter_optimizer_zero_target_classified_optimizer_zero(self):
+        # The load-bearing operator case: research said ENTER, the
+        # optimizer ran, the ticker was eligible, but the optimizer
+        # assigned ~0 target weight → "we looked and chose not to."
+        # Research bucket alone is what surfaces the ticker into the
+        # considered universe; the optimizer view supplies the detail.
+        shadow = {
+            "tickers": ["F"],
+            "current_weights": [0.0],
+            "target_weights": [0.0],
+            "alpha_hat": [0.001],
+            "eligibility": [True],
+            "eligibility_reasons": [None],
+            "optimizer_cfg": {"min_score_to_enter": 55.0},
+        }
+        payload = build_order_book_rationale(
+            signals={"enter": [_sig("F", "ENTER", score=65.0)],
+                     "exit": [], "reduce": [], "hold": []},
+            predictions_by_ticker={},
+            optimizer_shadow_log=shadow,
+            **self._base_kwargs(),
+        )
+        f = next(r for r in payload["tickers"] if r["ticker"] == "F")
+        assert f["terminal_state"] == STATE_NO_ACTION_OPTIMIZER_ZERO
+        na = next(s for s in f["decision_chain"] if s["stage"] == "no_action")
+        assert "optimizer" in na["detail"].lower()
+        # The optimizer view is on the record so the dashboard can
+        # surface the weights inline with the sub-state.
+        assert f["optimizer"]["target_weight"] == 0.0
+        assert f["optimizer"]["eligible"] is True
+
+    def test_research_enter_without_optimizer_view_classified_unknown(self):
+        # Defensive — should be rare in production. Research said ENTER,
+        # no optimizer shadow log (legacy non-optimizer run OR shadow
+        # log absent for the ticker), no approved-entry record, no
+        # risk-event. The legacy path would normally produce a
+        # blocked-entry or approved-entry; reaching no-action here means
+        # something upstream silently dropped the signal. Surfacing it
+        # as STATE_NO_ACTION_UNKNOWN gives the dashboard a distinct
+        # row to flag for investigation.
+        payload = build_order_book_rationale(
+            signals={"enter": [_sig("LOST", "ENTER")],
+                     "exit": [], "reduce": [], "hold": []},
+            predictions_by_ticker={},
+            **self._base_kwargs(),
+        )
+        lost = next(r for r in payload["tickers"] if r["ticker"] == "LOST")
+        assert lost["terminal_state"] == STATE_NO_ACTION_UNKNOWN
+        na = next(s for s in lost["decision_chain"] if s["stage"] == "no_action")
+        assert "no" in na["detail"].lower()
+
+    def test_chain_always_carries_no_action_stage_for_subclass_rows(self):
+        # Every sub-state row must append a `no_action` chain stage so
+        # the per-ticker drill-down explains the fallthrough — no
+        # silent "state slug only" records. Tested against the two
+        # reachable sub-states (optimizer_zero + unknown).
+        shadow = {
+            "tickers": ["F"],
+            "current_weights": [0.0],
+            "target_weights": [0.0],
+            "alpha_hat": [0.001],
+            "eligibility": [True],
+            "eligibility_reasons": [None],
+        }
+        payload = build_order_book_rationale(
+            signals={"enter": [_sig("F", "ENTER"), _sig("LOST", "ENTER")],
+                     "exit": [], "reduce": [], "hold": []},
+            predictions_by_ticker={},
+            optimizer_shadow_log=shadow,
+            **self._base_kwargs(),
+        )
+        for ticker in ("F", "LOST"):
+            rec = next(r for r in payload["tickers"] if r["ticker"] == ticker)
+            stages = [s["stage"] for s in rec["decision_chain"]]
+            assert "no_action" in stages, (
+                f"{ticker}: no_action stage missing from chain"
+            )
