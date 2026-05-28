@@ -39,12 +39,17 @@ logger = logging.getLogger(__name__)
 # predictor's own DailyData dependency expectation.
 _ATR_MAX_STALENESS_TRADING_DAYS = 1
 
-# Symbols that live in the ArcticDB `macro` library rather than `universe`.
-# Mirrors the canonical writer list in alpha-engine-data's
-# ``builders/daily_append.py`` (macro_keys + sector_etfs). Kept in sync
-# manually; any additions there need matching updates here.
+# Symbols the executor reads from the ArcticDB `macro` library (Close-only).
+# Subset of what alpha-engine-data writes to macro — SPY is dual-written
+# there but read from `universe` for full OHLCV + atr_14_pct (L1346 (c)
+# retirement, 2026-05-28; SPY became a full `universe` member via
+# alpha-engine-data #245's `_UNIVERSE_EXTRA = frozenset({"SPY"})` write
+# path on 2026-05-15). VIX/VIX3M/TNX/IRX/GLD/USO + XL* sector ETFs stay
+# macro-routed because they have no `universe` counterpart and their
+# use cases (sector-relative exit veto + macro features) consume Close
+# only.
 _MACRO_SYMBOLS = frozenset({
-    "SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO",
+    "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO",
     "XLB", "XLC", "XLE", "XLF", "XLI", "XLK",
     "XLP", "XLRE", "XLU", "XLV", "XLY",
 })
@@ -57,16 +62,15 @@ def _open_universe_library(signals_bucket: str):
     those live in the `macro` library; use ``_open_macro_library`` for
     those.
 
-    Hard-fails on connection/library errors per feedback_no_silent_fails.
+    Thin wrapper over ``alpha_engine_lib.arcticdb.open_universe_lib`` —
+    the lib chokepoint (L2771) centralizes the S3 URI construction and
+    `get_library` error-wrapping across all alpha-engine consumers.
+    Kept as a local wrapper so the existing callers' import surface
+    stays unchanged and so the macOS allocator-prime invariant
+    (``import arcticdb`` at module top, BEFORE pandas) is preserved.
     """
-    adb = _arcticdb  # already imported at module top for macOS allocator prime
-    region = os.environ.get("AWS_REGION", "us-east-1")
-    uri = (
-        f"s3s://s3.{region}.amazonaws.com:{signals_bucket}"
-        f"?path_prefix=arcticdb&aws_auth=true"
-    )
-    arctic = adb.Arctic(uri)
-    return arctic.get_library("universe")
+    from alpha_engine_lib.arcticdb import open_universe_lib
+    return open_universe_lib(signals_bucket)
 
 
 def _open_macro_library(signals_bucket: str):
@@ -77,16 +81,11 @@ def _open_macro_library(signals_bucket: str):
     and builders.backfill. SPY in particular is what the morning
     freshness gate and EOD reconcile check.
 
-    Hard-fails on connection/library errors per feedback_no_silent_fails.
+    Thin wrapper over ``alpha_engine_lib.arcticdb.open_macro_lib`` —
+    see ``_open_universe_library`` above for the rationale.
     """
-    adb = _arcticdb
-    region = os.environ.get("AWS_REGION", "us-east-1")
-    uri = (
-        f"s3s://s3.{region}.amazonaws.com:{signals_bucket}"
-        f"?path_prefix=arcticdb&aws_auth=true"
-    )
-    arctic = adb.Arctic(uri)
-    return arctic.get_library("macro")
+    from alpha_engine_lib.arcticdb import open_macro_lib
+    return open_macro_lib(signals_bucket)
 
 
 def load_price_histories(
@@ -131,17 +130,8 @@ def load_price_histories(
     read_errors: list[str] = []
     empty: list[str] = []
 
-    # L1346 (c) second-half routing post-#245:
-    # SPY is no longer in `_MACRO_SYMBOLS_NO_OHLCV` because universe.SPY
-    # now carries full OHLCV (alpha-engine-data #245 _UNIVERSE_EXTRA
-    # write path; gate (a) verified via 5/24 DataPhase1 SSM log).
-    # Defensive fallback to macro.SPY preserves backwards compat during
-    # the cross-repo retirement — mirrors alpha-engine-predictor #196's
-    # universe-preferred + macro-fallback shape. Non-SPY macro symbols
-    # (VIX/TNX/IRX/sector ETFs) remain macro-routed (still Close-only).
-    _MACRO_SYMBOLS_NO_OHLCV = _MACRO_SYMBOLS - {"SPY"}
     for ticker in tickers:
-        if ticker in _MACRO_SYMBOLS_NO_OHLCV:
+        if ticker in _MACRO_SYMBOLS:
             if macro is None:
                 macro = _open_macro_library(signals_bucket)
             lib = macro
@@ -150,24 +140,8 @@ def load_price_histories(
         try:
             df = lib.read(ticker).data
         except Exception as e:
-            # L1346 (c) SPY-specific fallback: if SPY isn't in universe
-            # (e.g. universe.SPY backfill hadn't run yet), fall through
-            # to macro.SPY. Removed once L1346 (b) + (c) soak clean for
-            # ≥1 Saturday cycle on production.
-            if ticker == "SPY" and lib is universe:
-                if macro is None:
-                    macro = _open_macro_library(signals_bucket)
-                try:
-                    df = macro.read(ticker).data
-                except Exception as e2:
-                    read_errors.append(
-                        f"{ticker} (universe={e.__class__.__name__}, "
-                        f"macro={e2.__class__.__name__})"
-                    )
-                    continue
-            else:
-                read_errors.append(f"{ticker} ({e.__class__.__name__})")
-                continue
+            read_errors.append(f"{ticker} ({e.__class__.__name__})")
+            continue
         if df.empty:
             empty.append(ticker)
             continue
