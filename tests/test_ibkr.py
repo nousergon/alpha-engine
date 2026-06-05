@@ -5,6 +5,8 @@ IB connection logic is mocked; these tests cover the parsing layer only.
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from executor.ibkr import IBKRClient
 
 
@@ -51,3 +53,50 @@ class TestAccruedDividendsBySymbol:
         ])
         result = client.get_accrued_dividends_by_symbol()
         assert result == {"AAPL": 7.50}
+
+
+class TestInitialConnectRetry:
+    """The constructor must retry a transient connect failure, not hard-fail.
+
+    Regression for the 2026-06-05 weekday-SF failure: the morning planner's
+    only IB touchpoint is ``IBKRClient.__init__``, which used to do a single
+    bare ``connect()``. An IB Gateway ``reqExecutions`` stall mid-handshake
+    raised ``TimeoutError`` and nuked the whole pipeline.
+    """
+
+    def _fake_ib(self, monkeypatch, connect_side_effect):
+        import executor.ibkr as ibkr_mod
+        import executor.retry as retry_mod
+        fake_ib = MagicMock()
+        fake_ib.connect.side_effect = connect_side_effect
+        monkeypatch.setattr(ibkr_mod, "IB", lambda: fake_ib)
+        monkeypatch.setattr(retry_mod.time, "sleep", lambda _s: None)  # no real backoff
+        return fake_ib
+
+    def test_retries_then_succeeds(self, monkeypatch):
+        state = {"connected": False, "calls": 0}
+
+        def connect_side(*_a, **_k):
+            state["calls"] += 1
+            if state["calls"] == 1:
+                raise TimeoutError("reqExecutions stalled mid-handshake")
+            state["connected"] = True
+
+        fake_ib = self._fake_ib(monkeypatch, connect_side)
+        fake_ib.isConnected.side_effect = lambda: state["connected"]
+
+        client = IBKRClient()  # must not raise
+
+        assert state["calls"] == 2  # one transient failure, one success
+        assert client.ib.isConnected()
+        # half-open socket / stale clientId cleared before the retry
+        assert fake_ib.disconnect.called
+
+    def test_raises_after_exhausting_attempts(self, monkeypatch):
+        fake_ib = self._fake_ib(monkeypatch, TimeoutError("gateway down"))
+        fake_ib.isConnected.return_value = False
+
+        with pytest.raises(TimeoutError):
+            IBKRClient(reconnect_attempts=2)
+
+        assert fake_ib.connect.call_count == 2  # honors reconnect_attempts, then raises loud
