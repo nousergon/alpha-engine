@@ -32,9 +32,7 @@ class IBKRClient:
         self._client_id = client_id
         self._reconnect_attempts = reconnect_attempts
         logger.info(f"Connecting to IB Gateway at {host}:{port} (clientId={client_id})")
-        self.ib.connect(host, port, clientId=client_id, timeout=20)
-        if not self.ib.isConnected():
-            raise RuntimeError("Failed to connect to IB Gateway")
+        self._connect()
         logger.info("Connected to IB Gateway")
 
     def ensure_connected(self) -> None:
@@ -42,15 +40,36 @@ class IBKRClient:
         if self.ib.isConnected():
             return
         logger.warning("IB Gateway connection lost — attempting reconnect")
-        self._reconnect()
+        self._connect()
 
-    @retry(max_attempts=3, retryable=(Exception,), label="ibkr_connect")
-    def _reconnect(self) -> None:
-        """Attempt a single IB Gateway reconnect (retried by @retry)."""
-        self.ib.connect(self._host, self._port,
-                        clientId=self._client_id, timeout=20)
-        if not self.ib.isConnected():
-            raise RuntimeError("IB Gateway connect returned but isConnected() is False")
+    def _connect(self) -> None:
+        """Establish (or re-establish) the IB Gateway connection with
+        exponential-backoff retry.
+
+        Both the initial connect (constructor) and every later reconnect route
+        through here, so they share identical resilience — the morning planner
+        gets the same retry the daemon already had. A timed-out handshake (e.g.
+        an IB Gateway ``reqExecutions`` stall mid-connect — the 2026-06-05
+        weekday-SF failure) leaves a half-open socket with the clientId still
+        registered on the gateway; ``disconnect()`` before each attempt clears
+        that stale state so the retry doesn't fail on "clientId already in use".
+        Raises loud after all attempts are exhausted — a genuinely-down gateway
+        must still surface (no silent degrade).
+        """
+        @retry(max_attempts=self._reconnect_attempts, retryable=(Exception,),
+               label="ibkr_connect")
+        def _attempt() -> None:
+            if self.ib.isConnected():
+                return
+            # idempotent on a fresh/clean IB object; clears half-open state
+            # left by a timed-out handshake so the reconnect's clientId is free
+            self.ib.disconnect()
+            self.ib.connect(self._host, self._port,
+                            clientId=self._client_id, timeout=20)
+            if not self.ib.isConnected():
+                raise RuntimeError("IB Gateway connect returned but isConnected() is False")
+
+        _attempt()
 
     # ── Account ───────────────────────────────────────────────────────────────
 
