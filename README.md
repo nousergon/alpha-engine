@@ -57,4 +57,4 @@ This repo is **public**. `config/risk.yaml` is gitignored locally; real risk thr
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+AGPL-3.0-only — see [LICENSE](LICENSE). Commercial licenses available — contact brian@nousergon.ai.
