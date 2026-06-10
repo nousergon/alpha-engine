@@ -6,7 +6,7 @@
 [![Python](https://img.shields.io/badge/python-3.11+-blue?style=flat-square)](https://www.python.org/)
 [![Interactive Brokers](https://img.shields.io/badge/IBKR-1a73e8?style=flat-square)](https://www.interactivebrokers.com/)
 [![ArcticDB](https://img.shields.io/badge/ArcticDB-0e1117?style=flat-square)](https://docs.arcticdb.io/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](LICENSE)
+[![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-yellow?style=flat-square)](LICENSE)
 [![Phase 2 · Reliability](https://img.shields.io/badge/Phase_2-Reliability-e9c46a?style=flat-square)](https://github.com/cipher813/alpha-engine-docs#phase-trajectory)
 
 Risk-gated trade executor. Reads research signals + predictor verdicts from S3, applies hard risk rules, sizes positions, and routes orders through IB Gateway. The morning planner writes the order book; an intraday daemon is the sole order executor.
@@ -57,4 +57,4 @@ This repo is **public**. `config/risk.yaml` is gitignored locally; real risk thr
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+AGPL-3.0-only — see [LICENSE](LICENSE). Commercial licenses available — contact brian@nousergon.ai.

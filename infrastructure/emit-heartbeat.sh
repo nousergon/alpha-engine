@@ -30,3 +30,5 @@ aws cloudwatch put-metric-data \
   --region "$AWS_REGION" 2>/dev/null \
   && echo "Heartbeat emitted: ${PROCESS_NAME}" \
   || echo "WARNING: Failed to emit heartbeat for ${PROCESS_NAME} (non-fatal)"
+
+# build-tag: ae-hb-2f4c92e7d3
