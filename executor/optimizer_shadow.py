@@ -78,6 +78,17 @@ def run_shadow_optimizer(
             run_date=run_date,
             legacy_orders=legacy_orders or [],
         )
+        # L4515 turnover tripwire: band-check the executed turnover (daily +
+        # rolling) BEFORE the artifact write so the verdict rides the daily
+        # shadow log. check_turnover_tripwire never raises (sentinel on error).
+        from executor.turnover_tripwire import check_turnover_tripwire
+        log["turnover_tripwire"] = check_turnover_tripwire(
+            log.get("diagnostics") or {},
+            log.get("optimizer_cfg") or {},
+            signals_bucket,
+            run_date,
+            s3_client,
+        )
         _write_shadow_log_to_s3(log, signals_bucket, run_date, s3_client)
         logger.info(
             f"Shadow optimizer OK: status={log['diagnostics']['status']} "
