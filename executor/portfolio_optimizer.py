@@ -269,6 +269,18 @@ OPTIMIZER_CONFIG_DEFAULTS: dict = {
     #     the flag.
     "max_daily_turnover": 0.20,
     "large_move_turnover_flag": 0.35,
+    # ── Turnover tripwire (L4515) ─────────────────────────────────────────
+    # SAFETY alarm — NOT an alpha knob, NOT backtester-tuned. Band-checks the
+    # EXECUTED one-way turnover daily in the planner and pages on breach
+    # (executor/turnover_tripwire.py): daily = cap × multiple at ERROR (the
+    # governor should make a breach impossible, so one means the cap was
+    # bypassed/disabled); rolling = sum over the last N sessions at WARN
+    # (churn-by-a-thousand-cuts — each day under the cap, week abnormal; the
+    # signature of the 5/29, 6/01, 6/04 incidents this generalizes).
+    "turnover_tripwire_enabled": True,
+    "turnover_tripwire_daily_multiple": 1.25,
+    "turnover_tripwire_rolling_days": 5,
+    "turnover_tripwire_rolling_sum_band": 0.60,
 }
 
 

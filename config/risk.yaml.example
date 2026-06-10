@@ -396,6 +396,20 @@ portfolio_optimizer:
   # emits a WARN + SNS/Telegram alert for operator approval to accelerate —
   # the move is still executed gradually under the cap regardless.
   large_move_turnover_flag: 0.35
+  # ── Turnover tripwire (L4515) — SAFETY alarm, not backtester-tuned ──────
+  # Band-checks EXECUTED one-way turnover daily in the planner and pages on
+  # breach (verdict persisted in predictor/optimizer_shadow/{date}.json):
+  #   daily   — executed > max_daily_turnover × daily_multiple → ERROR page
+  #             (the governor should make this impossible; a breach means the
+  #             cap was bypassed/disabled).
+  #   rolling — sum of executed turnover over the last rolling_days sessions
+  #             > rolling_sum_band → WARN page (churn-by-a-thousand-cuts:
+  #             each day under the cap, week abnormal — the 5/29 / 6/01 /
+  #             6/04 incident signature).
+  turnover_tripwire_enabled: true
+  turnover_tripwire_daily_multiple: 1.25
+  turnover_tripwire_rolling_days: 5
+  turnover_tripwire_rolling_sum_band: 0.60
   # Σ horizon in trading days. 1 (default) = legacy daily Σ, bit-identical to
   # pre-260526 behavior. Set to 21 to align Σ with the canonical 21d log-domain
   # α̂; under i.i.d. log-returns Σ_H = H · Σ_daily, with vol-target SOC and
