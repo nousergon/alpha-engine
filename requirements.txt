@@ -50,7 +50,7 @@ requests~=2.32
 # v0.60.1 (2026-06-18): SSM-authoritative flow-doctor secret seed when deployed
 # — overwrites a stale sourced FLOW_DOCTOR_GITHUB_TOKEN with the live SSM value
 # so the github_issue notifier stops 403ing on the EOD/executor path (config#1148).
-alpha-engine-lib[flow_doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.60.1
+nousergon-lib[flow_doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.60.1
 # portfolio_optimizer (PR 1 of portfolio-optimizer-260511 arc): cvxpy solves the
 # constrained mean-variance program (MVO + L1 turnover + SOC vol-target);
 # scikit-learn provides Ledoit-Wolf covariance shrinkage. Both are optional at
