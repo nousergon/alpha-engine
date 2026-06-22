@@ -50,7 +50,7 @@ _CFG = {
 @pytest.fixture
 def published(monkeypatch):
     calls = []
-    from alpha_engine_lib import alerts
+    from nousergon_lib import alerts
 
     monkeypatch.setattr(alerts, "publish", lambda **kw: calls.append(kw))
     return calls
@@ -139,7 +139,7 @@ def test_governor_off_uses_absolute_band(published):
 
 
 def test_publish_failure_recorded_not_raised(monkeypatch):
-    from alpha_engine_lib import alerts
+    from nousergon_lib import alerts
 
     def _boom(**kw):
         raise RuntimeError("sns down")

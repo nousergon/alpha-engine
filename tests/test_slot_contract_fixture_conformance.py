@@ -5,7 +5,7 @@ The executor is the canonical consumer of both slot contracts. Its consumer
 contract tests (``test_signal_reader_consumer_contract.py``) exercise
 ``signal_reader`` against fixtures — if those fixtures drift from the real
 producer shape, the consumer tests prove nothing about the actual boundary.
-This pins fixture <-> contract agreement via ``alpha_engine_lib.contracts``
+This pins fixture <-> contract agreement via ``nousergon_lib.contracts``
 (lib >= 0.59.1), the same versioned schemas the producers validate against
 (research / predictor CI).
 
@@ -19,7 +19,7 @@ from __future__ import annotations
 import pytest
 
 contracts = pytest.importorskip(
-    "alpha_engine_lib.contracts",
+    "nousergon_lib.contracts",
     reason="needs alpha-engine-lib[contracts] >= 0.59.1",
 )
 

@@ -93,7 +93,7 @@ _TRADES_MIGRATIONS = [
     "ALTER TABLE trades ADD COLUMN prediction_date TEXT",
     # ── Phase 2 transparency-inventory: entry-trigger lineage (2026-05-07) ──
     # entry_trigger is the canonical name in the substrate inventory
-    # (alpha_engine_lib/transparency_inventory.yaml row trade_execution_lineage).
+    # (nousergon_lib/transparency_inventory.yaml row trade_execution_lineage).
     # The existing trigger_type column overlaps but is also populated on exits
     # (with the exit reason); separating entry_trigger keeps the
     # entry-trigger-only contract clean. Populated only on ENTER rows; NULL
@@ -274,7 +274,7 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
     trading_day = trade.get("trading_day")
     if trading_day is None:
         try:
-            from alpha_engine_lib.dates import now_dual
+            from nousergon_lib.dates import now_dual
             trading_day = now_dual().trading_day
         except Exception:
             # Lib not yet bumped on this deploy — leave NULL. Backfill script
@@ -412,7 +412,7 @@ def log_risk_event(conn: sqlite3.Connection, event: dict) -> str:
     trading_day = event.get("trading_day")
     if trading_day is None:
         try:
-            from alpha_engine_lib.dates import now_dual
+            from nousergon_lib.dates import now_dual
             trading_day = now_dual().trading_day
         except Exception:
             trading_day = None

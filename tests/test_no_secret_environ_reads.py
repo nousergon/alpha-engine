@@ -2,7 +2,7 @@
 or ``os.getenv``.
 
 After the 2026-05-12 ``.env`` → SSM migration (PR 6 of the arc), every
-secret-bearing call site routes through ``alpha_engine_lib.secrets.get_secret()``.
+secret-bearing call site routes through ``nousergon_lib.secrets.get_secret()``.
 This test re-greps the codebase on every CI run so a future commit can't
 silently re-introduce a secret read via ``os.environ``.
 
@@ -60,6 +60,6 @@ def test_no_secret_environ_reads():
                     violations.append((path.relative_to(_REPO_ROOT), lineno, name))
     assert not violations, (
         "Found os.environ.get / os.getenv reads of pinned secrets — use "
-        "`from alpha_engine_lib.secrets import get_secret` instead:\n"
+        "`from nousergon_lib.secrets import get_secret` instead:\n"
         + "\n".join(f"  {p}:{ln}  {name}" for p, ln, name in violations)
     )

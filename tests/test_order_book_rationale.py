@@ -318,7 +318,7 @@ def test_write_latest_false_skips_sidecar(scenario):
 def test_round_trip_via_lib_loader(scenario):
     """The artifact resolves through the lib's canonical reader —
     proves the dashboard's load_latest_eval_artifact path works."""
-    from alpha_engine_lib.eval_artifacts import load_latest_eval_artifact
+    from nousergon_lib.eval_artifacts import load_latest_eval_artifact
 
     payload = build_order_book_rationale(**scenario)
     s3 = _StubS3()
@@ -733,7 +733,7 @@ class TestHeldFromPortfolioTruth:
 def test_obr_write_failure_publishes_alert_not_silent_swallow():
     """Pin the L171 fix (2026-05-22): an OBR write failure in
     `executor/main.py` must reach the operator via
-    `alpha_engine_lib.alerts.publish` — silent warning-log only is
+    `nousergon_lib.alerts.publish` — silent warning-log only is
     exactly the [[feedback_no_silent_fails]] failure mode (page 16
     falls back to yesterday's snapshot with zero signal that today's
     write never landed).
@@ -748,7 +748,7 @@ def test_obr_write_failure_publishes_alert_not_silent_swallow():
 
     src = inspect.getsource(main_mod)
     # Locate the OBR-rationale write block — the WARN log + the
-    # alpha_engine_lib.alerts.publish must BOTH live in the except
+    # nousergon_lib.alerts.publish must BOTH live in the except
     # handler that wraps write_order_book_rationale.
     assert "Order-book rationale write failed" in src, (
         "OBR write-failure WARN log appears to have been refactored — "
@@ -756,13 +756,13 @@ def test_obr_write_failure_publishes_alert_not_silent_swallow():
         "before merging."
     )
     assert "obr_write_failed_" in src, (
-        "OBR write-failure handler must call `alpha_engine_lib.alerts.publish` "
+        "OBR write-failure handler must call `nousergon_lib.alerts.publish` "
         "with a `dedup_key` starting `obr_write_failed_` so the failure "
         "reaches Telegram/SNS rather than silently swallowing "
         "([[feedback_no_silent_fails]])."
     )
-    assert "from alpha_engine_lib import alerts" in src, (
-        "OBR write-failure handler must import alpha_engine_lib.alerts "
+    assert "from nousergon_lib import alerts" in src, (
+        "OBR write-failure handler must import nousergon_lib.alerts "
         "lazily (inside the except) so a missing lib at boot doesn't "
         "break the planner cold-start."
     )

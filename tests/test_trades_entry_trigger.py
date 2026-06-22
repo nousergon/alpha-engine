@@ -2,7 +2,7 @@
 Tests for the `entry_trigger` column on the trades table.
 
 Phase 2 transparency-inventory item — closes the *trade execution lineage*
-row in alpha_engine_lib/transparency_inventory.yaml. The substrate health
+row in nousergon_lib/transparency_inventory.yaml. The substrate health
 check asserts the column is present in trades_full.csv; the daemon's
 ENTER fill site is the only writer that populates it (mirrors the
 trigger_reason returned by EntryTriggerEngine.should_enter).

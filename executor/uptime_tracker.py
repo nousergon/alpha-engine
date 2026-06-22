@@ -65,7 +65,7 @@ def _parse_ts(line: str) -> datetime | None:
 def _parse_tick_line(line: str) -> tuple[datetime, bool] | None:
     """Extract (ts_utc, ib_connected) from a DAEMON_TICK line in either the
     legacy text format or the current JSON format emitted by
-    alpha_engine_lib.logging. Returns None for anything else.
+    nousergon_lib.logging. Returns None for anything else.
     """
     if "DAEMON_TICK" not in line:
         return None

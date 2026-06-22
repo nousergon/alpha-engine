@@ -7,7 +7,7 @@ the Saturday evaluator email. Per-component artifacts at
 
 Schema is the lib's ``DecisionArtifact`` with ``model_metadata=None`` and
 ``full_prompt_context=None`` (deterministic decision — see
-``alpha_engine_lib.decision_capture`` schema_version=2 lib v0.10.0+).
+``nousergon_lib.decision_capture`` schema_version=2 lib v0.10.0+).
 Producer provenance lives in ``input_data_snapshot._producer`` +
 ``_producer_version`` rather than the LLM ``model_metadata.model_name``
 field — the plan doc question 2 anchor.
@@ -40,7 +40,7 @@ import os
 import uuid
 from typing import Any
 
-from alpha_engine_lib.decision_capture import (
+from nousergon_lib.decision_capture import (
     DecisionCaptureWriteError,
     capture_decision,
 )

@@ -24,7 +24,7 @@ the daemon's order-execution loop. Stale snapshots are visible to the
 surveillance Lambda via heartbeat-timestamp staleness, which is itself the
 designed alert signal.
 
-ROADMAP L1067 PR 2b. Composes with ``alpha_engine_lib.telegram`` (lib v0.14.0,
+ROADMAP L1067 PR 2b. Composes with ``nousergon_lib.telegram`` (lib v0.14.0,
 PR 1) and ``executor/notifier.py`` migration (PR 2a, merged).
 """
 

@@ -38,7 +38,7 @@ def test_parse_tick_lines_roundtrip():
 
 
 def _make_json_tick_line(ts_utc: datetime, connected: bool) -> str:
-    """Render a DAEMON_TICK line in the JSON format emitted by alpha_engine_lib.logging."""
+    """Render a DAEMON_TICK line in the JSON format emitted by nousergon_lib.logging."""
     return json.dumps({
         "ts": ts_utc.isoformat(),
         "level": "INFO",
@@ -49,7 +49,7 @@ def _make_json_tick_line(ts_utc: datetime, connected: bool) -> str:
 
 
 def test_parse_tick_lines_json_format():
-    """Parser handles the JSON format written by the new alpha_engine_lib.logging."""
+    """Parser handles the JSON format written by the new nousergon_lib.logging."""
     day = date(2026, 4, 13)
     t_et = _ET.localize(datetime(2026, 4, 13, 10, 15))
     t_utc = t_et.astimezone(_UTC)

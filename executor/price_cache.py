@@ -62,14 +62,14 @@ def _open_universe_library(signals_bucket: str):
     those live in the `macro` library; use ``_open_macro_library`` for
     those.
 
-    Thin wrapper over ``alpha_engine_lib.arcticdb.open_universe_lib`` —
+    Thin wrapper over ``nousergon_lib.arcticdb.open_universe_lib`` —
     the lib chokepoint (L2771) centralizes the S3 URI construction and
     `get_library` error-wrapping across all alpha-engine consumers.
     Kept as a local wrapper so the existing callers' import surface
     stays unchanged and so the macOS allocator-prime invariant
     (``import arcticdb`` at module top, BEFORE pandas) is preserved.
     """
-    from alpha_engine_lib.arcticdb import open_universe_lib
+    from nousergon_lib.arcticdb import open_universe_lib
     return open_universe_lib(signals_bucket)
 
 
@@ -81,10 +81,10 @@ def _open_macro_library(signals_bucket: str):
     and builders.backfill. SPY in particular is what the morning
     freshness gate and EOD reconcile check.
 
-    Thin wrapper over ``alpha_engine_lib.arcticdb.open_macro_lib`` —
+    Thin wrapper over ``nousergon_lib.arcticdb.open_macro_lib`` —
     see ``_open_universe_library`` above for the rationale.
     """
-    from alpha_engine_lib.arcticdb import open_macro_lib
+    from nousergon_lib.arcticdb import open_macro_lib
     return open_macro_lib(signals_bucket)
 
 

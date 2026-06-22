@@ -264,7 +264,7 @@ def _build_and_solve(
             _req * 100, (_flag or 0) * 100, (_cap or 0) * 100, run_date,
         )
         try:
-            from alpha_engine_lib import alerts as _alerts
+            from nousergon_lib import alerts as _alerts
             _alerts.publish(
                 message=(
                     f"[executor] Optimizer requested a large rebalance: "

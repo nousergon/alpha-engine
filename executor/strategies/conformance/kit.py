@@ -2,7 +2,7 @@
 
 ``conformance_errors(rule)`` returns a flat list of human-readable
 violations (empty = conformant), mirroring
-``alpha_engine_lib.contracts.conformance_errors`` for slots R/M so the
+``nousergon_lib.contracts.conformance_errors`` for slots R/M so the
 future ``ne validate`` CLI can front both with one vocabulary.
 
 What conformance asserts (the Slot S contract, executor/strategies/contract.py):

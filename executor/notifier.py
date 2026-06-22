@@ -1,7 +1,7 @@
 """
 Telegram trade notification sender — daemon-side structured-message formatters.
 
-Sits on top of ``alpha_engine_lib.telegram.send_message`` (lib v0.14.0+), which
+Sits on top of ``nousergon_lib.telegram.send_message`` (lib v0.14.0+), which
 handles token/chat_id resolution, markdown escape, retry/timeout, and
 fire-and-forget bool-return semantics. This module contributes daemon-specific
 *message formatting* — emoji + structured trade/status templates — and
@@ -15,7 +15,7 @@ Setup (one-time):
 
 Migration arc: ROADMAP L1067 PR 2a (2026-05-13). Previously this module owned
 the primitive send path inline; the surveillance Lambda arc required a second
-producer, so the primitive was consolidated into ``alpha_engine_lib.telegram``
+producer, so the primitive was consolidated into ``nousergon_lib.telegram``
 to prevent the "two writers diverged silently" antipattern.
 """
 
@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 
-from alpha_engine_lib.telegram import send_message
+from nousergon_lib.telegram import send_message
 
 logger = logging.getLogger(__name__)
 

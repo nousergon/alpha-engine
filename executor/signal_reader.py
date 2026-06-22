@@ -11,8 +11,8 @@ from datetime import date, timedelta
 import boto3
 from botocore.exceptions import ClientError
 
-from alpha_engine_lib.eval_artifacts import load_latest_eval_artifact
-from alpha_engine_lib.universe import filter_to_universe
+from nousergon_lib.eval_artifacts import load_latest_eval_artifact
+from nousergon_lib.universe import filter_to_universe
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +22,7 @@ REGIME_SUBSTRATE_PREFIX = "regime"
 def read_regime_substrate(s3_bucket: str) -> dict | None:
     """Read the latest regime substrate artifact via canonical sidecar.
 
-    Wraps ``alpha_engine_lib.eval_artifacts.load_latest_eval_artifact``
+    Wraps ``nousergon_lib.eval_artifacts.load_latest_eval_artifact``
     pointed at ``s3://{bucket}/regime/latest.json``. Returns the parsed
     payload dict (composite.intensity_z, hmm.posterior, bocpd.run_length_z,
     guardrails, run_id) or ``None`` if the artifact is unavailable.
@@ -388,7 +388,7 @@ def filter_buy_candidates_to_universe(
         )
         return signals
 
-    # Membership predicate is delegated to ``alpha_engine_lib.universe`` so
+    # Membership predicate is delegated to ``nousergon_lib.universe`` so
     # this Layer 2 filter and research's Layer 1 ``population_selector`` filter
     # share one canonical code path (no silent divergence on universe drift —
     # see lib v0.13.0 docstring).

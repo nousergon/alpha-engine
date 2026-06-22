@@ -1,7 +1,7 @@
 """Test fixtures + sys.path setup.
 
 Pins ``ALPHA_ENGINE_SECRETS_SOURCE=env`` for the test process so
-``alpha_engine_lib.secrets.get_secret()`` (post 2026-05-12 .env→SSM
+``nousergon_lib.secrets.get_secret()`` (post 2026-05-12 .env→SSM
 migration, PR 6 of the arc) reads from monkeypatched env vars only —
 never the real SSM Parameter Store.
 """
@@ -24,7 +24,7 @@ def _isolate_secrets_from_ssm(monkeypatch):
     """
     monkeypatch.setenv("ALPHA_ENGINE_SECRETS_SOURCE", "env")
     try:
-        from alpha_engine_lib.secrets import clear_cache
+        from nousergon_lib.secrets import clear_cache
     except ImportError:
         yield
         return
@@ -35,7 +35,7 @@ def _isolate_secrets_from_ssm(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _block_real_alert_publish(monkeypatch):
-    """Stub ``alpha_engine_lib.alerts.publish`` so NO test fans out a real
+    """Stub ``nousergon_lib.alerts.publish`` so NO test fans out a real
     SNS / Telegram operator alert.
 
     Without this, any test exercising a code path that calls
@@ -45,13 +45,13 @@ def _block_real_alert_publish(monkeypatch):
     #237, which fired a live WARN to Telegram + SNS on every suite run
     (``run_date=2026-05-11``, observed 2026-06-07). Tests assert on the call
     inputs, not on real delivery. ``optimizer_shadow`` imports the symbol
-    lazily as ``from alpha_engine_lib import alerts as _alerts`` and calls
+    lazily as ``from nousergon_lib import alerts as _alerts`` and calls
     ``_alerts.publish`` at runtime, so patching the module attribute here
     intercepts it. See ROADMAP L4566; mirrored by a cross-repo guard in
-    ``alpha_engine_lib.alerts.publish`` (PYTEST_CURRENT_TEST).
+    ``nousergon_lib.alerts.publish`` (PYTEST_CURRENT_TEST).
     """
     try:
-        from alpha_engine_lib import alerts
+        from nousergon_lib import alerts
     except ImportError:
         yield
         return
