@@ -97,12 +97,12 @@ def test_init_db_risk_events_migration_idempotent(tmp_path, monkeypatch):
 
 
 def test_log_risk_event_falls_through_when_lib_unavailable(tmp_path):
-    """The optional alpha_engine_lib.dates import must NOT hard-fail."""
+    """The optional nousergon_lib.dates import must NOT hard-fail."""
     conn = init_db(str(tmp_path / "trades.db"))
     fake_lib = MagicMock()
     fake_lib.now_dual.side_effect = RuntimeError("simulated import failure")
-    sys.modules.pop("alpha_engine_lib.dates", None)
-    sys.modules["alpha_engine_lib.dates"] = fake_lib
+    sys.modules.pop("nousergon_lib.dates", None)
+    sys.modules["nousergon_lib.dates"] = fake_lib
 
     try:
         event_id = log_risk_event(conn, {
@@ -113,7 +113,7 @@ def test_log_risk_event_falls_through_when_lib_unavailable(tmp_path):
         ).fetchone()[0]
         assert td is None
     finally:
-        sys.modules.pop("alpha_engine_lib.dates", None)
+        sys.modules.pop("nousergon_lib.dates", None)
 
 
 # ── log_trade ───────────────────────────────────────────────────────────────
@@ -135,20 +135,20 @@ def test_log_trade_uses_caller_trading_day_when_provided(db):
 
 def test_log_trade_falls_through_when_lib_unavailable(db, monkeypatch):
     """If the optional lib raises on import, trading_day stays NULL — no hard fail."""
-    # Force the inline `from alpha_engine_lib.dates import now_dual` to raise
+    # Force the inline `from nousergon_lib.dates import now_dual` to raise
     fake_lib = MagicMock()
     fake_lib.now_dual.side_effect = RuntimeError("simulated import failure")
     # Inject into sys.modules so the inline import picks it up — we need to
     # invalidate the cached import first
-    sys.modules.pop("alpha_engine_lib.dates", None)
-    sys.modules["alpha_engine_lib.dates"] = fake_lib
+    sys.modules.pop("nousergon_lib.dates", None)
+    sys.modules["nousergon_lib.dates"] = fake_lib
 
     try:
         log_trade(db, _trade())  # no trading_day provided
         td = db.execute("SELECT trading_day FROM trades").fetchone()[0]
         assert td is None
     finally:
-        sys.modules.pop("alpha_engine_lib.dates", None)
+        sys.modules.pop("nousergon_lib.dates", None)
 
 
 # ── log_shadow_book_block ───────────────────────────────────────────────────

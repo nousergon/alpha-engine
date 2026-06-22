@@ -68,7 +68,7 @@ from executor.price_monitor import PriceMonitor
 from executor.strategies.config import load_strategy_config
 from executor.trade_logger import init_db, log_trade, get_unmatched_entry
 
-from alpha_engine_lib.logging import setup_logging, guard_entrypoint
+from nousergon_lib.logging import setup_logging, guard_entrypoint
 # See executor/main.py for the rationale on IB Error 10197 / 10349 suppression.
 _FLOW_DOCTOR_EXCLUDE_PATTERNS = [r"Error 10197", r"Error 10349"]
 _FLOW_DOCTOR_YAML = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "flow-doctor.yaml")
@@ -393,7 +393,7 @@ def run_daemon(dry_run: bool = False) -> None:
     preflight.run()
 
     # Flow Doctor: retrieve the shared instance set up at module import
-    from alpha_engine_lib.logging import get_flow_doctor
+    from nousergon_lib.logging import get_flow_doctor
     fd = get_flow_doctor()
 
     global _allow_shorts

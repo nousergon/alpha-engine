@@ -2,7 +2,7 @@
 Executor preflight: connectivity + safety checks run at the top of each
 entrypoint before any real work starts.
 
-Primitives live in ``alpha_engine_lib.preflight.BasePreflight``; this
+Primitives live in ``nousergon_lib.preflight.BasePreflight``; this
 module composes them into a mode-specific sequence. See the
 alpha-engine-lib README for the rationale.
 
@@ -23,7 +23,7 @@ Modes:
 
 from __future__ import annotations
 
-from alpha_engine_lib.preflight import BasePreflight
+from nousergon_lib.preflight import BasePreflight
 
 
 class ExecutorPreflight(BasePreflight):

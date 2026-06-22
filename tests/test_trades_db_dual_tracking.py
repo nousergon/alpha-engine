@@ -3,7 +3,7 @@
 Covers:
   * Schema migration is idempotent — re-running init_db() against a DB that
     already has the new columns is a no-op.
-  * log_trade() populates trading_day via the alpha_engine_lib.dates fallback
+  * log_trade() populates trading_day via the nousergon_lib.dates fallback
     when the caller doesn't pass it explicitly.
   * log_trade() honors an explicit trading_day from the caller (live daemon
     path will populate this from the OrderBook entry context).
@@ -207,7 +207,7 @@ def _set_columns_null(db_path: Path) -> None:
 
 def test_backfill_dry_run_does_not_write(tmp_path):
     """--dry-run computes updates but doesn't mutate the DB."""
-    pytest.importorskip("alpha_engine_lib.dates", reason="lib v0.2.0+ required")
+    pytest.importorskip("nousergon_lib.dates", reason="lib v0.2.0+ required")
     from scripts import backfill_trading_day
 
     db_path = tmp_path / "trades.db"
@@ -244,7 +244,7 @@ def test_backfill_dry_run_does_not_write(tmp_path):
 def test_backfill_idempotent(tmp_path):
     """Running backfill twice produces the same end state — already-set
     columns are skipped on the second pass."""
-    pytest.importorskip("alpha_engine_lib.dates", reason="lib v0.2.0+ required")
+    pytest.importorskip("nousergon_lib.dates", reason="lib v0.2.0+ required")
     from scripts import backfill_trading_day
 
     db_path = tmp_path / "trades.db"
@@ -292,7 +292,7 @@ def test_backfill_idempotent(tmp_path):
 def test_backfill_does_not_overwrite_existing_values(tmp_path):
     """If trading_day is already set (e.g., from a forward-write call site),
     the backfill must not overwrite it."""
-    pytest.importorskip("alpha_engine_lib.dates", reason="lib v0.2.0+ required")
+    pytest.importorskip("nousergon_lib.dates", reason="lib v0.2.0+ required")
     from scripts import backfill_trading_day
 
     db_path = tmp_path / "trades.db"
@@ -330,7 +330,7 @@ def test_backfill_skips_signal_trading_day_for_non_enter(tmp_path):
     """EXIT and REDUCE actions don't have a signal_trading_day backfill —
     they stay NULL by design (they're outcomes of held positions, not new
     signal-driven entries)."""
-    pytest.importorskip("alpha_engine_lib.dates", reason="lib v0.2.0+ required")
+    pytest.importorskip("nousergon_lib.dates", reason="lib v0.2.0+ required")
     from scripts import backfill_trading_day
 
     db_path = tmp_path / "trades.db"

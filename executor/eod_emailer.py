@@ -438,10 +438,10 @@ def send_eod_email(
         except Exception as e:
             logger.warning("EOD email archival failed (non-fatal): %s", e)
 
-    # SMTP/SES dispatch via the alpha_engine_lib.email_sender chokepoint
+    # SMTP/SES dispatch via the nousergon_lib.email_sender chokepoint
     # (L4356 — Gmail SMTP primary, SES fallback). Identical semantics to
     # the pre-consolidation inline path.
-    from alpha_engine_lib.email_sender import send_email as _send_email
+    from nousergon_lib.email_sender import send_email as _send_email
     _send_email(
         subject, plain_body,
         recipients=recipients, html=html_body,

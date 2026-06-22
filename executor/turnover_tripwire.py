@@ -210,7 +210,7 @@ def _publish(out: dict, *, severity: str, dedup_key: str, message: str) -> None:
     publish failure must never block the planner; it is recorded in the
     artifact's ``publish_error`` field."""
     try:
-        from alpha_engine_lib import alerts as _alerts
+        from nousergon_lib import alerts as _alerts
         _alerts.publish(
             message=message,
             severity=severity,

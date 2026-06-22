@@ -51,8 +51,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from executor.config_loader import load_config
 from executor.ibkr import IBKRClient
 
-from alpha_engine_lib.dates import now_dual
-from alpha_engine_lib.logging import setup_logging
+from nousergon_lib.dates import now_dual
+from nousergon_lib.logging import setup_logging
 
 _FLOW_DOCTOR_EXCLUDE_PATTERNS = [r"Error 10197", r"Error 10349"]
 _FLOW_DOCTOR_YAML = os.path.join(

@@ -26,8 +26,8 @@ from executor.trade_logger import (
     init_db, log_eod, backup_to_s3, get_entry_trade, get_todays_trades,
 )
 
-from alpha_engine_lib.dates import now_dual
-from alpha_engine_lib.logging import setup_logging, guard_entrypoint
+from nousergon_lib.dates import now_dual
+from nousergon_lib.logging import setup_logging, guard_entrypoint
 # See executor/main.py for the rationale on IB Error 10197 / 10349 suppression.
 _FLOW_DOCTOR_EXCLUDE_PATTERNS = [r"Error 10197", r"Error 10349"]
 _FLOW_DOCTOR_YAML = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "flow-doctor.yaml")
@@ -397,7 +397,7 @@ def run(run_date: str | None = None) -> None:
     ExecutorPreflight(bucket=trades_bucket, mode="eod").run()
 
     # Flow Doctor: retrieve the shared instance set up at module import
-    from alpha_engine_lib.logging import get_flow_doctor
+    from nousergon_lib.logging import get_flow_doctor
     fd = get_flow_doctor()
 
     if not config.get("email_sender") or not config.get("email_recipients"):
@@ -1050,7 +1050,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=(
             "EOD reconciliation. Defaults to today's trading_day "
-            "(via alpha_engine_lib.dates.now_dual). Hard-fails on any "
+            "(via nousergon_lib.dates.now_dual). Hard-fails on any "
             "explicit --date that isn't today: live IB state would corrupt "
             "the historical row's NAV/positions."
         )

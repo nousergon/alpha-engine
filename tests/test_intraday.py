@@ -404,7 +404,7 @@ class TestMarketHours:
 
 class TestNotifier:
     """Daemon-side formatter tests. Primitive send/escape behavior is locked
-    upstream in alpha_engine_lib.telegram's own test suite (29 tests). These
+    upstream in nousergon_lib.telegram's own test suite (29 tests). These
     tests cover only the daemon-specific message-shape contracts and that
     the formatters correctly route through the lib substrate.
     """

@@ -60,7 +60,7 @@ from executor.trade_logger import (
     log_trade,
 )
 
-from alpha_engine_lib.logging import setup_logging, guard_entrypoint
+from nousergon_lib.logging import setup_logging, guard_entrypoint
 # Suppress benign IB Error codes that don't represent real failures:
 #   10197 — "No market data during competing live session". The daemon
 #     keeps receiving delayed ticks via the delayedLast fallback in
@@ -898,7 +898,7 @@ def run(
         ExecutorPreflight(bucket=signals_bucket, mode="main").run()
 
     # ── Flow Doctor: retrieve the shared instance set up at module import ───
-    from alpha_engine_lib.logging import get_flow_doctor
+    from nousergon_lib.logging import get_flow_doctor
     fd = get_flow_doctor() if not simulate else None
 
     # ── 0. Check upstream health — hard-fail if anything upstream is broken ──
@@ -983,7 +983,7 @@ def run(
         try:
             import pandas as _pd
             from executor.price_cache import _open_macro_library
-            from alpha_engine_lib.trading_calendar import last_closed_trading_day
+            from nousergon_lib.trading_calendar import last_closed_trading_day
             _macro = _open_macro_library(signals_bucket)
             _spy_df = _macro.read("SPY").data
             _expected_min = _pd.Timestamp(last_closed_trading_day()).normalize()
@@ -1764,8 +1764,8 @@ def run(
             try:
                 import boto3
 
-                from alpha_engine_lib.dates import now_dual
-                from alpha_engine_lib.eval_artifacts import new_eval_run_id
+                from nousergon_lib.dates import now_dual
+                from nousergon_lib.eval_artifacts import new_eval_run_id
                 from executor.order_book_rationale import (
                     build_order_book_rationale,
                     write_order_book_rationale,
@@ -1819,7 +1819,7 @@ def run(
                     _rat_err,
                 )
                 try:
-                    from alpha_engine_lib import alerts as _alerts
+                    from nousergon_lib import alerts as _alerts
                     _alerts.publish(
                         message=(
                             f"[executor/main.py] Order-book rationale write "

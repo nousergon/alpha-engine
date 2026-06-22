@@ -2,7 +2,7 @@
 
 The harness's three experiment slots exchange PRODUCT CONTRACTS (M0
 discipline, ratified 2026-06-11 — config#638). Slots R and M are JSON
-artifacts with versioned schemas in ``alpha_engine_lib.contracts``; Slot S
+artifacts with versioned schemas in ``nousergon_lib.contracts``; Slot S
 is different in kind: a **Python plugin interface** for backtestable exit
 strategy rules. This module is that contract's single source of truth:
 

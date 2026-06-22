@@ -20,7 +20,7 @@ new instrumentation**. It reuses the ``risk_events`` rule slugs
 (alpha-engine #138), and the ``entries_with_meta`` sizing breakdown
 the order book already carries.
 
-The artifact is written in the canonical ``alpha_engine_lib.eval_artifacts``
+The artifact is written in the canonical ``nousergon_lib.eval_artifacts``
 shape (``{prefix}/{run_id}.json`` dated forensic artifact + a
 ``{prefix}/latest.json`` operator-UX sidecar) so the dashboard reads it
 with the same ``load_latest_eval_artifact`` / ``list_eval_artifacts``
@@ -686,7 +686,7 @@ def write_order_book_rationale(
 
     Returns dict with ``artifact_key`` and (when written) ``latest_key``.
     """
-    from alpha_engine_lib.eval_artifacts import (
+    from nousergon_lib.eval_artifacts import (
         eval_artifact_key,
         eval_latest_key,
     )

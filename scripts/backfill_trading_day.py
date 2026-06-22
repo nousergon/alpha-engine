@@ -51,13 +51,13 @@ logger = logging.getLogger(__name__)
 
 
 def _import_lib_dates():
-    """Import alpha_engine_lib.dates with a clear error if the pin is stale."""
+    """Import nousergon_lib.dates with a clear error if the pin is stale."""
     try:
-        from alpha_engine_lib.dates import session_for_timestamp
+        from nousergon_lib.dates import session_for_timestamp
         return session_for_timestamp
     except ImportError as exc:
         sys.stderr.write(
-            "ERROR: alpha_engine_lib.dates not importable. "
+            "ERROR: nousergon_lib.dates not importable. "
             "This script requires alpha-engine-lib v0.2.0+. "
             "Update requirements.txt and reinstall before running.\n"
             f"Underlying ImportError: {exc}\n"
