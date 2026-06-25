@@ -14,11 +14,21 @@ from executor.order_book import OrderBook, _current_trading_day, _default_book
 
 
 def _today() -> str:
-    return date.today().isoformat()
+    # The order book's ``date`` field and its load-time freshness check key on
+    # the *trading day* (last closed NYSE session via now_dual().trading_day),
+    # NOT the raw calendar date (config#1016). Pre-open on a weekday these
+    # differ, so the load tests must compare against the trading-day axis the
+    # source actually stamps — comparing to date.today() is time-of-day flaky
+    # (green after the close, red pre-open).
+    return _current_trading_day()
 
 
 def _yesterday() -> str:
-    return (date.today() - timedelta(days=1)).isoformat()
+    # A date guaranteed strictly before the current trading day, so the
+    # stale-book discard fires regardless of time-of-day. Walk back from the
+    # current trading day rather than from date.today() (which can EQUAL the
+    # trading day pre-open, making the "stale" book look current).
+    return (date.fromisoformat(_current_trading_day()) - timedelta(days=1)).isoformat()
 
 
 def _make_book(tmp_path, data: dict | None = None):
