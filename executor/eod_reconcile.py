@@ -94,11 +94,19 @@ def _spy_close(run_date: str, config: dict | None = None) -> float:
     return close
 
 
-def _load_signals_from_s3(bucket: str, run_date: str, max_lookback: int = 5) -> tuple[dict, str | None]:
+def _load_signals_from_s3(bucket: str, run_date: str, max_lookback: int = 14) -> tuple[dict, str | None]:
     """Load signals.json from S3, falling back to prior days.
 
-    Research runs on Saturday and writes signals with the Saturday date,
-    so the lookback must include weekends.
+    Research runs weekly (Saturday) and writes signals with the trading-day
+    date, so the lookback must span weekends + a missed-cycle buffer. The
+    14-day default matches the morning planner's
+    ``read_signals_with_fallback`` window — EOD reconciliation should use the
+    same last-good signals the planner traded on, not a tighter window. (The
+    prior 5-day window paged a misleading flow-doctor ERROR on 2026-06-25
+    when the only staleness was a missed Saturday cycle the planner had
+    already tolerated.) Whether the required signals.json was actually
+    PRODUCED is owned by the central artifact-freshness monitor
+    (research_signals in ARTIFACT_REGISTRY.yaml), not this consumer.
     """
     s3 = boto3.client("s3")
     start = date.fromisoformat(run_date)
@@ -112,7 +120,12 @@ def _load_signals_from_s3(bucket: str, run_date: str, max_lookback: int = 5) -> 
             return json.loads(obj["Body"].read()), None
         except Exception:
             continue
-    logger.error("No signals found within %d days of %s", max_lookback, run_date)
+    # WARNING not ERROR: EOD reconcile degrades gracefully on absent signals
+    # (returns {} + a warning the caller surfaces in the EOD report). The
+    # operator-paging "signals.json was not produced" alert is owned by the
+    # central artifact-freshness monitor (research_signals), so this consumer
+    # must not also page flow-doctor for the same upstream condition.
+    logger.warning("No signals found within %d days of %s", max_lookback, run_date)
     return {}, f"Signals unavailable from S3 for {run_date} (checked {max_lookback} days back)"
 
 
@@ -147,7 +160,10 @@ def _load_constituents_sector_map(bucket: str) -> dict[str, str]:
         )
         return sector_map
     except Exception as e:
-        logger.error("Failed to load constituents sector_map: %s", e)
+        # WARNING not ERROR: graceful fallthrough to the "Unknown" sentinel
+        # (return {}). Upstream constituents.json freshness is owned by the
+        # central artifact-freshness monitor, not this best-effort lookup.
+        logger.warning("Failed to load constituents sector_map: %s", e)
         return {}
 
 
@@ -184,7 +200,11 @@ def _load_predictions_from_s3(bucket: str) -> tuple[dict, str | None]:
         data = json.loads(obj["Body"].read())
         return {p["ticker"]: p for p in data.get("predictions", []) if "ticker" in p}, None
     except Exception as e:
-        logger.error("Failed to load predictions from S3: %s", e)
+        # WARNING not ERROR: EOD reconcile degrades gracefully without
+        # predictions (returns {} + a warning the caller surfaces). Upstream
+        # predictions.json freshness is owned by the central artifact-
+        # freshness monitor (predictor_predictions), not this consumer.
+        logger.warning("Failed to load predictions from S3: %s", e)
         return {}, "Predictions unavailable from S3"
 
 
