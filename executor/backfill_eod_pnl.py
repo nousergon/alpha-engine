@@ -13,12 +13,24 @@ historical-account endpoint. So a day discovered LATE (box gone) cannot be
 recovered from IBKR at all.
 
 This tool recovers it WITHOUT IBKR, from data we already store durably:
-  * positions(D)  — cumulative replay of the `trades` ledger through D,
+  * positions(D)  — ANCHORED on the prior day's RECONCILED `positions_snapshot`
+                    (broker-book-aligned) + ONLY that day's fills/share-deltas,
+                    so error never compounds across the replay (config#1281).
+                    A free-running full-ledger replay (the legacy
+                    `replay_positions`) drifts from the broker book — closed/
+                    partial/fractional positions don't fully net — and produced
+                    a badly-wrong NAV (config#1276: 20 synthesized positions /
+                    $1.49M vs the real 7 / ~$0.98M on 2026-06-24). It survives
+                    only as the missing-anchor cold-start fallback (flagged).
   * closes(D)     — ArcticDB universe/macro closes (gapless after the
                     market-data auto-heal, config#1228),
   * NAV/cash(D)   — rolled forward from the prior `eod_pnl` row:
                     cash(D) = cash(D-1) + D's trade cash-flows;
                     NAV(D)  = cash(D) + Σ shares(D)·close_D.
+
+A reconciliation guard refuses to write (flags the gap) when the synthesized
+position count diverges materially from the prior reconciled snapshot's, rather
+than persisting a wrong NAV.
 
 It synthesizes a `trades/snapshots/{D}.json` byte-compatible with what
 `snapshot_capturer` writes (marked ``synthesized: true`` for audit) and then
@@ -58,9 +70,27 @@ _BUY_ACTIONS = ("ENTER",)
 _SELL_ACTIONS = ("EXIT", "REDUCE")
 
 
+# If the anchored position count diverges from the prior reconciled snapshot's
+# by MORE than this fraction (and by more than the absolute floor below), the
+# synthesis is presumed broken and refuses to write — we'd rather flag a gap
+# than persist a wrong NAV (the config#1276 / 2026-06-24 failure mode: 20
+# synthesized positions vs the real 7). A small drift (a single fully-exited or
+# newly-opened name on the day) is normal and allowed.
+_DIVERGENCE_FRACTION = 0.5
+_DIVERGENCE_ABS_FLOOR = 3
+
+
 def replay_positions(conn: sqlite3.Connection, as_of_date: str) -> dict[str, int]:
-    """Net shares held per ticker at the close of ``as_of_date``, from the
-    cumulative `trades` ledger (all fills with date <= as_of_date).
+    """DEPRECATED free-running anchor (config#1281). Net shares held per ticker
+    at the close of ``as_of_date`` by **cumulatively netting the entire `trades`
+    ledger** (all fills with date <= as_of_date).
+
+    This drifts from the broker's actual book — closed/partial/fractional
+    positions don't fully net across a long ledger — so the synthesized NAV can
+    be badly wrong (config#1276: 20 synthesized positions / NAV $1.49M vs the
+    real 7 positions / ~$0.98M on 2026-06-24). It is retained only as the
+    missing-anchor FALLBACK in :func:`synthesize_positions`; the primary path
+    now anchors on the prior reconciled snapshot. Do not use directly.
 
     Uses the actually-filled share count (``filled_shares`` when present, else
     ``shares``). Returns only tickers with a positive net position."""
@@ -79,6 +109,110 @@ def replay_positions(conn: sqlite3.Connection, as_of_date: str) -> dict[str, int
         elif action in _SELL_ACTIONS:
             net[ticker] = net.get(ticker, 0) - sh
     return {t: q for t, q in net.items() if q > 0}
+
+
+def day_share_deltas(conn: sqlite3.Connection, as_of_date: str) -> dict[str, int]:
+    """Net share delta per ticker from fills **ON** ``as_of_date`` only.
+
+    ENTER adds shares; EXIT/REDUCE remove them. Uses the actually-filled count
+    (``filled_shares`` when present, else ``shares``). This is the day's change
+    to the book — applied to the prior reconciled snapshot in
+    :func:`synthesize_positions` so error never compounds across the replay.
+    Returns {} when no trades executed that day (the common halt case)."""
+    rows = conn.execute(
+        "SELECT ticker, action, COALESCE(filled_shares, shares) AS sh "
+        "FROM trades WHERE date = ? ORDER BY created_at",
+        (as_of_date,),
+    ).fetchall()
+    delta: dict[str, int] = {}
+    for ticker, action, sh in rows:
+        if sh is None:
+            continue
+        sh = int(sh)
+        if action in _BUY_ACTIONS:
+            delta[ticker] = delta.get(ticker, 0) + sh
+        elif action in _SELL_ACTIONS:
+            delta[ticker] = delta.get(ticker, 0) - sh
+    return delta
+
+
+def _prior_snapshot_shares(prior_positions: dict[str, dict]) -> dict[str, int]:
+    """Broker-verified held shares per ticker from the prior reconciled
+    `positions_snapshot` — the trusted anchor. Drops non-positive holdings."""
+    anchor: dict[str, int] = {}
+    for ticker, pos in (prior_positions or {}).items():
+        shares = (pos or {}).get("shares")
+        if shares is None:
+            continue
+        try:
+            shares = int(shares)
+        except (TypeError, ValueError):
+            continue
+        if shares > 0:
+            anchor[ticker] = shares
+    return anchor
+
+
+def synthesize_positions(
+    prior_positions: dict[str, dict],
+    day_deltas: dict[str, int],
+    conn: sqlite3.Connection | None = None,
+    as_of_date: str | None = None,
+) -> tuple[dict[str, int], bool]:
+    """ANCHOR the day's held positions on the prior day's RECONCILED snapshot
+    (broker-book-aligned) + apply ONLY that day's fills (config#1281).
+
+    This replaces the free-running full-ledger :func:`replay_positions`: each
+    day is computed from a TRUSTED anchor, so replay error cannot compound. For
+    a no-trade halt day this is exact — the result is the prior snapshot's
+    positions verbatim (re-marked at the day's closes by the caller).
+
+    Missing-anchor fallback: when no prior reconciled snapshot exists (empty
+    ``prior_positions``) AND a connection/date is supplied, fall back to the
+    legacy full-ledger replay through ``as_of_date`` so the tool still produces
+    *a* result on a cold-start day; the second return value is ``True`` to flag
+    that the result is the un-anchored (drift-prone) fallback. Otherwise the
+    second return value is ``False`` (anchored, trusted).
+
+    Returns ``(shares_by_ticker, used_fallback)`` with only positive holdings.
+    """
+    anchor = _prior_snapshot_shares(prior_positions)
+    if not anchor:
+        if conn is not None and as_of_date is not None:
+            logger.warning(
+                "No prior RECONCILED positions_snapshot to anchor on for %s — "
+                "falling back to the drift-prone full-ledger replay. Synthesis "
+                "is FLAGGED un-anchored; verify against the broker book.",
+                as_of_date,
+            )
+            return replay_positions(conn, as_of_date), True
+        # No anchor and no ledger to fall back on: empty book, anchored-trivially.
+        return {}, False
+
+    held = dict(anchor)
+    for ticker, delta in day_deltas.items():
+        held[ticker] = held.get(ticker, 0) + delta
+    return {t: q for t, q in held.items() if q > 0}, False
+
+
+def check_position_divergence(
+    synthesized: dict[str, int], prior_positions: dict[str, dict]
+) -> tuple[bool, int, int]:
+    """Reconciliation guard (config#1281 / config#1276): does the synthesized
+    position count diverge MATERIALLY from the prior reconciled snapshot's?
+
+    A no-trade day must reproduce the prior count; a normal trading day moves it
+    by a name or two. A large jump (the 7→20 failure) means the synthesis is
+    broken — the caller refuses to write and flags the gap instead.
+
+    Returns ``(diverged, n_synth, n_prior)``."""
+    n_synth = len(synthesized)
+    n_prior = len(_prior_snapshot_shares(prior_positions))
+    if n_prior == 0:
+        return False, n_synth, n_prior  # nothing to compare against (cold start)
+    drift = abs(n_synth - n_prior)
+    diverged = drift > _DIVERGENCE_ABS_FLOOR and drift > _DIVERGENCE_FRACTION * n_prior
+    return diverged, n_synth, n_prior
 
 
 def day_cash_flow(conn: sqlite3.Connection, as_of_date: str) -> float:
@@ -251,9 +385,32 @@ def backfill(run_date: str, *, dry_run: bool = False, force: bool = False) -> di
         )
     cash_prior = float(prior["total_cash"])
 
-    shares_by_ticker = replay_positions(conn, run_date)
+    # config#1281: ANCHOR the day's positions on the prior RECONCILED snapshot
+    # (broker-book-aligned) + apply ONLY this day's fills, instead of a
+    # free-running full-ledger replay that compounds drift away from the broker
+    # book. Missing-anchor cold-start days fall back to the legacy replay and
+    # are flagged un-anchored.
+    prior_positions = prior.get("positions_snapshot", {})
+    day_deltas = day_share_deltas(conn, run_date)
+    shares_by_ticker, used_fallback = synthesize_positions(
+        prior_positions, day_deltas, conn=conn, as_of_date=run_date
+    )
     if not shares_by_ticker:
-        logger.warning("Ledger replay yields no open positions at %s.", run_date)
+        logger.warning("Position synthesis yields no open positions at %s.", run_date)
+
+    # Reconciliation guard (config#1276 7→20 failure): refuse to write a row
+    # whose synthesized position count diverges materially from the prior
+    # reconciled snapshot — flag the gap instead of persisting a wrong NAV.
+    diverged, n_synth, n_prior = check_position_divergence(shares_by_ticker, prior_positions)
+    if diverged and not force:
+        raise RuntimeError(
+            f"Synthesized position count for {run_date} diverges materially from "
+            f"the prior reconciled snapshot ({n_synth} vs {n_prior}). Refusing to "
+            f"write a likely-wrong NAV — the gap is FLAGGED for manual review "
+            f"(config#1281/#1276). Investigate the ledger/snapshot, or re-run "
+            f"with --force only if you have verified the count against the broker "
+            f"book."
+        )
 
     closes = _read_closes_for_date(trades_bucket, list(shares_by_ticker), run_date)
     cash_today = cash_prior + day_cash_flow(conn, run_date)
@@ -284,8 +441,15 @@ def backfill(run_date: str, *, dry_run: bool = False, force: bool = False) -> di
         "cash_prior": round(cash_prior, 2),
         "cash_today": round(cash_today, 2),
         "synthesized_nav": round(snapshot["account"]["net_liquidation"], 2),
+        "anchored_on_prior_snapshot": not used_fallback,
+        "n_prior_snapshot_positions": n_prior,
         "dry_run": dry_run,
     }
+    if used_fallback:
+        summary["warning"] = (
+            "no prior reconciled snapshot — used drift-prone full-ledger "
+            "fallback; verify against broker book"
+        )
     logger.info("Synthesized snapshot for %s: %s", run_date, summary)
 
     if dry_run:
