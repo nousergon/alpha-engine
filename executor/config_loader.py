@@ -40,6 +40,8 @@ import os
 
 import yaml
 
+from nousergon_lib.config import resolve_experiment_config
+
 _REPO_ROOT = os.path.dirname(os.path.dirname(__file__))
 
 
@@ -51,16 +53,24 @@ def _build_search_paths() -> list:
     first, then the legacy top-level ``executor/`` config-repo path, then the
     legacy repo-local ``config/risk.yaml``. The ``.example`` template is never
     a candidate (see module docstring).
+
+    Delegates to the canonical resolver in nousergon-lib
+    (``resolve_experiment_config``, alpha-engine-config#1157) — the lift of the
+    five inline copies to the shared-lib chokepoint. The executor-specific
+    fallbacks are preserved verbatim: the repo-local ``config/risk.yaml`` tail
+    (subdir-flattened) and the ``.example`` exclusion guard (the template ships
+    placeholder bucket names and must never auto-resolve — see module docstring).
     """
-    exp = os.environ.get("ALPHA_ENGINE_EXPERIMENT_ID", "reference")
-    config_roots = [
-        os.path.expanduser("~/alpha-engine-config"),
-        os.path.join(_REPO_ROOT, "..", "alpha-engine-config"),
+    return [
+        str(p)
+        for p in resolve_experiment_config(
+            "executor",
+            "risk.yaml",
+            repo_root=_REPO_ROOT,
+            repo_local_fallback=os.path.join(_REPO_ROOT, "config", "risk.yaml"),
+            exclude_suffixes=(".example",),
+        )
     ]
-    paths = [os.path.join(r, "experiments", exp, "executor", "risk.yaml") for r in config_roots]
-    paths += [os.path.join(r, "executor", "risk.yaml") for r in config_roots]
-    paths.append(os.path.join(_REPO_ROOT, "config", "risk.yaml"))
-    return paths
 
 
 _SEARCH_PATHS = _build_search_paths()

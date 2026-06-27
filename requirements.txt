@@ -55,7 +55,7 @@ requests~=2.32
 # does NOT normalize underscore->hyphen, so `[flow_doctor]` silently drops the
 # extra (leaving flow-doctor stale/absent). `[flow-doctor]` is the PEP 685
 # canonical form and resolves on every pip version (config#1178).
-nousergon-lib[flow-doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.60.2
+nousergon-lib[flow-doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.70.0
 # portfolio_optimizer (PR 1 of portfolio-optimizer-260511 arc): cvxpy solves the
 # constrained mean-variance program (MVO + L1 turnover + SOC vol-target);
 # scikit-learn provides Ledoit-Wolf covariance shrinkage. Both are optional at
