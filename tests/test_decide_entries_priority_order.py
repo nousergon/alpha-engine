@@ -107,6 +107,114 @@ class TestEntryPriorityKey:
         assert key == (-80.0, 0.0)
 
 
+# ── urgency-weighted entry ranking (config#676 Phase 1, opt-in) ──────────────
+
+from executor.deciders import _entry_urgency_score, _days_until
+
+
+class TestUrgencyWeightedEntryRanking:
+    """The opt-in Gârleanu–Pedersen Phase-1 urgency ranking (config#676).
+
+    Flag defaults OFF → ordering byte-identical to the flat-priority baseline.
+    Flag ON → urgency (magnitude × conviction × boost) is the primary key, with
+    score / predicted_alpha as deterministic tie-breakers.
+    """
+
+    URGENCY_ON = {"urgency_weighted_entry_ranking_enabled": True}
+
+    def test_flag_off_is_byte_identical_baseline(self):
+        # No config and explicit-flag-off must both yield the 2-tuple baseline.
+        sig = {"ticker": "AAA", "score": 80}
+        preds = {"AAA": {"predicted_alpha": 0.01, "expected_move": 0.2, "prediction_confidence": 0.9}}
+        assert _entry_priority_key(sig, preds) == (-80.0, -0.01)
+        assert _entry_priority_key(sig, preds, {"urgency_weighted_entry_ranking_enabled": False}) == (-80.0, -0.01)
+
+    def test_urgency_outranks_higher_score_when_enabled(self):
+        # LOWSCORE has a much larger expected_move × confidence → more urgent →
+        # sorts ahead of the higher-composite-score name when the flag is on.
+        sig_high_score = {"ticker": "HS", "score": 90}
+        sig_urgent = {"ticker": "URG", "score": 70}
+        preds = {
+            "HS": {"expected_move": 0.01, "prediction_confidence": 0.5},
+            "URG": {"expected_move": 0.12, "prediction_confidence": 0.9},
+        }
+        items = [sig_high_score, sig_urgent]
+        items.sort(key=lambda s: _entry_priority_key(s, preds, self.URGENCY_ON))
+        assert [s["ticker"] for s in items] == ["URG", "HS"]
+        # ...and with the flag OFF the higher score wins (baseline preserved).
+        items.sort(key=lambda s: _entry_priority_key(s, preds))
+        assert [s["ticker"] for s in items] == ["HS", "URG"]
+
+    def test_equal_urgency_falls_back_to_score(self):
+        # Identical urgency inputs → score breaks the tie deterministically.
+        preds = {
+            "A": {"expected_move": 0.05, "prediction_confidence": 0.8},
+            "B": {"expected_move": 0.05, "prediction_confidence": 0.8},
+        }
+        a = {"ticker": "A", "score": 60}
+        b = {"ticker": "B", "score": 85}
+        items = [a, b]
+        items.sort(key=lambda s: _entry_priority_key(s, preds, self.URGENCY_ON))
+        assert [s["ticker"] for s in items] == ["B", "A"]
+
+    def test_catalyst_proximity_boost(self):
+        # Same magnitude × conviction; CAT has a catalyst inside the window →
+        # boosted urgency → sorts first.
+        preds = {
+            "CAT": {"expected_move": 0.05, "prediction_confidence": 0.8, "catalyst_date": "2026-06-30"},
+            "NOCAT": {"expected_move": 0.05, "prediction_confidence": 0.8},
+        }
+        cat = {"ticker": "CAT", "score": 70}
+        nocat = {"ticker": "NOCAT", "score": 70}
+        items = [nocat, cat]
+        items.sort(key=lambda s: _entry_priority_key(s, preds, self.URGENCY_ON, run_date="2026-06-28"))
+        assert [s["ticker"] for s in items] == ["CAT", "NOCAT"]
+
+    def test_catalyst_outside_window_no_boost(self):
+        # A catalyst far in the future (beyond the window) earns no boost.
+        score = _entry_urgency_score(
+            {"ticker": "X"},
+            {"expected_move": 0.05, "prediction_confidence": 0.8, "catalyst_date": "2026-09-01"},
+            self.URGENCY_ON,
+            run_date="2026-06-28",
+        )
+        assert score == 0.05 * 0.8  # no catalyst boost applied
+
+    def test_confirmed_momentum_boost(self):
+        boosted = _entry_urgency_score(
+            {"ticker": "M"},
+            {"expected_move": 0.05, "prediction_confidence": 0.8, "momentum_20d": 0.04},
+            self.URGENCY_ON,
+        )
+        flat = _entry_urgency_score(
+            {"ticker": "F"},
+            {"expected_move": 0.05, "prediction_confidence": 0.8, "momentum_20d": -0.04},
+            self.URGENCY_ON,
+        )
+        assert boosted > flat
+
+    def test_magnitude_prefers_expected_move_else_predicted_alpha(self):
+        with_em = _entry_urgency_score({"ticker": "E"}, {"expected_move": 0.07, "prediction_confidence": 1.0}, self.URGENCY_ON)
+        assert with_em == 0.07
+        # No expected_move → |predicted_alpha| is the magnitude.
+        with_pa = _entry_urgency_score({"ticker": "P"}, {"predicted_alpha": -0.03, "prediction_confidence": 1.0}, self.URGENCY_ON)
+        assert with_pa == 0.03
+
+    def test_missing_fields_neutral_no_raise(self):
+        # Empty prediction → magnitude 0, conviction neutral 1.0, no boost → 0.0.
+        assert _entry_urgency_score({"ticker": "Z"}, {}, self.URGENCY_ON) == 0.0
+        # Key path never raises on a totally empty prediction set.
+        key = _entry_priority_key({"ticker": "Z", "score": 50}, {}, self.URGENCY_ON)
+        assert key == (0.0, -50.0, 0.0)
+
+    def test_days_until_helper(self):
+        assert _days_until("2026-06-30", "2026-06-28") == 2
+        assert _days_until("2026-06-26", "2026-06-28") == -2
+        assert _days_until(None, "2026-06-28") is None
+        assert _days_until("not-a-date", "2026-06-28") is None
+        assert _days_until("2026-06-30", None) is None
+
+
 # ── decide_entries integration with priority ordering ───────────────────────
 
 def _df_history(base: float = 100.0):
