@@ -345,12 +345,97 @@ def _apply_batch_confidence_tightening(
     return derived
 
 
-def _entry_priority_key(sig: dict, predictions_by_ticker: dict) -> tuple[float, float]:
+def _days_until(target_date: str | None, run_date: str | None) -> int | None:
+    """Calendar days from ``run_date`` to ``target_date`` (both ISO ``YYYY-MM-DD``).
+
+    Returns ``None`` when either input is missing or unparseable — callers treat
+    that as "no clock" (no catalyst-proximity boost). Negative results (the
+    catalyst is in the past) are returned as-is so callers can decide whether a
+    just-passed catalyst still counts.
+    """
+    if not target_date or not run_date:
+        return None
+    try:
+        return (date.fromisoformat(str(target_date)) - date.fromisoformat(str(run_date))).days
+    except (ValueError, TypeError):
+        return None
+
+
+def _entry_urgency_score(
+    sig: dict, pred: dict, config: dict, run_date: str | None = None
+) -> float:
+    """Gârleanu–Pedersen Phase-1 urgency proxy (config#676): higher → trade sooner.
+
+    Brian's intuition (2026-06-07): "if one stock may move more quickly we should
+    buy it before a stock that increases gradually." Gârleanu & Pedersen (2013)
+    formalize this — with alpha that decays at different rates, the optimal policy
+    trades FASTER on faster-decaying alpha. This is the cheap Phase-1 cross-
+    sectional ranking (no optimizer-objective surgery): within the turnover
+    governor's daily budget, front-load the urgent names.
+
+    ``urgency = magnitude × conviction × boost`` where:
+      * magnitude — predictor ``expected_move`` if present, else ``|predicted_alpha|``
+        (both express "size of the expected move").
+      * conviction — ``prediction_confidence`` in [0, 1], else a neutral 1.0 so a
+        sparse/early-cutover predictions file doesn't zero the whole queue.
+      * boost — multiplicative: a **catalyst-proximity** bump when a ``catalyst_date``
+        falls within ``urgency_catalyst_window_days`` (the hard clock — buy before
+        the event), and a **confirmed-momentum** bump when ``momentum_20d`` is
+        above ``urgency_momentum_threshold`` (already breaking out).
+
+    All thresholds/boosts are config-tunable (backtester-sweepable). Missing
+    fields degrade to the neutral element, never raising — this runs inside the
+    live entry path.
+    """
+    expected_move = pred.get("expected_move")
+    if isinstance(expected_move, (int, float)):
+        magnitude = abs(float(expected_move))
+    else:
+        predicted_alpha = pred.get("predicted_alpha")
+        magnitude = abs(float(predicted_alpha)) if isinstance(predicted_alpha, (int, float)) else 0.0
+
+    confidence = pred.get("prediction_confidence")
+    conviction = float(confidence) if isinstance(confidence, (int, float)) else 1.0
+
+    boost = 1.0
+
+    catalyst_window = config.get("urgency_catalyst_window_days", 5)
+    days_to_catalyst = _days_until(pred.get("catalyst_date"), run_date)
+    if days_to_catalyst is not None and 0 <= days_to_catalyst <= catalyst_window:
+        boost *= float(config.get("urgency_catalyst_boost", 1.5))
+
+    momentum_20d = pred.get("momentum_20d")
+    if isinstance(momentum_20d, (int, float)) and float(momentum_20d) > float(
+        config.get("urgency_momentum_threshold", 0.0)
+    ):
+        boost *= float(config.get("urgency_momentum_boost", 1.2))
+
+    return magnitude * conviction * boost
+
+
+def _entry_priority_key(
+    sig: dict,
+    predictions_by_ticker: dict,
+    config: dict | None = None,
+    run_date: str | None = None,
+) -> tuple[float, ...]:
     """Sort key controlling the order in which ENTER candidates are processed.
 
-    Primary: research composite ``score`` (descending — higher score first).
-    Secondary: predictor ``predicted_alpha`` (descending — higher predicted
-    alpha breaks ties when research scores match).
+    Default (``urgency_weighted_entry_ranking_enabled`` off / no config):
+      Primary: research composite ``score`` (descending — higher score first).
+      Secondary: predictor ``predicted_alpha`` (descending — tie-break).
+
+    Urgency-weighted (config#676 Phase 1, opt-in via
+    ``urgency_weighted_entry_ranking_enabled``): a per-name **urgency** score
+    (see :func:`_entry_urgency_score`) becomes the PRIMARY key, with ``score``
+    and ``predicted_alpha`` retained as deterministic tie-breakers. So urgent
+    names (fast-decaying alpha: big expected move × conviction, catalyst soon,
+    confirmed momentum) are front-loaded within the governor's daily turnover
+    budget, while equally-urgent names still fall back to the score ordering.
+    The flag defaults OFF, so this ships **observe-first** — the live ordering
+    is byte-identical to the flat-priority baseline until Brian flips the flag
+    in risk.yaml (matching the codebase's measure-before-cutover discipline; the
+    realized-entry-price improvement vs naive is the gate the issue closes on).
 
     Why this matters: ``decide_entries`` evaluates candidates one at a time,
     and the risk_guard's ``max_total_equity`` / ``max_sector`` caps bind on
@@ -369,6 +454,11 @@ def _entry_priority_key(sig: dict, predictions_by_ticker: dict) -> tuple[float, 
     ticker = sig.get("ticker", "")
     pred = predictions_by_ticker.get(ticker, {}) if predictions_by_ticker else {}
     predicted_alpha = pred.get("predicted_alpha") or 0.0
+
+    if config and config.get("urgency_weighted_entry_ranking_enabled", False):
+        urgency = _entry_urgency_score(sig, pred, config, run_date)
+        return (-float(urgency), -float(score), -float(predicted_alpha))
+
     return (-float(score), -float(predicted_alpha))
 
 
@@ -458,9 +548,16 @@ def decide_entries(
     # use of `predicted_alpha` — it informs ordering without affecting
     # sizing. Stable on missing fields (None → 0.0) so signals from older
     # research runs without scores still get processed deterministically.
+    #
+    # When `urgency_weighted_entry_ranking_enabled` (config#676 Phase 1, default
+    # OFF) is set, a per-name urgency score becomes the PRIMARY key so faster-
+    # decaying alpha (big move × conviction / catalyst-soon / confirmed momentum)
+    # is front-loaded within the governor's daily budget — score/predicted_alpha
+    # stay as deterministic tie-breakers. `config`/`run_date` are threaded so the
+    # urgency proxy can read predictor fields + the catalyst clock.
     enter_signals = sorted(
         enter_signals,
-        key=lambda s: _entry_priority_key(s, predictions_by_ticker),
+        key=lambda s: _entry_priority_key(s, predictions_by_ticker, config, run_date),
     )
 
     for sig in enter_signals:
