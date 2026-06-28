@@ -70,6 +70,21 @@ reversal_confirmation_threshold: 0.0   # require momentum_confirmation >= this (
 # Cross-ticker correlation blocking — prevent correlated entries
 correlation_block_enabled: true
 correlation_block_threshold: 0.80  # max mean pairwise correlation (backtester-tunable: [0.70, 0.75, 0.80, 0.85])
+
+# Urgency-weighted entry ranking (config#676 Phase 1 — Gârleanu–Pedersen
+# dynamic trading). When ON, the ENTER queue is ranked PRIMARILY by a per-name
+# urgency score (expected_move × prediction_confidence, boosted by catalyst
+# proximity + confirmed momentum) instead of research composite score, so
+# faster-decaying alpha is front-loaded within the turnover governor's daily
+# budget (score / predicted_alpha remain deterministic tie-breakers). DEFAULT
+# OFF (observe-first): leave off to keep the flat-priority baseline byte-
+# identical, then flip ON once the realized-entry-price improvement vs naive is
+# measured (the #676 close gate). All boosts/windows are backtester-tunable.
+urgency_weighted_entry_ranking_enabled: false
+urgency_catalyst_window_days: 5     # catalyst within N days → proximity boost
+urgency_catalyst_boost: 1.5         # multiplier when a catalyst is imminent
+urgency_momentum_threshold: 0.0     # momentum_20d above this → confirmed-breakout boost
+urgency_momentum_boost: 1.2         # multiplier when momentum is confirmed
 correlation_lookback_days: 60
 
 # ── Sizing adjustments ──────────────────────────────────────────────────────
